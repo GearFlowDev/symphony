@@ -76,6 +76,42 @@ invariant above:
   retry, but each hit costs a full dispatch cycle. Fix idea: wait for an idle
   input box (no queued-messages banner) before pasting, or retry the paste
   once after a short delay.
+  Status 2026-09-02: partial — an 8-attempt progressive backoff exists
+  (`tmux_cli.ex` `@paste_attempts`, 3c7b3b4); no idle-input gate before pasting.
+
+## Evaluator attributes a PR by the slot's CURRENT branch, not the issue's branch
+Seen on GEA-5188 (2026-08-28): dashboard showed the issue complete with PR
+`#2403` linked, but #2403 is an unrelated *merged* PR for GEA-5405, and GEA-5188
+has no PR at all — its work sits pushed on `gea-5188-…` (9 commits, complete,
+self-APPROVED) with nothing opened. Root cause: `Evaluator.evaluate/2` resolves
+the PR from `detect_current_branch(workspace)` → `check_pr(--head <current>)`.
+Slots are released and reused, so at eval time the slot had been re-checked-out
+to gea-5405; `check_pr` matched #2403 and stored it as GEA-5188's `eval_pr_url`.
+`history.ex` `has_pr`/`latest_pr_url` then trust that stale value, so the
+dashboard reports a green, PR-backed completion over work that never shipped —
+the worst failure mode (looks done, isn't). Fix idea: pin evaluation to the
+issue's Linear branch (`run_context[:branch_name]`), and only accept a
+`check_pr` hit whose head branch equals that branch — never the slot's ambient
+`detect_current_branch`, which is authoritative for nothing once slots churn.
+Belt-and-suspenders: when `branch_pushed` is true but `pr_created` is false,
+surface "pushed, NO PR" on the dashboard instead of borrowing any URL.
+
+Related but distinct — a BLOCKED/needs-human plan reads as "done". GEA-5567
+(2026-08-31): dashboard showed "Test ✓ complete (6t)" linking `#3170` (an
+unrelated OPEN PR for GEA-8141), over a branch with ZERO commits. Here the empty
+branch was CORRECT: the planner deliberately wrote no implementation rows because
+the issue is labeled needs-human and its body reserves a product/security call
+for a human (it reverses the 2-day-old GEA-5237 credential fence and offers four
+mutually exclusive options, one with a hard dep on GEA-5466). Plan status stayed
+`dispatching` with a "blocked pending that decision" note — but dispatch read
+"no open rows" as "all rows done → tester → complete", and the run recorded
+`outcome=completed, needs_human=0`. So a plan that is empty *because it is
+blocked* is indistinguishable from a plan that is empty *because it is finished*.
+Fixes: (1) a plan with zero implementation rows AND a needs-human/blocked note
+must escalate (needs_human=true, outcome=blocked), never complete — same family
+as the refusal-run row-state bug below; (2) never let `pr_created` be satisfied
+by a borrowed URL whose head branch ≠ the issue's Linear branch (the #3170
+mislink is the PR-attribution bug above).
 
 ## Grader re-derives row state from the diff and overrides human directives
 A plan row the ticket owner explicitly cancelled ("remove the '+' menu unit
@@ -88,6 +124,10 @@ deferred/cancelled; workers can only plead via needs_help. Fix ideas: honor a
 works this way — the gap is that nothing sets it); teach the planner/grader
 that a ticket owner's later comment supersedes plan rows; or add a dashboard
 control to defer a row.
+Status 2026-09-02: partial — `deferred` is honored (`plan.ex`, `workflow.ex`) and
+the grader cannot emit it (`grader.ex` `valid_row?`), but nothing sets it: no
+dashboard control, no owner-comment path, no `cancelled` state. Also
+`merge_grade_into_plan` still overwrites any row id present in the grade JSON.
 
 ## Dependency-blocked issues get re-dispatched until the breaker trips
 When an issue's plan depends on another issue's unmerged branch, the worker
@@ -197,6 +237,9 @@ Real fix, either/both: (a) start the stall clock only once the agent session
 exists; (b) map the active backend's `stall_timeout_ms` onto the watchdog.
 Mitigation in place: `codex.stall_timeout_ms: 1800000` in WORKFLOW*.md — must
 stay >= hooks.timeout_ms until fixed.
+Status 2026-09-02: partial (config-only) — code still reads
+`codex_stall_timeout_ms` for every backend, starts the clock at `started_at`, and
+the phase timer below is still `timeout_ms * 2` with no recent-activity guard.
 
 Related: the phase-stuck timer (hardcoded `timeout_ms * 2`) killed an ACTIVELY
 WORKING agent 31 min into its Test phase (GEA-4621, 2026-07-14 16:35 — pane
@@ -238,6 +281,9 @@ Mitigations in place:
   archives to iterate, `append_archives` never reaches the fragile warning
   path at all. If the crash stops recurring, this is the keeper; consider
   promoting it into `devenv.nix` in gf_procurement.
+Status 2026-09-02: partial — recycle + exit 75 present (`slot-claim-registry.sh`,
+`BOOT_RETRIES=4`); release leaves the backend running; `MIX_ARCHIVES` still lives
+only in untracked per-slot `.envrc` files, not promoted to `devenv.nix`.
 
 ## `:paste_not_visible` crash storm pinned one issue's dispatches for hours
 Observed 2026-07-09, 19:19–20:53Z: every GEA-4394 Test dispatch (25+ in a row) crashed
@@ -251,6 +297,8 @@ flapping the PR's draft state, and burned a slot claim/release cycle.
 Next time it fires: capture the worker pane BEFORE the runner kills the session
 (e.g. on paste failure, `tmux capture-pane -p` into the run's log/DB row), so the
 failure is diagnosable post-mortem. That capture hook is the fix to build first.
+Status 2026-09-02: partial — `tmux_cli.ex` captures the pane tail and logs it
+before returning `:paste_not_visible`; it is not yet written to the run's DB row.
 
 ## Stale `.symphony_slot` makes a retry adopt a slot dir as its workspace → double-booked slots, destroyed work
 `Workspace.create_for_issue` ends with `resolve_slot_workspace/1`: if the issue's
@@ -285,6 +333,9 @@ Fix directions:
 - Delete the workspace's `.symphony_slot` whenever its lease is released (after_run,
   before_remove, stale sweep).
 - Claim-script guard: refuse to run with `$WORKSPACE` inside `local-dev/` slot dirs.
+Status 2026-09-02: partial — first two done (`workspace.ex` always returns the
+symphony workspace; `slot-release-registry.sh` removes `.symphony_slot`); the
+claim-script guard is still missing.
 
 ## needs_human_message truncated at 500 chars
 The escalation message is cut mid-sentence at exactly 500 chars — in the DB column and
@@ -317,6 +368,8 @@ review round + misleading `stall` failures in the runs table.
 
 Fix: emit a heartbeat (log line / explicit poll loop) while waiting on CodeRabbit, or a
 per-phase stall timeout with a longer window for Resolve Review.
+Status 2026-09-02: partial (config-only) — global stall timeout raised to 30 min;
+no heartbeat, no per-phase window.
 
 ## slot-claim hangs on a dead-but-listening backend squatting the slot's Phoenix port
 An orphaned backend beam from a previous run can keep listening on the slot's Phoenix
@@ -337,8 +390,12 @@ with a clear error. Consider sweeping orphaned process-compose supervisors whose
 gone. Related: the `runs` table holds ~44 `finished_at IS NULL` rows from crashed or
 restarted runs — a startup sweep closing rows for runs that aren't alive would stop
 "active runs" queries from lying.
+Status 2026-09-02: mostly done — `slot-claim-registry.sh` treats 000/5xx as
+unhealthy, `kill_slot_orphans` kills `process-compose|beam.smp` whose cwd is the
+slot, and the health gate backs off instead of hanging; the legacy `slot-claim.sh`
+still only warns. Startup sweep done: `History.close_orphaned_runs/0`.
 
-## Post-ship review gate
+## Post-ship review gate (done; verified 2026-09-02)
 After a worker ships a PR, the orchestrator should poll CI and review status before marking the issue done. Currently the judge sees `pr_created: true` and moves on immediately — there's no time for CI to run or reviewers (CodeRabbit, humans) to post comments.
 
 Needed:
@@ -347,6 +404,11 @@ Needed:
 - Poll for new review comments (CodeRabbit takes 2-5 min)
 - If CI fails or actionable review comments appear, retask the agent to fix
 - Only mark done when CI passes and no unaddressed comments (or timeout)
+
+Done: `external_ship_gate/1` (`orchestrator.ex`) chains `merge_gate` → `ci_gate`
+(`gh pr checks`) → `review_gate` before `:done`, retasking to Resolve Conflicts /
+Fix CI / Resolve Review; CodeRabbit is requested at `:needs_test` (see
+CodeRabbit-during-build above).
 
 ## Surface blocked issues on the dashboard
 Issues that hit `max_runs_per_issue` silently disappear from the dashboard — the orchestrator logs a warning but the user sees nothing. These issues still need work but something went wrong (infrastructure failures, stale locks, etc).
@@ -361,6 +423,11 @@ Root causes to also fix:
 - Failed slot claims (0-turn runs) count toward max_runs — they shouldn't
 - Stale slot locks from crashed/killed runs are never cleaned up
 - Consider a TTL on locks, a startup sweep, or orchestrator-level lock release on hook failure
+
+Status 2026-09-02: partial — root causes done (`no_capacity` runs excluded from the
+breaker, 7b84202; stale-lock sweep in `workspace.ex` + `STALE_LOCK_MAX_AGE_SECONDS`);
+the free-text force-dispatch form clears the sticky blocked set (203ca9b). Still no
+Blocked section or per-issue Reset & Retry.
 
 ## Detect issue description changes while agent is working
 The orchestrator fetches the issue once at dispatch and never re-reads the description. If the user updates the issue (adds details, clarifies requirements, attaches screenshots) while the agent is working, the agent never sees the changes.
@@ -384,6 +451,9 @@ The evaluator currently checks `tests_written: bool` — did any test file chang
 
 This would catch the GEA-2463 case where the agent wrote one test file for a large feature.
 
+Status 2026-09-02: partial — evaluator still a bool; the LLM grader marks a row
+`partial` when its diff has no test (`grader.ex`), which drives the retask.
+
 ## Judge should detect unanswered help requests on Linear
 When an agent posts a question or asks for help on the Linear issue, the judge should not dispatch the next phase until a human responds. Currently the orchestrator detects `SYMPHONY_NEEDS_HELP` in the output stream, but if the agent posts a question as a regular Linear comment, the judge ignores it and moves on.
 
@@ -402,6 +472,10 @@ Possible causes:
 - The `safe_port_close` function sends `kill -- -$PID` (SIGTERM to process group) which may be triggered prematurely
 - The orchestrator may not cleanly terminate previous runs before dispatching retries
 
+Status 2026-09-02: partial — `--strict-mcp-config` in place; the turn loop runs
+through tmux so `safe_port_close` no longer reaches workers; the registry claim
+script skips heavy setup when the slot is healthy. SIGTERM root cause still unknown.
+
 ## Completed Work view needs actionable detail
 The Completed Work section on the dashboard shows badges but no useful information about what happened. When an agent fails, the operator needs to understand:
 
@@ -417,6 +491,9 @@ The error column currently shows a truncated RuntimeError which is useless. Cons
 - Link to the session log if available
 - Show the last tool call and its result
 
+Status 2026-09-02: partial — rows show outcome, phases, PR, error, last activity,
+turns, tokens; no expandable panel, summary line, or session-log link.
+
 ## Interactive agent takeover
 Investigate whether a running agent session can be converted to interactive mode so the user can communicate with the agent and direct its activities. Currently agents run autonomously — the user can only watch. If the user sees an agent going off-track or wants to steer it, there's no way to intervene without killing the session and starting over.
 
@@ -427,18 +504,30 @@ Questions to answer:
 - What happens to the orchestrator's tracking if the user sends messages the orchestrator didn't initiate?
 - Should this be a "pause and hand off" model (orchestrator stops, user takes over) or a "co-pilot" model (orchestrator and user both send messages)?
 
+Status 2026-09-02: partial — `@agent` comment injection only (`linear/client.ex`,
+`agent_runner.ex`, `fresh_agent_feedback/2`); no attach/steer.
+
 ## Show issue title on dashboard
 The dashboard only shows issue identifiers (e.g. GEA-2631). Show the issue title alongside it so the operator can tell at a glance what each agent is working on without clicking through to Linear.
+
+Status 2026-09-02: partial — title renders only in the Run history tab.
 
 ## Dashboard polling overhead
 When the dashboard LiveView is open, it polls `run_events` every second per expanded timeline. This hammers the SQLite DB with redundant queries. Should debounce or only poll when timeline is expanded.
 
-## Orchestrator snapshot timeouts ("Snapshot unavailable")
+Status 2026-09-02: partial — already gated on expansion and the payload reload is
+debounced 250 ms, but `render_timeline/2` still re-queries `events_for_run` on
+every 1 s tick per expanded row.
+
+## Orchestrator snapshot timeouts ("Snapshot unavailable") (done: interim fix)
 The dashboard and TUI fetch status via `Orchestrator.snapshot()` → `GenServer.call(:snapshot, 15_000)`. The `:snapshot` handler is trivial (it just reads state), but the orchestrator is a single GenServer that runs its **entire poll cycle in-process**: Linear HTTP (`Tracker.fetch_candidate_issues` / `fetch_issue_states`), plan generation (`Planning.Workflow.assess` — one LLM call), and dispatch grading (`maybe_grade_plan_dispatch` — another LLM call). A GenServer handles one message at a time, so while a poll cycle is blocked on a slow LLM grade/plan (routinely >15s, worse under churn), the `:snapshot` call sits in the mailbox until it times out → `snapshot_payload` returns `:error` → "Snapshot unavailable / Snapshot timed out". Intermittent — only fires when a refresh lands during a slow cycle.
 
 Fix:
 - Proper: move the blocking poll-cycle work (LLM grade/plan, Linear calls, worker dispatch) into supervised `Task`s so the GenServer stays responsive to `:snapshot` and the other status/control calls.
 - Cheap interim: raise the snapshot timeout above the worst-case grade time, and/or render the **last-known** snapshot on timeout (the dashboard already tracks `last_snapshot_fingerprint`) instead of erroring — shows slightly-stale status rather than "unavailable".
+
+Done (046d226): the interim fix — ETS snapshot cache; `snapshot/2` returns the
+last-known snapshot tagged `stale_age_ms` on timeout. The Task refactor is deferred.
 
 ## Add OpenCode as an alternative agent backend
 Symphony's agent layer is already abstracted behind `Config.agent_runner_module()` (claude → `Claude.AgentRunner`, default → legacy Codex runner). Adding sst/opencode as a third backend is mostly mirroring the Claude modules.

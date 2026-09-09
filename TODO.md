@@ -78,6 +78,15 @@ invariant above:
   once after a short delay.
   Status 2026-09-02: partial — an 8-attempt progressive backoff exists
   (`tmux_cli.ex` `@paste_attempts`, 3c7b3b4); no idle-input gate before pasting.
+  Status 2026-09-09: done for the truncation form. Claude Code 2.1.265/266 (installed
+  2026-09-08 evening) stopped putting the pane in bracketed-paste mode, so a plain
+  `paste-buffer` arrived as a keystroke burst and the TUI kept only its tail: GEA-7669's
+  three Implement workers each received the last ~390 chars of a 20 KB prompt, GEA-7671's
+  and the graders' the last 133–621, and the old check passed because it accepted the
+  suffix alone. Fix: `paste-buffer -p` (bracketed paste, verified intact for 69 KB), and
+  `paste_landed?/2` now demands the "[Pasted text #N +L lines]" placeholder with L equal
+  to the prompt's newline count, or both prefix and suffix, inside the "❯" input region.
+  Still open: the idle-input gate for the queued-messages case.
 
 ## Evaluator attributes a PR by the slot's CURRENT branch, not the issue's branch
 Seen on GEA-5188 (2026-08-28): dashboard showed the issue complete with PR
@@ -210,6 +219,15 @@ worktree (then `git worktree prune`) so one agent's leftovers can't poison the
 slot. Second incident of stale slot state breaking claims; same family as the
 quarantined-slot boot crash below.
 
+## Trust dialog default flipped to "No, exit" (fixed 2026-09-09)
+Claude Code 2.1.26x lists "No, exit" first and preselected in the "Do you trust this
+folder?" dialog. `wait_for_ready` answered it with a bare Enter (assuming "1. Yes" was
+selected), which exits the CLI and leaves a zsh prompt in the pane — the next paste then
+runs the prompt's lines as shell commands (reproduced in a lab session: `cd: too many
+arguments` from a pasted line). Fixed: `answer_trust_dialog/1` reads which option the
+`❯` cursor is on (`trust_cursor/1`), presses Down until it is on "Yes", then Enter.
+Symphony workspaces are usually already trusted, which is why this stayed latent.
+
 ## ready_timeout kills the pane without capturing it (evidence destroyed)
 `TmuxCLI.wait_for_ready` gives up after 30s and `kill_session`s the pane
 without logging what was on screen, so every `{:start_session_failed,
@@ -299,6 +317,9 @@ Next time it fires: capture the worker pane BEFORE the runner kills the session
 failure is diagnosable post-mortem. That capture hook is the fix to build first.
 Status 2026-09-02: partial — `tmux_cli.ex` captures the pane tail and logs it
 before returning `:paste_not_visible`; it is not yet written to the run's DB row.
+Status 2026-09-09: the 2026-09-09 truncation (see "Grader tmux paste race" above) is the
+inverse failure — the check passed on a partial paste — and is fixed by bracketed paste
+plus a whole-prompt landing check. Pane capture into the DB row remains open.
 
 ## Stale `.symphony_slot` makes a retry adopt a slot dir as its workspace → double-booked slots, destroyed work
 `Workspace.create_for_issue` ends with `resolve_slot_workspace/1`: if the issue's
@@ -355,6 +376,11 @@ risks killing in-flight work.
 
 Fix: skip tmux-session and slot-lease reaping (any shared-state mutation at startup)
 when `Mix.env() == :test`.
+Status 2026-09-09: done — `config :symphony_elixir, reap_orphans: false` under `:test`
+(`config/config.exs`); `Application.start/1` skips the startup tmux reaper and
+`Orchestrator.maybe_dispatch/1` skips both per-poll reapers when the flag is false.
+Verified: `mix test test/symphony_elixir/claude/tmux_cli_test.exs` ran beside a live
+worker (session 7d33bb2a) and left it untouched.
 
 ## Resolve Review workers get stall-killed while waiting on CodeRabbit
 Resolve Review workers finish the triage (push fixes, reply to every thread), then sit

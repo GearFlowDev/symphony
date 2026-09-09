@@ -25,7 +25,7 @@ defmodule SymphonyElixir.Application do
   def start(_type, _args) do
     :ok = SymphonyElixir.LogFile.configure()
     :ok = SymphonyElixir.Repo.configure()
-    reap_orphan_tmux_sessions()
+    if reap_orphans?(), do: reap_orphan_tmux_sessions()
 
     children = [
       SymphonyElixir.Repo,
@@ -50,6 +50,11 @@ defmodule SymphonyElixir.Application do
     SymphonyElixir.StatusDashboard.render_offline_status()
     :ok
   end
+
+  # False under :test (config/config.exs): a test BEAM must never reap the live
+  # orchestrator's sessions or leases. The orchestrator's per-poll reapers
+  # honour the same flag.
+  defp reap_orphans?, do: Application.get_env(:symphony_elixir, :reap_orphans, true)
 
   # Clean up tmux sessions leaked by a previous run that crashed before its
   # AgentRunner could stop them. Never let this block or fail startup.

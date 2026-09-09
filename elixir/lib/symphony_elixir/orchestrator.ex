@@ -385,9 +385,13 @@ defmodule SymphonyElixir.Orchestrator do
 
     # Free slots whose lock no longer backs a running issue (e.g. a run that
     # ended without its slot release firing). Runs every poll so abandoned
-    # locks don't silently shrink effective concurrency.
-    reap_stale_pool_locks(state)
-    reap_orphan_tmux_sessions(state)
+    # locks don't silently shrink effective concurrency. Off under :test
+    # (`reap_orphans: false`): a test BEAM's empty running set would otherwise
+    # make every live worker on this host look orphaned.
+    if Application.get_env(:symphony_elixir, :reap_orphans, true) do
+      reap_stale_pool_locks(state)
+      reap_orphan_tmux_sessions(state)
+    end
 
     if not Config.within_active_hours?() do
       Logger.debug("Outside active hours, skipping dispatch")

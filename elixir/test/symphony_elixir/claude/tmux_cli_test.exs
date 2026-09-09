@@ -164,4 +164,105 @@ defmodule SymphonyElixir.Claude.TmuxCLITest do
       assert :ok = TmuxCLI.kill_by_session_id(nil)
     end
   end
+
+  describe "paste_landed?/2" do
+    # Pane fixtures mirror real `capture-pane -p` output from Claude Code 2.1.266
+    # (probed 2026-09-09): the input box sits between two rule lines, starts with
+    # the "❯" marker, and a multi-line bracketed paste collapses into a
+    # "[Pasted text #N +L lines]" placeholder where L is the newline count.
+    @rule String.duplicate("─", 40)
+
+    defp pane(input_lines, transcript \\ []) do
+      Enum.join(
+        transcript ++ [@rule] ++ input_lines ++ [@rule, "  ⏵⏵ bypass permissions on (shift+tab to cycle)", "", "", ""],
+        "\n"
+      )
+    end
+
+    test "accepts a collapsed placeholder whose line count matches the prompt" do
+      prompt = Enum.map_join(0..404, "\n", &"- row #{&1}: lorem ipsum")
+      assert TmuxCLI.paste_landed?(pane(["❯ [Pasted text #69 +404 lines]"]), prompt)
+    end
+
+    test "rejects a placeholder with a smaller line count (paste lost its head)" do
+      prompt = Enum.map_join(0..404, "\n", &"- row #{&1}: lorem ipsum")
+      refute TmuxCLI.paste_landed?(pane(["❯ [Pasted text #69 +6 lines]"]), prompt)
+    end
+
+    test "rejects a literal tail-only delivery even though the suffix is visible" do
+      # The GEA-7669 failure: 20 KB prompt, only its last ~390 chars landed.
+      head = "# Symphony Agent Workflow\n\nYou are a senior engineer at Gearflow.\n" <> String.duplicate("- row: work item\n", 200)
+      tail = "Escalate only when a row is genuinely impossible to close as written:\n- Missing backend / data / design\n- Broken slot"
+      prompt = head <> tail
+
+      pane_output =
+        pane([
+          "❯ Escalate only when a row is genuinely impossible to close as written:",
+          "  - Missing backend / data / design",
+          "  - Broken slot"
+        ])
+
+      refute TmuxCLI.paste_landed?(pane_output, prompt)
+    end
+
+    test "accepts a short prompt rendered literally when both ends are visible" do
+      prompt = "first line of a short prompt\nsecond line of a short prompt"
+      assert TmuxCLI.paste_landed?(pane(["❯ first line of a short prompt", "  second line of a short prompt"]), prompt)
+    end
+
+    test "tolerates the TUI wrapping a long literal line mid-word" do
+      prompt = "line one " <> String.duplicate("alpha beta gamma delta ", 13) <> "\nline three end marker here"
+
+      pane_output =
+        pane([
+          "❯ line one alpha beta gamma delta alpha beta gamma delta alpha beta gamma delta alpha beta gamma delta alp",
+          "  ha beta gamma delta alpha beta gamma delta alpha beta gamma delta alpha beta gamma delta alpha beta gamma delta",
+          "  alpha beta gamma delta alpha beta gamma delta alpha beta gamma delta alpha beta gamma delta",
+          "  line three end marker here"
+        ])
+
+      assert TmuxCLI.paste_landed?(pane_output, prompt)
+    end
+
+    test "ignores a previous turn's submitted placeholder in the transcript" do
+      # Continuation prompts share a newline count turn after turn, and a short
+      # reply can leave the previous turn's "> [Pasted text]" line near the
+      # bottom. An empty input box must still read as not-landed.
+      prompt = Enum.map_join(1..11, "\n", &"continuation line #{&1}")
+
+      pane_output =
+        pane(
+          ["❯ "],
+          ["> [Pasted text #2 +10 lines]", "", "⏺ Ending the turn.", ""]
+        )
+
+      refute TmuxCLI.paste_landed?(pane_output, prompt)
+    end
+
+    test "rejects an empty input box" do
+      refute TmuxCLI.paste_landed?(pane(["❯ "]), "some prompt text that never arrived\nsecond line")
+    end
+  end
+
+  describe "trust_cursor/1" do
+    test "detects the 2.1.26x layout where 'No, exit' is preselected" do
+      output = """
+       Quick safety check: Is this a project you created or one you trust?
+       ❯ No, exit
+         Yes, I trust this folder
+       Enter to confirm · Esc to cancel
+      """
+
+      assert TmuxCLI.trust_cursor(output) == :no
+    end
+
+    test "detects the cursor on the Yes option, numbered or not" do
+      assert TmuxCLI.trust_cursor("   No, exit\n ❯ Yes, I trust this folder\n") == :yes
+      assert TmuxCLI.trust_cursor(" ❯ 1. Yes, proceed\n   2. No, exit\n") == :yes
+    end
+
+    test "returns :unknown when no recognisable option is under the cursor" do
+      assert TmuxCLI.trust_cursor("Do you trust the files in this folder?\n") == :unknown
+    end
+  end
 end

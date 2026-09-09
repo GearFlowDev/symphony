@@ -8,8 +8,8 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
   credit pool; a long-running interactive `claude` bills against the plan.
 
   The session is created once per issue run. Prompts are delivered via
-  `tmux load-buffer` + `paste-buffer` (atomic and reliable for any prompt size,
-  unlike character-by-character `send-keys`). The structured event stream is NOT
+  `tmux load-buffer` + `paste-buffer -p` (one bracketed paste, reliable for any
+  prompt size — see `send_prompt/3`). The structured event stream is NOT
   read from stdout here — interactive Claude Code writes the full event stream to
   a JSONL file, which `SymphonyElixir.Claude.SessionWatcher` tails. This module
   only owns the tmux/process lifecycle and prompt delivery.
@@ -85,8 +85,15 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
   @doc """
   Deliver `prompt` to the running session and submit it.
 
-  Uses `load-buffer` + `paste-buffer` so arbitrarily large / multi-line prompts
-  arrive intact, then sends Enter as a separate keystroke (tmux requires this).
+  Uses `load-buffer` + `paste-buffer -p` so arbitrarily large / multi-line
+  prompts arrive intact, then sends Enter as a separate keystroke (tmux requires
+  this). `-p` wraps the text in bracketed-paste markers unconditionally. Without
+  them the TUI has to guess where a burst of keystrokes ends: Claude Code
+  2.1.265+ no longer switches the pane into bracketed-paste mode itself, and its
+  heuristic dropped the head of large pastes — workers received only the last
+  few hundred characters of a 20 KB prompt (GEA-7669, 2026-09-09) — while a
+  2-line paste submitted at the newline. With the markers every size lands as
+  one unit, and a multi-line paste collapses to "[Pasted text #N +L lines]".
 
   A short settle delay between paste and Enter is essential: the TUI processes the
   bracketed paste on its next render frame, and an Enter sent in the same frame is
@@ -302,7 +309,7 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
   defp paste_until_visible(session_name, prompt_file, prompt, attempts_left) do
     with {_, 0} <- tmux(["send-keys", "-t", pane(session_name), "-N", "25", "C-u"]),
          {_, 0} <- tmux(["load-buffer", prompt_file]),
-         {_, 0} <- tmux(["paste-buffer", "-t", pane(session_name)]),
+         {_, 0} <- tmux(["paste-buffer", "-p", "-t", pane(session_name)]),
          :ok <- settle_paste() do
       if paste_visible?(session_name, prompt) do
         :ok
@@ -319,57 +326,95 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
     end
   end
 
-  # Confirm the paste reached the input box. We only inspect the bottom of the
-  # pane (where the input box lives), so a previous turn's prompt still in the
-  # transcript can't produce a false positive. Whitespace runs are squished
-  # because the TUI may reflow the pasted text.
+  # Confirm the WHOLE paste reached the input box — not just its tail. Only the
+  # input region of the pane is inspected (from the last "❯" input marker down),
+  # so a prompt already submitted and sitting in the transcript above cannot
+  # produce a false positive.
   #
-  # Three independent signals, any of which proves the paste landed:
-  #   * the prompt's SUFFIX — for a large multi-line prompt the TUI collapses the
-  #     START into "[Pasted text #N]" placeholders but keeps the END literally at
-  #     the cursor, so the suffix is the most reliable signal (the placeholders
-  #     can scroll above our window when the literal tail is long);
-  #   * the prompt's PREFIX — short prompts render entirely literally;
-  #   * a "[Pasted text" placeholder — present when it happens to be in-window.
+  # Two signals, either of which proves the paste landed intact:
+  #   * a "[Pasted text #N +L lines]" placeholder whose L equals the prompt's
+  #     newline count — the TUI collapses a multi-line bracketed paste into this
+  #     placeholder, and L is the number of newlines it actually received, so a
+  #     paste that lost its head shows a smaller L (or no placeholder at all);
+  #   * the prompt's PREFIX and SUFFIX both visible — a prompt of only a few
+  #     lines renders literally, and requiring both ends rejects a tail-only
+  #     delivery.
+  # Accepting the suffix alone (or any "[Pasted text" at all) is what let
+  # truncated prompts through on 2026-09-09: three GEA-7669 workers received the
+  # last ~390 characters of a 20 KB Implement prompt and reported "no task".
+  # Whitespace is stripped before matching because the TUI reflows and wraps
+  # long lines at the pane width, mid-word.
   @input_tail_lines 12
+  @placeholder_re ~r/\[Pasted text #\d+ \+(\d+) lines?\]/
 
   defp paste_visible?(session_name, prompt) do
-    {prefix, suffix} = prompt_needles(prompt)
-
     case tmux(["capture-pane", "-t", pane(session_name), "-p"]) do
-      {output, 0} ->
-        tail = input_tail(output)
-
-        String.contains?(tail, "[Pasted text") or
-          (suffix != "" and String.contains?(tail, suffix)) or
-          (prefix != "" and String.contains?(tail, prefix))
-
-      _ ->
-        false
+      {output, 0} -> paste_landed?(output, prompt)
+      _ -> false
     end
   end
 
-  # `capture-pane -p` right-pads the pane with blank lines, so we drop trailing
-  # blanks before taking the tail — otherwise the window is all padding and the
-  # input box (which sits above the footer) is missed.
-  defp input_tail(output) do
-    output
-    |> String.split("\n")
-    |> Enum.reverse()
-    |> Enum.drop_while(&(String.trim(&1) == ""))
-    |> Enum.take(@input_tail_lines)
-    |> Enum.reverse()
-    |> Enum.join(" ")
-    |> squish()
+  @doc false
+  # Pure check over a pane capture; public so the rule is unit-testable.
+  @spec paste_landed?(String.t(), String.t()) :: boolean()
+  def paste_landed?(pane_output, prompt) when is_binary(pane_output) and is_binary(prompt) do
+    region = input_region(pane_output)
+    newlines = length(String.split(prompt, "\n")) - 1
+
+    placeholder_ok? =
+      @placeholder_re
+      |> Regex.scan(region)
+      |> Enum.any?(fn [_, count] -> String.to_integer(count) == newlines end)
+
+    {prefix, suffix} = prompt_needles(prompt)
+    compact = compact(region)
+
+    literal_ok? =
+      prefix != "" and String.contains?(compact, prefix) and
+        (suffix == "" or String.contains?(compact, suffix))
+
+    placeholder_ok? or literal_ok?
   end
 
-  # A distinctive prefix and suffix of the prompt (squished), each ~24 chars.
+  # The input box: from the last line carrying the "❯" input marker to the end
+  # of the pane (trailing padding dropped). Submitted prompts render in the
+  # transcript with ">" instead, so they fall outside this window even when a
+  # short reply leaves them near the bottom. Falls back to the last
+  # @input_tail_lines lines when no marker is visible.
+  defp input_region(output) do
+    lines =
+      output
+      |> String.split("\n")
+      |> Enum.reverse()
+      |> Enum.drop_while(&(String.trim(&1) == ""))
+      |> Enum.reverse()
+
+    marker_index =
+      lines
+      |> Enum.with_index()
+      |> Enum.reduce(nil, fn {line, i}, acc ->
+        if String.starts_with?(String.trim_leading(line), "❯"), do: i, else: acc
+      end)
+
+    region =
+      case marker_index do
+        nil -> Enum.take(lines, -@input_tail_lines)
+        i -> Enum.drop(lines, i)
+      end
+
+    region |> Enum.join(" ") |> squish()
+  end
+
+  # A distinctive prefix and suffix of the prompt, whitespace stripped, ~24
+  # chars each. Both must be present for a literal (uncollapsed) render.
   defp prompt_needles(prompt) do
-    squished = squish(prompt)
-    prefix = String.slice(squished, 0, 24)
-    suffix = if String.length(squished) > 24, do: String.slice(squished, -24, 24), else: ""
+    compacted = compact(prompt)
+    prefix = String.slice(compacted, 0, 24)
+    suffix = if String.length(compacted) > 24, do: String.slice(compacted, -24, 24), else: ""
     {prefix, suffix}
   end
+
+  defp compact(text), do: String.replace(text, ~r/\s+/, "")
 
   defp squish(text), do: text |> String.replace(~r/\s+/, " ") |> String.trim()
 
@@ -525,9 +570,13 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
             :ok
 
           :trust ->
-            # Accept the "Do you trust this folder?" dialog ("1. Yes" is the
-            # default selection). The workspace is always our own fresh clone.
-            tmux(["send-keys", "-t", pane(session_name), "Enter"])
+            # Accept the "Do you trust this folder?" dialog — the workspace is
+            # always our own clone. Which option is preselected has changed:
+            # older builds put "1. Yes" under the cursor, Claude Code 2.1.26x
+            # puts "No, exit" first and selected, so a bare Enter exits the CLI
+            # and leaves a shell in the pane (the next paste then runs as shell
+            # commands). Read where the cursor is and only confirm on "Yes".
+            answer_trust_dialog(session_name)
             Process.sleep(poll_ms)
             do_wait_for_ready(session_name, poll_ms, deadline)
 
@@ -562,6 +611,40 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
   defp trust_dialog?(output) do
     String.contains?(output, "trust this folder") or
       String.contains?(output, "trust the files")
+  end
+
+  defp answer_trust_dialog(session_name) do
+    case tmux(["capture-pane", "-t", pane(session_name), "-p"]) do
+      {output, 0} ->
+        case trust_cursor(output) do
+          :yes -> tmux(["send-keys", "-t", pane(session_name), "Enter"])
+          # On "No" (or an option we don't recognise) step the cursor and let
+          # the next poll re-read it; a two-option menu reaches "Yes" in one
+          # step, and an unexpected menu times out loudly instead of exiting.
+          _ -> tmux(["send-keys", "-t", pane(session_name), "Down"])
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  @doc false
+  # Which trust-dialog option the "❯" cursor sits on. Public for unit tests.
+  @spec trust_cursor(String.t()) :: :yes | :no | :unknown
+  def trust_cursor(output) when is_binary(output) do
+    output
+    |> String.split("\n")
+    |> Enum.find_value(:unknown, fn line ->
+      trimmed = String.trim_leading(line)
+
+      cond do
+        not String.starts_with?(trimmed, "❯") -> nil
+        Regex.match?(~r/^❯\s*(\d+\.\s*)?Yes\b/, trimmed) -> :yes
+        Regex.match?(~r/^❯\s*(\d+\.\s*)?No\b/, trimmed) -> :no
+        true -> nil
+      end
+    end)
   end
 
   # "Ready for a prompt" = the "❯" input marker plus a footer line that only

@@ -15,6 +15,12 @@ config :symphony_elixir,
 # dev server (which holds the workflow-configured port).
 if config_env() == :test, do: config(:symphony_elixir, server_port_override: 0)
 
+# `mix test` boots the application on the same host as the live orchestrator.
+# A test BEAM owns no runs, so its startup and per-poll reapers would see every
+# live worker's tmux session and slot lease as orphaned and kill them. Only the
+# real orchestrator reaps.
+if config_env() == :test, do: config(:symphony_elixir, reap_orphans: false)
+
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   url: [host: "localhost"],

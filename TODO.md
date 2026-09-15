@@ -265,6 +265,41 @@ showed live token flow). A long test suite naturally holds one phase for
 30-60 min. The phase timer should not fire while the session shows recent
 activity; long-but-active phases are normal, not stuck.
 
+## One dead slot at the head of the free list starves every dispatch (GEA-7671, 2026-09-15)
+`slot-claim-registry.sh` claims the first free slot in numeric order and, when that
+slot's backend never answers, exits 75 after 4 recycles and 450s. The orchestrator
+retries 45s later and claims the same slot again. Observed 2026-09-15 08:23–09:40 CT:
+seven Resolve Conflicts dispatches for GEA-7671, each ~8.5 min, zero worker turns, while
+slots 11 and 14 sat free and healthy. The dead slot was slot10, the only procurement slot
+whose untracked `.envrc` lacked the `MIX_ARCHIVES` mitigation (see the ETS badarg entry
+below); every boot crashed the same way. Fixed on this machine by adding the line and
+`direnv allow`. Symphony-side fixes still open:
+- On boot failure, release the slot and continue to the next free slot inside the same
+  claim instead of exiting 75.
+- Detect the `Mix.State` ETS crash in the fresh `processes.log` and fail that slot fast
+  (it never recovers by recycling).
+- Slot provisioning must write the `MIX_ARCHIVES` export, or `devenv.nix` in
+  gf_procurement must carry it, so a new slot cannot miss it.
+
+## A transient Linear error during a retry poll drops the issue for good (2026-09-15)
+`dispatch_issue/…` handles `{:error, reason}` from the retry-time issue refresh by
+logging "Skipping dispatch; issue refresh failed" and returning state — no re-schedule.
+Observed 2026-09-15 09:40 CT: Linear answered RATELIMITED (2500 req/h exhausted) on
+GEA-7671's retry poll; the issue left the retry queue and nothing brought it back. It is
+`In Review`, so the regular poll never lists it (`active_states` is Shaped/Todo/In
+Progress), and `check_completed_pr_health` had lost it too (next entry). It vanished
+from the dashboard until a manual force dispatch at 10:18. Fix: on a refresh error keep
+the issue in the retry queue with backoff (treat like `no_capacity`), and honour the
+rate-limit reset instead of hammering.
+
+## Force dispatch wipes run history, so the PR-health check forgets the PR
+`do_force_dispatch/2` calls `History.delete_all_runs/1` and drops the issue from the
+`completed` set. After that, `check_completed_pr_health` has no `pr_url` for the issue,
+so a conflicted PR is only re-detected while the retry chain is alive. Combined with the
+entry above, one Linear hiccup after a force dispatch parks the issue silently. Fix:
+keep the PR url (Linear attachment lookup) in the completed history, or do not delete
+rows that carry `eval_pr_url`.
+
 ## Slot backends intermittently die at boot inside `Mix.start/0` (ETS badarg)
 `devenv up` backend sometimes crashes before any app code loads:
 `(MatchError) ... {Mix, :start, ...} {:EXIT, {:badarg, [{:ets, :lookup, [Mix.State, :shell] ...`

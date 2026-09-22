@@ -280,6 +280,24 @@ below); every boot crashed the same way. Fixed on this machine by adding the lin
   (it never recovers by recycling).
 - Slot provisioning must write the `MIX_ARCHIVES` export, or `devenv.nix` in
   gf_procurement must carry it, so a new slot cannot miss it.
+Status 2026-09-22 (GEA-9890): **re-scoped to the laptop; this shape cannot occur on the
+`gf-symphony` box.** Re-tested against the box's slot protocol, which is what `before_run`
+calls there:
+- There is no allowlist and no head of a free list. `slot-claim-registry.sh` walked five
+  fixed slots in numeric order; `agents/provision-slot.sh` reuses a *finished* slot first
+  (GEA-9597: clean tree, branch pushed, HEAD is what was pushed, branch gone from origin,
+  PR merged) and otherwise takes the first integer with neither a directory nor a lease.
+  A slot holding a lease is skipped, so a failed slot cannot sit at the front of anything.
+- There is no backend to answer. Provisioning on the box ends at the repo's own setup task;
+  nothing runs `mix phx.server`, so "the slot's backend never answers" is not one of its
+  outcomes, and neither is the 4-recycle/exit-75 loop that followed it.
+- The root cause is structurally gone. The failure was one slot whose *untracked* `.envrc`
+  lacked the archive mitigation. On the box that file is not hand-maintained: the
+  provisioner copies the tracked `configs/<repo>/.envrc` and appends `MIX_HOME` itself
+  (`pin_mix_home`, GEA-9479) — one archive dir per Elixir major.minor — which is this
+  entry's own third fix, already shipped on the side that provisions.
+What remains is the laptop's `slot-claim-registry.sh` and belongs to whoever still runs
+Symphony from a laptop. The first two fixes above are worth nothing to the box.
 
 ## A transient Linear error during a retry poll drops the issue for good (2026-09-15)
 `dispatch_issue/…` handles `{:error, reason}` from the retry-time issue refresh by
@@ -392,6 +410,15 @@ Fix directions:
 Status 2026-09-02: partial — first two done (`workspace.ex` always returns the
 symphony workspace; `slot-release-registry.sh` removes `.symphony_slot`); the
 claim-script guard is still missing.
+Status 2026-09-22 (GEA-9890): **done on the `gf-symphony` box — all three.** The third,
+the claim-script guard, is now the first thing `before_run` does in
+`agents/WORKFLOW.symphony.md` (gf_harness_surfaces): it refuses outright when `$PWD` is
+inside `local-dev/`, which is the only way a hook can write one slot's contract into
+another slot's tree. The marker deletion is now on the release side too — `before_remove`
+removes both copies of `.symphony_slot` when it frees the lease, so no retry can adopt one.
+Re-read of the cause confirms it is gone upstream of both: `Workspace.create_for_issue/1`
+has no `resolve_slot_workspace/1` any more and always hands back the symphony workspace.
+The laptop scripts keep whatever guard they have; they route nothing now.
 
 ## needs_human_message truncated at 500 chars
 The escalation message is cut mid-sentence at exactly 500 chars — in the DB column and

@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{Config, Evaluator, Grant, History, Notifier, Planning, StatusDashboard, Suitability, Tracker, Workspace}
   alias SymphonyElixir.Claude.StreamParser
+  alias SymphonyElixir.Linear.Client
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 30_000
@@ -1263,7 +1264,7 @@ defmodule SymphonyElixir.Orchestrator do
     # `pr_head_sha/1` answers with the first 12 characters, or "?" when `gh` cannot say.
     # "?" is not an answer, so it means "post the hand-off".
     with short when is_binary(short) and short != "?" <- pr_head_sha(pr_url),
-         {:ok, comments} <- SymphonyElixir.Linear.Client.fetch_all_issue_comments(Map.get(issue, :id)) do
+         {:ok, comments} <- Client.fetch_all_issue_comments(Map.get(issue, :id)) do
       handed_off_for_sha?(comments, short)
     else
       _ -> false

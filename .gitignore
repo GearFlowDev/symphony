@@ -1,2 +1,13 @@
 # Playwright MCP cache / browser artifacts.
 .playwright-mcp/
+
+# nix/devenv, for machines that build this repo with nix rather than mise. `devenv.nix`,
+# `devenv.yaml` and `devenv.lock` are tracked; everything devenv and direnv generate is not.
+.devenv/
+.devenv.flake.nix
+devenv.local.nix
+.direnv/
+
+# The per-machine environment a slot or a laptop renders. The key-set it fills is
+# `local-dev/configs/symphony/env.template` in the gf_engineering workspace.
+.env

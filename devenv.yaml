@@ -1,0 +1,7 @@
+# `rolling` is devenv's own default nixpkgs, named here so the pin is legible rather than
+# implicit. `devenv.lock` beside this file holds the revision, and it is the revision the
+# Gearflow agent boxes already carry in their nix store — so a slot of this repo builds
+# from cache instead of fetching a second nixpkgs.
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling

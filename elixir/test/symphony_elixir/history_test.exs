@@ -178,6 +178,44 @@ defmodule SymphonyElixir.HistoryTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
+  describe "the daily dispatch budget (GEA-9886)" do
+    test "a dispatch that died in before_run does not spend the budget" do
+      # No session id and no turns: the agent never started. A failed
+      # provisioning hook and a stall abandoned before a session both look like
+      # this, and on 2026-09-22 twelve of them exhausted GEA-9699's day.
+      {:ok, hook_failure} = History.record_dispatch(dispatch_attrs(issue_identifier: "SYM-BUDGET"))
+
+      {:ok, _} =
+        History.record_completion(hook_failure, %{
+          finished_at: DateTime.utc_now(),
+          outcome: "failed",
+          error_category: "terminated"
+        })
+
+      assert History.dispatches_today("SYM-BUDGET") == 0
+    end
+
+    test "a dispatch whose agent ran does spend the budget" do
+      {:ok, real} = History.record_dispatch(dispatch_attrs(issue_identifier: "SYM-BUDGET-REAL"))
+
+      {:ok, _} =
+        History.record_completion(real, %{
+          finished_at: DateTime.utc_now(),
+          outcome: "failed",
+          session_id: "thread-1",
+          turns_used: 4
+        })
+
+      assert History.dispatches_today("SYM-BUDGET-REAL") == 1
+    end
+
+    test "a run still in flight counts, so a live worker cannot be dispatched twice over" do
+      {:ok, _open} = History.record_dispatch(dispatch_attrs(issue_identifier: "SYM-BUDGET-OPEN"))
+
+      assert History.dispatches_today("SYM-BUDGET-OPEN") == 1
+    end
+  end
+
   describe "the no-progress breaker's pre-PR progress signal (GEA-9886)" do
     test "issue_change_totals sums the evaluator's recorded change counts" do
       {:ok, first} = History.record_dispatch(dispatch_attrs(issue_identifier: "SYM-PRE"))

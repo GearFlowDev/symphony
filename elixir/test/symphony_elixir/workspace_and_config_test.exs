@@ -1116,6 +1116,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   end
 
   test "a reload that cannot be read keeps the last known good configuration" do
+    # The store IS the subject: with no store process, `Workflow.current/0`
+    # reads the file directly and an unreadable one falls back to defaults —
+    # the very thing this test says does not happen. It can genuinely be absent
+    # by the time this runs: SymphonyElixir.ExtensionsTest terminates the
+    # supervised store and its restart is a no-op, because the replacement it
+    # started still holds the registered name, so `restart_child` answers
+    # `{:already_started, _}` and that replacement then dies with its test
+    # process. Same remedy that file uses on itself.
+    ensure_workflow_store_running()
+
     workflow_root =
       Path.join(System.tmp_dir!(), "symphony-elixir-bad-reload-#{System.unique_integer([:positive])}")
 
@@ -1175,6 +1185,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     )
 
     assert Config.agent_stall_timeout_ms() == 1_800_000
+  end
+
+  defp ensure_workflow_store_running do
+    if Process.whereis(WorkflowStore) do
+      :ok
+    else
+      case Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore) do
+        {:ok, _pid} -> :ok
+        {:error, {:already_started, _pid}} -> :ok
+      end
+    end
   end
 
   defp process_alive?(pid) when is_binary(pid) do

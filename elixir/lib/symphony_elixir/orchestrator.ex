@@ -1297,7 +1297,8 @@ defmodule SymphonyElixir.Orchestrator do
        {:dispatch_budget_exhausted,
         "#{used} dispatches since 00:00 UTC (limit #{limit}) — a converging issue " <>
           "finishes in far fewer; something is looping. Review the plan and recent " <>
-          "run outcomes, then re-activate the issue to resume."}}
+          "run outcomes. The count resets at 00:00 UTC; re-activate the issue to " <>
+          "resume before then."}}
     else
       :ok
     end
@@ -1412,8 +1413,6 @@ defmodule SymphonyElixir.Orchestrator do
   rescue
     _ -> "changed=?"
   end
-
-  defp progress_marker(_identifier, _pr_url), do: "head=?"
 
   # The PR head belongs in the fingerprint: post-approval phases (Resolve
   # Review, Fix CI) change no row states and add no tester verdict — new
@@ -2465,8 +2464,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp cleanup_issue_workspace(_running_entry, identifier), do: cleanup_issue_workspace(identifier)
-
   defp kill_running_hook(running_entry) when is_map(running_entry) do
     case Map.get(running_entry, :workspace_path) do
       workspace_path when is_binary(workspace_path) and workspace_path != "" ->
@@ -2483,8 +2480,6 @@ defmodule SymphonyElixir.Orchestrator do
       Logger.warning("Failed to kill workspace hook process tree: #{Exception.message(error)}")
       :ok
   end
-
-  defp kill_running_hook(_running_entry), do: :ok
 
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.linear_terminal_states()) do

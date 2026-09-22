@@ -2,6 +2,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
   test "snapshot returns :timeout when snapshot server is unresponsive" do
+    # This asserts the NO-CACHE path, so start from no cache. The application's
+    # own orchestrator caches a snapshot on its first poll, which used to be
+    # prevented only by that orchestrator failing every cycle on an unusable
+    # config — not something a test should depend on.
+    if :ets.whereis(:symphony_orchestrator_snapshot) != :undefined do
+      :ets.delete(:symphony_orchestrator_snapshot, :last)
+    end
+
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
 
@@ -832,10 +840,15 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "orchestrator triggers an immediate poll cycle shortly after startup" do
+    # `tracker_kind: "memory"`, not a missing Linear token: the orchestrator now
+    # refuses to start on an invalid WORKFLOW.md, and this test wants a VALID
+    # config whose poll reaches no tracker.
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: nil,
+      tracker_kind: "memory",
       poll_interval_ms: 5_000
     )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
 
     orchestrator_name = Module.concat(__MODULE__, :ImmediateStartupOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -885,9 +898,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   test "orchestrator poll cycle resets next refresh countdown after a check" do
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: nil,
+      tracker_kind: "memory",
       poll_interval_ms: 50
     )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
 
     orchestrator_name = Module.concat(__MODULE__, :PollCycleOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -934,9 +949,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: nil,
+      tracker_kind: "memory",
       codex_stall_timeout_ms: 1_000
     )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
 
     issue_id = "issue-stall"
     orchestrator_name = Module.concat(__MODULE__, :StallOrchestrator)
@@ -994,6 +1011,59 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
     assert remaining_ms >= 9_500
     assert remaining_ms <= 10_500
+  end
+
+  test "a run still inside its before_run hook is not stall-killed on the agent timeout" do
+    # No session id yet means no agent yet: the run is in `before_run`, and a
+    # provisioning hook legitimately takes minutes. Policing that window with
+    # the AGENT's stall timeout killed runs mid-provision and tore down the
+    # devenv the hook was waiting on (TODO.md, GEA-4619/4625).
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_stall_timeout_ms: 1_000,
+      hook_timeout_ms: 900_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    issue_id = "issue-bootstrapping"
+    orchestrator_name = Module.concat(__MODULE__, :BootstrapStallOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :normal) end)
+
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill) end)
+
+    dispatched_at = DateTime.add(DateTime.utc_now(), -60, :second)
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: "MT-BOOTSTRAP",
+      issue: %Issue{id: issue_id, identifier: "MT-BOOTSTRAP", state: "In Progress"},
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: dispatched_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    assert Map.has_key?(state.running, issue_id),
+           "60s into a 900s hook budget is not a stalled agent"
+
+    assert Process.alive?(worker_pid)
   end
 
   test "status dashboard renders offline marker to terminal" do
@@ -1161,19 +1231,22 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "status dashboard coalesces rapid updates to one render per interval" do
     dashboard_name = Module.concat(__MODULE__, :RenderDashboard)
     parent = self()
-    orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
+    # The orchestrator is no longer a direct child of the application
+    # supervisor: it sits under AgentRuntimeSupervisor with the task supervisor
+    # that owns its agents, so stopping it means stopping that subtree.
+    runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
 
     on_exit(fn ->
-      if is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
-        case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator) do
+      if is_nil(Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)) do
+        case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.AgentRuntimeSupervisor) do
           {:ok, _pid} -> :ok
           {:error, {:already_started, _pid}} -> :ok
         end
       end
     end)
 
-    if is_pid(orchestrator_pid) do
-      assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator)
+    if is_pid(runtime_pid) do
+      assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.AgentRuntimeSupervisor)
     end
 
     {:ok, pid} =

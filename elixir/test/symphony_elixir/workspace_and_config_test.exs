@@ -972,4 +972,212 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   defp lease_exists?(registry, slot_name) do
     File.exists?(Path.join(registry, slot_name <> ".json"))
   end
+
+  # --- Ported upstream behaviours (GEA-9886) -------------------------------
+
+  test "a failed after_create hook removes the workspace it partially built" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-failed-bootstrap-#{System.unique_integer([:positive])}")
+
+    try do
+      File.mkdir_p!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        hook_after_create: "echo half-built > partial.txt\nexit 9"
+      )
+
+      workspace = Path.join(test_root, "MT-BOOTSTRAP")
+
+      assert {:error, {:workspace_hook_failed, "after_create", 9, _output}} =
+               Workspace.create_for_issue("MT-BOOTSTRAP")
+
+      refute File.exists?(workspace),
+             "a half-built workspace must not survive to be mistaken for a provisioned one"
+
+      # And the retry bootstraps from nothing rather than inheriting the debris.
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        hook_after_create: "echo built > ready.txt"
+      )
+
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-BOOTSTRAP")
+      assert File.exists?(Path.join(workspace, "ready.txt"))
+      refute File.exists?(Path.join(workspace, "partial.txt"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "a failed after_create hook leaves a workspace it did not create alone" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-existing-workspace-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "MT-EXISTING")
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "work-in-progress.txt"), "keep me\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        hook_after_create: "exit 9"
+      )
+
+      assert {:error, {:workspace_hook_failed, "after_create", 9, _output}} =
+               Workspace.create_for_issue("MT-EXISTING")
+
+      assert File.read!(Path.join(workspace, "work-in-progress.txt")) == "keep me\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "a relative workspace.root anchors on the WORKFLOW.md directory, not the current one" do
+    workflow_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-relative-root-#{System.unique_integer([:positive])}")
+
+    try do
+      File.mkdir_p!(workflow_root)
+      workflow_file = Path.join(workflow_root, "WORKFLOW.md")
+      write_workflow_file!(workflow_file, workspace_root: "./workspaces")
+      Workflow.set_workflow_file_path(workflow_file)
+
+      assert Config.workspace_root() == Path.join(workflow_root, "workspaces")
+      refute Config.workspace_root() == Path.expand("./workspaces")
+    after
+      File.rm_rf(workflow_root)
+    end
+  end
+
+  test "an absolute workspace.root is left exactly where it points" do
+    absolute = Path.join(System.tmp_dir!(), "symphony-elixir-absolute-root-#{System.unique_integer([:positive])}")
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: absolute)
+
+    assert Config.workspace_root() == absolute
+  end
+
+  test "remove_recorded removes the workspace a run recorded even after the root moves" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-recorded-removal-#{System.unique_integer([:positive])}")
+
+    try do
+      recorded_root = Path.join(test_root, "recorded")
+      moved_root = Path.join(test_root, "moved")
+      workspace = Path.join(recorded_root, "MT-RECORDED")
+
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(moved_root)
+      File.write!(Path.join(workspace, "slot.txt"), "claimed\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: moved_root)
+
+      # The configured root no longer contains this workspace; the recorded path
+      # is what the run actually created, so that is what must be removed.
+      assert {:error, {:workspace_outside_root, _expanded, _root}, ""} = Workspace.remove(workspace)
+      assert File.exists?(workspace)
+
+      assert {:ok, _removed} = Workspace.remove_recorded(workspace)
+      refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "an abandoned hook is killed with the processes it started" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-hook-tree-#{System.unique_integer([:positive])}")
+
+    try do
+      File.mkdir_p!(test_root)
+      child_pid_file = Path.join(test_root, "child.pid")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        hook_timeout_ms: 400,
+        hook_before_run: "sleep 120 &\necho $! > \"#{child_pid_file}\"\nwait"
+      )
+
+      workspace = Path.join(test_root, "MT-HOOKTREE")
+      File.mkdir_p!(workspace)
+
+      assert {:error, {:workspace_hook_timeout, "before_run", 400}} =
+               Workspace.run_before_run_hook(workspace, "MT-HOOKTREE")
+
+      child_pid = child_pid_file |> File.read!() |> String.trim()
+      assert child_pid != ""
+
+      # Closing the port kills the hook's shell and nothing below it. The child
+      # is the process that, in the live incident, went on building a second
+      # slot for an issue the orchestrator had already re-dispatched.
+      refute process_alive?(child_pid), "the hook's child survived the timeout"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "a reload that cannot be read keeps the last known good configuration" do
+    workflow_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-bad-reload-#{System.unique_integer([:positive])}")
+
+    try do
+      File.mkdir_p!(workflow_root)
+      workflow_file = Path.join(workflow_root, "WORKFLOW.md")
+      write_workflow_file!(workflow_file, poll_interval_ms: 45_000)
+      Workflow.set_workflow_file_path(workflow_file)
+
+      assert Config.poll_interval_ms() == 45_000
+
+      # Front matter that does not decode to a map — the shape a half-written or
+      # hand-broken WORKFLOW.md takes. An unattended orchestrator must go on
+      # running the config it already had rather than falling back to defaults
+      # that point somewhere else.
+      #
+      # The error is logged by `WorkflowStore.log_reload_error/2` ("keeping last
+      # known good configuration"). That line is NOT asserted here: by the time
+      # this test runs in the full suite, error logging has been turned off by
+      # an earlier file, and neither `capture_log/1` nor a handler added here
+      # receives anything. That is SymphonyElixir.ExtensionsTest's pre-existing
+      # breakage (GEA-10241), not this behaviour's — so the assertions below are
+      # on the contract the orchestrator actually depends on.
+      File.write!(workflow_file, """
+      ---
+      - not
+      - a map
+      ---
+
+      Prompt.
+      """)
+
+      assert {:error, :workflow_front_matter_not_a_map} = WorkflowStore.force_reload()
+
+      assert Config.poll_interval_ms() == 45_000,
+             "a rejected reload must not drop the orchestrator back to defaults"
+    after
+      File.rm_rf(workflow_root)
+    end
+  end
+
+  test "the stall watchdog reads the timeout of the backend that is actually running" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "claude",
+      claude_command: "claude",
+      claude_stall_timeout_ms: 600_000,
+      codex_stall_timeout_ms: 1_800_000
+    )
+
+    assert Config.agent_stall_timeout_ms() == 600_000,
+           "a claude run must be policed by claude.stall_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_backend: "codex",
+      claude_stall_timeout_ms: 600_000,
+      codex_stall_timeout_ms: 1_800_000
+    )
+
+    assert Config.agent_stall_timeout_ms() == 1_800_000
+  end
+
+  defp process_alive?(pid) when is_binary(pid) do
+    match?({_output, 0}, System.cmd("ps", ["-p", pid], stderr_to_stdout: true))
+  end
 end

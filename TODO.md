@@ -6,6 +6,49 @@ CI passing and the CodeRabbit review resolved/approved. Merge is the only human
 step. Any place the pipeline can stall short of that line without a human being
 *required* is a bug.
 
+## Upstream behaviours ported by hand (2026-09-22, GEA-9886)
+
+The fork is 182 commits past the fork point and upstream rewrote `config.ex`,
+`orchestrator.ex` and `workspace.ex`, so there is no merge path. Nine behaviours
+an unattended run depends on were re-implemented against this fork's code, each
+with a regression in `elixir/test/`:
+
+- **Claim hygiene on retry** (upstream 0517275) — see the entry below, now fixed.
+- **Safe terminal cleanup** (7cf29df) — the worker is stopped before
+  `before_remove` releases its slot, and cleanup removes the workspace the run
+  RECORDED (`Workspace.remove_recorded/1`) rather than one recomputed from a
+  config that may have reloaded since.
+- **Failed bootstrap retry and root anchoring** (cbd2158) — a failed
+  `after_create` removes the workspace it partially built, so the retry
+  bootstraps from nothing; a relative `workspace.root` resolves against the
+  WORKFLOW.md directory, not the process's current one.
+- **Validate at boot** (d476215) — the orchestrator refuses to start on an
+  invalid WORKFLOW.md instead of polling forever and logging the same config
+  error every cycle. `:test` boots against `test/fixtures/startup_workflow.md`.
+  The other half of that pair, keeping last known good on a failed reload
+  (cdb466a), was ALREADY in this fork; it now has a regression pinning it.
+- **Agents under the orchestrator's supervision tree** (476b2b0) —
+  `AgentRuntimeSupervisor` holds the orchestrator and the task supervisor that
+  owns its agents under `:one_for_all`, so a restarted orchestrator can never
+  believe a dead agent is still running.
+- **Live stop on label removal** (54b456b, behaviour only) — the candidate query
+  filters on the routing label, but the by-id refresh carries live labels;
+  removing the label from a running issue now stops its agent and releases its
+  slot. An EMPTY label list is treated as a thin projection, not as removal.
+- **Stall watchdog** — see the entry below, now fixed.
+- **Continuation guidance keys on rows, not on a push** — the per-turn guidance
+  for a dispatch carrying assigned rows says the phase is complete only when
+  every row is `done`. The old "or your fix is pushed" ended two re-dispatched
+  row-closers' turns while their rows sat `partial` (first Fly run, GEA-9889).
+- **The no-progress breaker has a pre-PR progress signal** — before a PR exists
+  the tester verdict and PR head are both constants, so the fingerprint
+  collapsed to row states and a dispatch that pushed looked identical to one
+  that did nothing. It now carries the evaluator's cumulative change totals, and
+  the trip message names only the gates that actually ran.
+
+Deliberately NOT ported: tracker adapters, SSH workers, the Ecto config schema,
+Burrito packaging.
+
 ## Code/context-aware completeness review (done 2026-08-11); residual validation
 The dominant defect was incomplete propagation of a change across the codebase —
 a signature/field changes but some callers/writers are never updated (GEA-4849,
@@ -242,7 +285,7 @@ belong here:
 - Launch `claude` as the tmux session command (`new-session ... <cmd>`) instead
   of typing into an interactive shell, so shell-init prompts can't eat it.
 
-## Stall watchdog counts before_run provisioning as agent inactivity
+## Stall watchdog counts before_run provisioning as agent inactivity (fixed 2026-09-22)
 The orchestrator's stall reconciler (`reconcile_stalled_running_issues`) starts
 its clock at dispatch and reads `codex.stall_timeout_ms` (300s default)
 regardless of agent backend — `claude.stall_timeout_ms` never reaches it. A
@@ -258,6 +301,16 @@ stay >= hooks.timeout_ms until fixed.
 Status 2026-09-02: partial (config-only) — code still reads
 `codex_stall_timeout_ms` for every backend, starts the clock at `started_at`, and
 the phase timer below is still `timeout_ms * 2` with no recent-activity guard.
+Status 2026-09-22 (GEA-9886): both real fixes are in. (b) the watchdog reads
+`Config.agent_stall_timeout_ms/0`, which follows `agent.backend` — a claude run is
+policed by `claude.stall_timeout_ms`, not by a codex key. (a) until a session id
+exists there is no agent to be stalled, so `bootstrap_aware_timeout/2` floors the
+window at `hooks.timeout_ms`; the "keep codex.stall_timeout_ms >= hooks.timeout_ms"
+mitigation is no longer what holds this together. Regressions:
+`workspace_and_config_test.exs` "the stall watchdog reads the timeout of the backend
+that is actually running" and `orchestrator_status_test.exs` "a run still inside its
+before_run hook is not stall-killed on the agent timeout". The phase timer is still
+`timeout_ms * 2` with no recent-activity guard — still open.
 
 Related: the phase-stuck timer (hardcoded `timeout_ms * 2`) killed an ACTIVELY
 WORKING agent 31 min into its Test phase (GEA-4621, 2026-07-14 16:35 — pane
@@ -281,7 +334,7 @@ below); every boot crashed the same way. Fixed on this machine by adding the lin
 - Slot provisioning must write the `MIX_ARCHIVES` export, or `devenv.nix` in
   gf_procurement must carry it, so a new slot cannot miss it.
 
-## A transient Linear error during a retry poll drops the issue for good (2026-09-15)
+## A transient Linear error during a retry poll drops the issue for good (fixed 2026-09-22)
 `dispatch_issue/…` handles `{:error, reason}` from the retry-time issue refresh by
 logging "Skipping dispatch; issue refresh failed" and returning state — no re-schedule.
 Observed 2026-09-15 09:40 CT: Linear answered RATELIMITED (2500 req/h exhausted) on
@@ -291,6 +344,13 @@ Progress), and `check_completed_pr_health` had lost it too (next entry). It vani
 from the dashboard until a manual force dispatch at 10:18. Fix: on a refresh error keep
 the issue in the retry queue with backoff (treat like `no_capacity`), and honour the
 rate-limit reset instead of hammering.
+Status 2026-09-22 (GEA-9886, ported from upstream 0517275): fixed for the refresh half.
+`refresh_issue_for_dispatch/1` is split out of `dispatch_issue/4` and `handle_active_retry/4`
+now acts on its outcome — a missing issue releases the claim, a stale one goes through
+blocked reconciliation, and an ERROR reschedules with backoff instead of returning state.
+Regression: `core_test.exs` "a retry whose dispatch-time refresh errors keeps its claim and
+reschedules". Honouring the rate-limit reset window is still open; the backoff ladder is
+what stands in for it.
 
 ## Force dispatch wipes run history, so the PR-health check forgets the PR
 `do_force_dispatch/2` calls `History.delete_all_runs/1` and drops the issue from the

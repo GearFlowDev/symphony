@@ -178,6 +178,49 @@ defmodule SymphonyElixir.HistoryTest do
   # Helpers
   # ---------------------------------------------------------------------------
 
+  describe "the no-progress breaker's pre-PR progress signal (GEA-9886)" do
+    test "issue_change_totals sums the evaluator's recorded change counts" do
+      {:ok, first} = History.record_dispatch(dispatch_attrs(issue_identifier: "SYM-PRE"))
+      {:ok, second} = History.record_dispatch(dispatch_attrs(issue_identifier: "SYM-PRE"))
+
+      {:ok, _} = History.record_completion(first, %{finished_at: DateTime.utc_now(), outcome: "completed"})
+      {:ok, _} = History.record_completion(second, %{finished_at: DateTime.utc_now(), outcome: "completed"})
+      {:ok, _} = History.record_evaluation(first, %{eval_files_changed: 2, eval_lines_changed: 40})
+      {:ok, _} = History.record_evaluation(second, %{eval_files_changed: 1, eval_lines_changed: 7})
+
+      assert %{files_changed: 3, lines_changed: 47} = History.issue_change_totals("SYM-PRE")
+    end
+
+    test "an issue with no runs totals to zero rather than raising" do
+      assert %{files_changed: 0, lines_changed: 0} = History.issue_change_totals("SYM-NONE")
+    end
+
+    test "a dispatch that changed code does not fingerprint the same as one that did not" do
+      plan = %SymphonyElixir.Planning.Plan{
+        issue_identifier: "SYM-FP",
+        plan_json: %{"rows" => [%{"id" => "R1", "state" => "done"}, %{"id" => "R2", "state" => "partial"}]}
+      }
+
+      # No PR yet: the verdict and the PR head are both constants here, so the
+      # change totals are the only thing left that can move.
+      before = SymphonyElixir.Orchestrator.plan_cycle_fingerprint_for_test(plan, "SYM-FP", nil)
+
+      {:ok, run} = History.record_dispatch(dispatch_attrs(issue_identifier: "SYM-FP"))
+      {:ok, _} = History.record_completion(run, %{finished_at: DateTime.utc_now(), outcome: "completed"})
+      {:ok, _} = History.record_evaluation(run, %{eval_files_changed: 1, eval_lines_changed: 12})
+
+      assert before =~ "changed=0f/0l"
+      refute before == SymphonyElixir.Orchestrator.plan_cycle_fingerprint_for_test(plan, "SYM-FP", nil)
+    end
+
+    test "the breaker message does not blame a tester that never ran" do
+      message = SymphonyElixir.Orchestrator.no_progress_message_for_test(3, 3, "R1=partial | untested | changed=0f/0l", "SYM-NOTESTER")
+
+      assert message =~ "the tester has not run yet"
+      refute message =~ "plan, grader and tester are not converging"
+    end
+  end
+
   defp dispatch_attrs(overrides \\ []) do
     Enum.into(overrides, %{
       issue_id: "linear-uuid-1",

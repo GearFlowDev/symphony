@@ -7,6 +7,11 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.Config
 
   @excluded_entries MapSet.new([".elixir_ls", "tmp"])
+  @hook_pid_file_prefix "symphony-hook-"
+  # Recorded before the hook body runs, so an abandoned hook can be killed WITH
+  # its children. `$$` is this shell; every process the hook starts hangs below
+  # it, and closing the port only ever reaches the shell itself.
+  @hook_pid_preamble "printf '%s' \"$$\" > \"$SYMPHONY_HOOK_PIDFILE\" 2>/dev/null || true\n"
 
   @spec create_for_issue(map() | String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier) do
@@ -19,7 +24,7 @@ defmodule SymphonyElixir.Workspace do
 
       with :ok <- validate_workspace_path(workspace),
            {:ok, created?} <- ensure_workspace(workspace),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?) do
+           :ok <- run_after_create_or_clean_up(workspace, issue_context, created?) do
         # Always hand back the symphony workspace — never a slot directory.
         # Resolving a leftover .symphony_slot to its slot dir here (pre-claim)
         # made interrupted-run retries pass a SLOT DIR as $WORKSPACE to the
@@ -77,6 +82,54 @@ defmodule SymphonyElixir.Workspace do
         File.rm_rf(workspace)
     end
   end
+
+  @doc """
+  Removes a workspace by the path the caller RECORDED when it was created.
+
+  `remove_issue_workspaces/1` recomputes the path from the live
+  `workspace.root`, so a config edit or reload between create and cleanup sends
+  the removal at a directory that was never this issue's — and leaves the real
+  one behind, still holding its pool slot. A recorded path validates against its
+  own parent instead of against the current root (upstream 7cf29df).
+  """
+  @spec remove_recorded(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(workspace) when is_binary(workspace) do
+    cond do
+      String.trim(workspace) == "" ->
+        {:error, {:workspace_path_unreadable, workspace, :empty}, ""}
+
+      Path.type(workspace) != :absolute ->
+        {:error, {:workspace_path_unreadable, workspace, :not_absolute}, ""}
+
+      not File.exists?(workspace) ->
+        File.rm_rf(workspace)
+
+      true ->
+        case validate_workspace_path(workspace, Path.dirname(workspace)) do
+          :ok ->
+            release_pool_slot(workspace)
+            maybe_run_before_remove_hook(workspace)
+            File.rm_rf(workspace)
+
+          {:error, reason} ->
+            {:error, reason, ""}
+        end
+    end
+  end
+
+  def remove_recorded(workspace) do
+    {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
+  end
+
+  @doc "The workspace directory this issue identifier resolves to under the current root."
+  @spec path_for_issue(String.t() | nil) :: Path.t() | nil
+  def path_for_issue(identifier) when is_binary(identifier) do
+    identifier
+    |> safe_identifier()
+    |> workspace_path_for_issue()
+  end
+
+  def path_for_issue(_identifier), do: nil
 
   @spec remove_issue_workspaces(term()) :: :ok
   def remove_issue_workspaces(identifier) when is_binary(identifier) do
@@ -425,6 +478,35 @@ defmodule SymphonyElixir.Workspace do
     end)
   end
 
+  # A failed `after_create` leaves a directory that LOOKS provisioned: the next
+  # attempt finds `File.dir?/1` true, skips creation, and inherits whatever the
+  # half-run hook wrote. Remove what THIS call created so the retry bootstraps
+  # from nothing; a workspace that already existed is left alone (upstream
+  # cbd2158).
+  defp run_after_create_or_clean_up(workspace, issue_context, created?) do
+    case maybe_run_after_create_hook(workspace, issue_context, created?) do
+      :ok ->
+        :ok
+
+      {:error, _reason} = error ->
+        cleanup_failed_new_workspace(workspace, created?)
+        error
+    end
+  end
+
+  defp cleanup_failed_new_workspace(_workspace, false), do: :ok
+
+  defp cleanup_failed_new_workspace(workspace, true) do
+    case File.rm_rf(workspace) do
+      {:ok, _removed} ->
+        :ok
+
+      {:error, reason, path} ->
+        Logger.warning("Failed to remove partial workspace path=#{path} reason=#{inspect(reason)}")
+        :ok
+    end
+  end
+
   defp maybe_run_after_create_hook(workspace, issue_context, created?) do
     # Run after_create hook if either:
     # 1. The workspace was just created, or
@@ -476,24 +558,121 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace}")
 
-    env = hook_env(issue_context)
+    pid_file = hook_pid_file(workspace)
+    env = [{"SYMPHONY_HOOK_PIDFILE", pid_file} | hook_env(issue_context)]
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true, env: env)
+        System.cmd("sh", ["-lc", @hook_pid_preamble <> command],
+          cd: workspace,
+          stderr_to_stdout: true,
+          env: env
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
       {:ok, cmd_result} ->
+        File.rm(pid_file)
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
       nil ->
         Task.shutdown(task, :brutal_kill)
 
-        Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} timeout_ms=#{timeout_ms}")
+        # Shutting the task down closes the port, which kills `sh` and NOTHING
+        # BELOW IT. A provisioning `before_run` spawns its real work as a child,
+        # so the abandoned hook kept building a slot while the orchestrator
+        # re-dispatched beside it and a second provisioner claimed a second slot
+        # for the same issue (first Fly run, GEA-9889, 2026-09-22).
+        killed = kill_hook_tree(workspace)
+
+        Logger.warning("Workspace hook timed out hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} timeout_ms=#{timeout_ms} killed_pids=#{inspect(killed)}")
 
         {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
     end
+  end
+
+  @doc """
+  Kills a still-running workspace hook and every process it started.
+
+  Returns the OS pids it signalled, newest descendant first. A no-op when the
+  workspace records no live hook.
+  """
+  @spec kill_hook_tree(Path.t()) :: [pos_integer()]
+  def kill_hook_tree(workspace) when is_binary(workspace) do
+    pid_file = hook_pid_file(workspace)
+
+    with {:ok, contents} <- File.read(pid_file),
+         {pid, _rest} <- Integer.parse(String.trim(contents)),
+         true <- still_our_hook?(pid) do
+      File.rm(pid_file)
+      kill_process_tree(pid)
+    else
+      _ ->
+        File.rm(pid_file)
+        []
+    end
+  end
+
+  def kill_hook_tree(_workspace), do: []
+
+  # A pid file outlives the shell that wrote it, and the box recycles pids.
+  # Kill only a process whose command line still carries the hook preamble —
+  # otherwise a stale file aims `kill -KILL` at whatever now holds that number.
+  defp still_our_hook?(pid) when is_integer(pid) and pid > 1 do
+    case System.cmd("ps", ["-o", "args=", "-p", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {output, 0} -> String.contains?(output, "SYMPHONY_HOOK_PIDFILE")
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  defp still_our_hook?(_pid), do: false
+
+  defp kill_process_tree(pid) when is_integer(pid) and pid > 1 do
+    descendants = Enum.flat_map(child_pids(pid), &kill_process_tree/1)
+    System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+    descendants ++ [pid]
+  end
+
+  defp kill_process_tree(_pid), do: []
+
+  defp child_pids(pid) when is_integer(pid) do
+    case System.cmd("pgrep", ["-P", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split(~r/\s+/, trim: true)
+        |> Enum.flat_map(fn token ->
+          case Integer.parse(token) do
+            {child, ""} -> [child]
+            _ -> []
+          end
+        end)
+
+      _ ->
+        []
+    end
+  rescue
+    # `pgrep` is absent on a minimal image; an unkillable tree is worse news
+    # than a missing one, so say so rather than failing the hook.
+    error ->
+      Logger.warning("Cannot enumerate hook child processes pid=#{pid}: #{Exception.message(error)}")
+      []
+  end
+
+  # Outside the workspace on purpose. A bootstrap `after_create` hook is often
+  # `git clone <url> .`, which refuses to run in a directory that is not empty —
+  # so a pid file written INTO the workspace breaks the very hook it exists to
+  # supervise. Keyed by the workspace path so it is stable across the hook's
+  # lifetime and unique per workspace.
+  defp hook_pid_file(workspace) when is_binary(workspace) do
+    digest =
+      :sha256
+      |> :crypto.hash(Path.expand(workspace))
+      |> Base.url_encode64(padding: false)
+      |> binary_part(0, 32)
+
+    Path.join(System.tmp_dir!(), @hook_pid_file_prefix <> digest <> ".pid")
   end
 
   defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name) do
@@ -555,8 +734,12 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp validate_workspace_path(workspace) when is_binary(workspace) do
+    validate_workspace_path(workspace, Config.workspace_root())
+  end
+
+  defp validate_workspace_path(workspace, root) when is_binary(workspace) and is_binary(root) do
     expanded_workspace = Path.expand(workspace)
-    root = Path.expand(Config.workspace_root())
+    root = Path.expand(root)
     root_prefix = root <> "/"
 
     cond do

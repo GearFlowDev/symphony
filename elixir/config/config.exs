@@ -21,6 +21,14 @@ if config_env() == :test, do: config(:symphony_elixir, server_port_override: 0)
 # real orchestrator reaps.
 if config_env() == :test, do: config(:symphony_elixir, reap_orphans: false)
 
+# The orchestrator refuses to start on an invalid WORKFLOW.md. The repo's own
+# WORKFLOW.md reads its Linear key from the environment, which a test BEAM does
+# not carry — so `:test` boots against a self-contained fixture instead of
+# failing at application start. Tests that exercise config write their own file.
+if config_env() == :test do
+  config(:symphony_elixir, workflow_file_path: Path.expand("../test/fixtures/startup_workflow.md", __DIR__))
+end
+
 config :symphony_elixir, SymphonyElixirWeb.Endpoint,
   adapter: Bandit.PhoenixAdapter,
   url: [host: "localhost"],

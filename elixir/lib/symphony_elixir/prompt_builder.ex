@@ -141,21 +141,54 @@ defmodule SymphonyElixir.PromptBuilder do
   Continuation for a single-phase dispatch: keep the agent inside its phase
   instead of the generic (Implement-flavored) continuation template.
   """
-  @spec build_phase_continuation_prompt(map(), String.t(), pos_integer(), pos_integer(), [map()]) ::
-          String.t()
-  def build_phase_continuation_prompt(_issue, phase, turn_number, max_turns, comments) do
+  @spec build_phase_continuation_prompt(
+          map(),
+          String.t(),
+          pos_integer(),
+          pos_integer(),
+          [map()],
+          keyword()
+        ) :: String.t()
+  def build_phase_continuation_prompt(_issue, phase, turn_number, max_turns, comments, opts \\ []) do
     """
     Continuation guidance (turn #{turn_number}/#{max_turns}):
 
     You were dispatched for the **#{phase} phase only**. This is the same session
     as turn 1 — your #{phase} instructions are already in your context.
     #{format_comments_section(comments)}
-    If the #{phase} phase is already complete (your report/verdict is posted, or
-    your fix is pushed), end your turn now with no further action. Otherwise
-    resume the #{phase} phase from where you left off.
+    #{phase_completion_test(phase, Keyword.get(opts, :assigned_rows))}
 
     Do NOT implement plan rows, start other phases, or repeat completed work.
     Do NOT look for more work. Do NOT expand scope.
+    """
+  end
+
+  # A dispatch that carries assigned rows is done when THE ROWS are done, and
+  # nothing else says so. The old wording offered "or your fix is pushed" as an
+  # alternative completion test, and two re-dispatched row-closers took it:
+  # a commit from an earlier dispatch was already on the branch, so both ended
+  # every turn without touching the rows they were sent to close, which sat at
+  # `partial` (first Fly run, GEA-9699 via GEA-9889, 2026-09-22).
+  defp phase_completion_test(phase, rows) when is_list(rows) and rows != [] do
+    """
+    Your assigned rows, with the status the grader last gave each one:
+
+    #{render_rows_md(rows)}
+
+    This phase is complete when EVERY row above is `done` — that test and no
+    other. A pushed commit, an open PR and green CI do NOT complete a row; a row
+    left `partial` or `missing` is open work even if the branch already carries
+    your earlier commits. If any row above is still open, resume the #{phase}
+    phase and close it. End your turn with no further action only when every row
+    is done.
+    """
+  end
+
+  defp phase_completion_test(phase, _rows) do
+    """
+    If the #{phase} phase is already complete (your report or verdict is
+    posted), end your turn now with no further action. Otherwise resume the
+    #{phase} phase from where you left off.
     """
   end
 

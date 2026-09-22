@@ -4,11 +4,12 @@ defmodule SymphonyElixir do
   """
 
   @doc """
-  Start the orchestrator in the current BEAM node.
+  Start the agent runtime — the orchestrator and the agent tasks it owns — in
+  the current BEAM node.
   """
-  @spec start_link(keyword()) :: GenServer.on_start()
+  @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts \\ []) do
-    SymphonyElixir.Orchestrator.start_link(opts)
+    SymphonyElixir.AgentRuntimeSupervisor.start_link(opts)
   end
 end
 
@@ -31,9 +32,8 @@ defmodule SymphonyElixir.Application do
       SymphonyElixir.Repo,
       SymphonyElixir.Repo.Migrator,
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
-      {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
       SymphonyElixir.WorkflowStore,
-      SymphonyElixir.Orchestrator,
+      SymphonyElixir.AgentRuntimeSupervisor,
       SymphonyElixir.HttpServer,
       SymphonyElixir.StatusDashboard
     ]

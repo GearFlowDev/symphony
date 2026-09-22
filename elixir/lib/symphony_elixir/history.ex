@@ -344,6 +344,26 @@ defmodule SymphonyElixir.History do
     |> Repo.one() || %{input_tokens: 0, output_tokens: 0, total_tokens: 0}
   end
 
+  @doc """
+  Cumulative code-change evidence across an issue's finished runs.
+
+  The no-progress breaker needs a progress signal that exists BEFORE a PR does.
+  These totals are recorded by the evaluator on every run, so a dispatch that
+  closed a row and pushed is distinguishable from one that changed nothing.
+  """
+  @spec issue_change_totals(String.t()) :: %{
+          files_changed: non_neg_integer(),
+          lines_changed: non_neg_integer()
+        }
+  def issue_change_totals(issue_identifier) when is_binary(issue_identifier) do
+    completed_runs_query(issue_identifier: issue_identifier)
+    |> select([r], %{
+      files_changed: coalesce(sum(r.eval_files_changed), 0),
+      lines_changed: coalesce(sum(r.eval_lines_changed), 0)
+    })
+    |> Repo.one() || %{files_changed: 0, lines_changed: 0}
+  end
+
   @doc "Most recent PR URL the evaluator recorded for an issue, or nil."
   @spec latest_pr_url(String.t()) :: String.t() | nil
   def latest_pr_url(identifier) when is_binary(identifier) do

@@ -35,6 +35,11 @@ defmodule SymphonyElixir.Orchestrator do
       :max_concurrent_agents,
       :next_poll_due_at_ms,
       :poll_check_in_progress,
+      # The task supervisor that owns this orchestrator's agent tasks. Held on
+      # the state (not read from the module name) so a test can run an isolated
+      # runtime, and so stopping an agent always addresses the supervisor that
+      # started it.
+      task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
       completed_history: [],
@@ -65,11 +70,38 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
+    case validate_workflow_at_boot() do
+      :ok ->
+        start_polling(opts)
+
+      {:error, reason} ->
+        # An invalid WORKFLOW.md used to start a healthy-looking orchestrator
+        # that failed every poll cycle instead: `do_dispatch/1` logged the same
+        # config error every interval and dispatched nothing, forever. Refuse to
+        # start, so the failure is at the boundary where someone reads it
+        # (upstream d476215).
+        Logger.error("Refusing to start the orchestrator; WORKFLOW.md is invalid: #{inspect(reason)}")
+        {:stop, reason}
+    end
+  end
+
+  # `Config.validate!/0` reads through `NimbleOptions.validate!`, which RAISES
+  # on a typed-invalid file rather than answering `{:error, _}`. Both are the
+  # same refusal here.
+  defp validate_workflow_at_boot do
+    Config.validate!()
+  rescue
+    error ->
+      {:error, {:invalid_workflow_config, Exception.message(error)}}
+  end
+
+  defp start_polling(opts) do
     now_ms = System.monotonic_time(:millisecond)
     ensure_snapshot_cache()
 
     state = %State{
+      task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
       poll_interval_ms: Config.poll_interval_ms(),
       max_concurrent_agents: Config.max_concurrent_agents(),
       next_poll_due_at_ms: now_ms,
@@ -544,6 +576,25 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec plan_cycle_fingerprint_for_test(term(), String.t(), String.t() | nil) :: String.t()
+  def plan_cycle_fingerprint_for_test(plan, identifier, pr_url) do
+    plan_cycle_fingerprint(plan, identifier, pr_url)
+  end
+
+  @doc false
+  @spec no_progress_message_for_test(pos_integer(), pos_integer(), String.t(), String.t()) :: String.t()
+  def no_progress_message_for_test(repeats, limit, fingerprint, identifier) do
+    no_progress_message(repeats, limit, fingerprint, identifier)
+  end
+
+  @doc false
+  @spec handle_active_retry_for_test(Issue.t(), term(), pos_integer(), map()) :: term()
+  def handle_active_retry_for_test(%Issue{} = issue, %State{} = state, attempt, metadata) do
+    {:noreply, new_state} = handle_active_retry(state, issue, attempt, metadata)
+    new_state
+  end
+
+  @doc false
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
     sort_issues_for_dispatch(issues)
@@ -571,6 +622,17 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false, :not_routable)
+
+      # The candidate QUERY filters on the routing label, so a label removed
+      # mid-run never reaches this loop through the query — but the by-id
+      # refresh carries the live labels, and this is the only place that reads
+      # them. Without this arm, taking the label off a running issue changed
+      # nothing until the agent finished on its own, holding its slot the whole
+      # time (upstream 54b456b). Cleanup is on: releasing the slot IS the point.
+      !issue_carries_required_labels?(issue) ->
+        Logger.info("Required label removed from issue: #{issue_context(issue)} labels=#{inspect(issue.labels)}; stopping active agent and releasing its slot")
+
+        terminate_running_issue(state, issue.id, true, :label_removed)
 
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
@@ -606,12 +668,11 @@ defmodule SymphonyElixir.Orchestrator do
         # Grade any plan dispatch before workspace cleanup wipes the diff.
         maybe_grade_plan_dispatch(running_entry)
 
-        if cleanup_workspace do
-          cleanup_issue_workspace(identifier)
-        end
-
+        # STOP THE WORKER FIRST. `before_remove` releases the pool slot, and a
+        # worker still alive while that runs goes on writing into a slot the
+        # registry has already handed to someone else.
         if is_pid(pid) do
-          terminate_task(pid)
+          terminate_task(pid, state.task_supervisor)
         end
 
         # Killing the BEAM task is not enough: the worker's Claude runs in a
@@ -620,8 +681,17 @@ defmodule SymphonyElixir.Orchestrator do
         # terminated/restarted worker can't keep editing its slot.
         SymphonyElixir.Claude.TmuxCLI.kill_by_session_id(Map.get(running_entry, :session_id))
 
+        # Nor is the task enough for a hook: closing its port kills `sh` and
+        # leaves the provisioner it spawned running. An abandoned `before_run`
+        # went on to claim a second slot for this same issue (GEA-9889).
+        kill_running_hook(running_entry)
+
         if is_reference(ref) do
           Process.demonitor(ref, [:flush])
+        end
+
+        if cleanup_workspace do
+          cleanup_issue_workspace(running_entry, identifier)
         end
 
         %{
@@ -637,7 +707,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
-    timeout_ms = Config.codex_stall_timeout_ms()
+    timeout_ms = Config.agent_stall_timeout_ms()
 
     cond do
       timeout_ms <= 0 ->
@@ -658,6 +728,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
     elapsed_ms = stall_elapsed_ms(running_entry, now)
     phase_elapsed_ms = phase_stall_elapsed_ms(running_entry, now)
+    timeout_ms = bootstrap_aware_timeout(running_entry, timeout_ms)
     phase_timeout_ms = timeout_ms * 2
 
     stall_reason =
@@ -698,6 +769,23 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # The clock starts at dispatch, but the agent does not: `before_run` runs
+  # first, and a provisioning hook is not an inactive agent. Until a session id
+  # exists there is no agent to be stalled, and the hook has its OWN timeout
+  # bounding that window — so never abandon a run inside it for less than the
+  # hook's own budget. This is what killed runs mid-provision and made every
+  # retry fail the same way (TODO.md, GEA-4619/4625), and what `WORKFLOW.md`'s
+  # "keep codex.stall_timeout_ms >= hooks.timeout_ms" note was standing in for.
+  defp bootstrap_aware_timeout(running_entry, timeout_ms) do
+    case running_entry_session_id(running_entry) do
+      session_id when is_binary(session_id) and session_id != "n/a" ->
+        timeout_ms
+
+      _ ->
+        max(timeout_ms, Config.hook_timeout_ms())
+    end
+  end
+
   defp stall_elapsed_ms(running_entry, now) do
     running_entry
     |> last_activity_timestamp()
@@ -716,8 +804,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp last_activity_timestamp(_running_entry), do: nil
 
-  defp terminate_task(pid) when is_pid(pid) do
-    case Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid) do
+  defp terminate_task(pid, task_supervisor) when is_pid(pid) do
+    case Task.Supervisor.terminate_child(task_supervisor, pid) do
       :ok ->
         :ok
 
@@ -726,7 +814,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_task(_pid), do: :ok
+  defp terminate_task(_pid, _task_supervisor), do: :ok
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -839,6 +927,24 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp issue_routable_to_worker?(_issue), do: true
 
+  # NO labels is missing evidence, not proof of removal: a routed issue carries
+  # at least the routing label, so an empty list means the refresh did not
+  # project labels at all. Stopping an agent and wiping its slot on that would
+  # turn a thin Linear response into lost work. Only a label set that IS present
+  # and lacks a required label proves the label was taken off.
+  defp issue_carries_required_labels?(%Issue{labels: []}), do: true
+
+  defp issue_carries_required_labels?(%Issue{labels: labels}) when is_list(labels) do
+    issue_labels = MapSet.new(labels, &normalize_label/1)
+
+    Enum.all?(Config.required_issue_labels(), &MapSet.member?(issue_labels, normalize_label(&1)))
+  end
+
+  defp issue_carries_required_labels?(_issue), do: true
+
+  defp normalize_label(label) when is_binary(label), do: label |> String.trim() |> String.downcase()
+  defp normalize_label(label), do: to_string(label)
+
   defp todo_issue_blocked_by_non_terminal?(
          %Issue{state: issue_state, blocked_by: blockers},
          terminal_states
@@ -885,45 +991,67 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, metadata \\ %{}) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
+    case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
-        # Find the issue's open PR (if any) so the plan workflow assesses against
-        # the right branch, and the worker checks it out. The plan — not a phase
-        # judge — decides what to dispatch; that happens in do_dispatch_issue.
-        # The evaluator's stored PR wins over the branch-name search: the search
-        # guesses by prefix and picks the wrong sibling when two open branches
-        # share the issue identifier (GEA-5377: #2388 shadowed #2385).
-        {pr_url, pr_branch} =
-          case stored_pr(refreshed_issue) || attachment_pr(refreshed_issue) ||
-                 check_existing_pr(refreshed_issue) do
-            {:pr_exists, url, branch} -> {url, branch}
-            :no_pr -> {nil, nil}
-          end
+        dispatch_refreshed_issue(state, refreshed_issue, attempt, metadata)
 
-        # Carry the resolved PR on the issue so slot routing (workspace hooks)
-        # leases the PR's repo, not the repo the product label guesses.
-        refreshed_issue = %{refreshed_issue | pr_url: pr_url}
-
-        pr_metadata = %{existing_pr_url: pr_url, existing_pr_branch: pr_branch}
-        do_dispatch_issue(state, refreshed_issue, attempt, Map.merge(metadata, pr_metadata))
-
-      {:skip, :missing} ->
-        Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
+      {:skip, _reason} ->
         state
 
-      {:skip, %Issue{} = refreshed_issue} ->
-        Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
-
-        state
-
-      {:error, reason} ->
-        Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+      {:error, _reason} ->
         state
     end
   rescue
     error ->
       Logger.error("dispatch_issue crashed for #{issue_context(issue)}: #{Exception.message(error)}")
       state
+  end
+
+  # Split out of `dispatch_issue/4` so a RETRY can act on the refresh outcome
+  # instead of dropping the issue. Every caller used to get `state` back for all
+  # three non-ok outcomes, which on the retry path left the issue claimed and out
+  # of the retry queue for good (TODO.md "A transient Linear error during a retry
+  # poll drops the issue for good", 2026-09-15; upstream 0517275).
+  defp refresh_issue_for_dispatch(issue) do
+    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
+      {:ok, %Issue{} = refreshed_issue} ->
+        {:ok, refreshed_issue}
+
+      {:skip, :missing} ->
+        Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
+        {:skip, :missing}
+
+      {:skip, %Issue{} = refreshed_issue} ->
+        Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
+
+        {:skip, refreshed_issue}
+
+      {:error, reason} ->
+        Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp dispatch_refreshed_issue(%State{} = state, %Issue{} = refreshed_issue, attempt, metadata) do
+    # Find the issue's open PR (if any) so the plan workflow assesses against
+    # the right branch, and the worker checks it out. The plan — not a phase
+    # judge — decides what to dispatch; that happens in do_dispatch_issue.
+    # The evaluator's stored PR wins over the branch-name search: the search
+    # guesses by prefix and picks the wrong sibling when two open branches
+    # share the issue identifier (GEA-5377: #2388 shadowed #2385).
+    {pr_url, pr_branch} =
+      case stored_pr(refreshed_issue) || attachment_pr(refreshed_issue) ||
+             check_existing_pr(refreshed_issue) do
+        {:pr_exists, url, branch} -> {url, branch}
+        :no_pr -> {nil, nil}
+      end
+
+    # Carry the resolved PR on the issue so slot routing (workspace hooks)
+    # leases the PR's repo, not the repo the product label guesses.
+    refreshed_issue = %{refreshed_issue | pr_url: pr_url}
+
+    pr_metadata = %{existing_pr_url: pr_url, existing_pr_branch: pr_branch}
+    do_dispatch_issue(state, refreshed_issue, attempt, Map.merge(metadata, pr_metadata))
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, metadata) do
@@ -998,7 +1126,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     runner = Config.agent_runner_module()
 
-    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+    case Task.Supervisor.start_child(state.task_supervisor, fn ->
            runner.run(issue, recipient,
              attempt: attempt,
              retask_phases: metadata[:retask_phases],
@@ -1052,6 +1180,9 @@ defmodule SymphonyElixir.Orchestrator do
             ref: ref,
             identifier: issue.identifier,
             issue: issue,
+            # Recorded, not recomputed: cleanup must aim at the directory this
+            # dispatch actually created, whatever `workspace.root` says later.
+            workspace_path: Workspace.path_for_issue(issue.identifier),
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -1199,6 +1330,7 @@ defmodule SymphonyElixir.Orchestrator do
         if finished > last_seen do
           fingerprint =
             plan_cycle_fingerprint(plan, identifier, dispatch_metadata[:existing_pr_url])
+
           history = Enum.take([fingerprint | meta["cycle_history"] || []], 4 * limit)
           repeats = Enum.count(history, &(&1 == fingerprint))
           tripped? = repeats >= limit
@@ -1215,11 +1347,7 @@ defmodule SymphonyElixir.Orchestrator do
             })
 
           if tripped? do
-            {:blocked,
-             {:no_progress,
-              "the dispatch cycle has returned to the same state #{repeats}× " <>
-                "(limit #{limit}) — plan, grader, and tester are not converging. " <>
-                "State: #{fingerprint}"}}
+            {:blocked, {:no_progress, no_progress_message(repeats, limit, fingerprint, identifier)}}
           else
             result
           end
@@ -1232,6 +1360,21 @@ defmodule SymphonyElixir.Orchestrator do
     error ->
       Logger.warning("no_progress_check failed for #{issue_context(issue)}: #{Exception.message(error)}")
       result
+  end
+
+  # Name only the gates that actually ran. The fixed text blamed "plan, grader,
+  # and tester" on every trip, including the pre-PR ones where no tester had
+  # ever been dispatched — the person reading it went looking for a tester
+  # disagreement that did not exist (first Fly run, GEA-9889, 2026-09-22).
+  defp no_progress_message(repeats, limit, fingerprint, identifier) do
+    gates =
+      case History.latest_tester_verdict(identifier) do
+        %{verdict: _verdict} -> "plan, grader and tester are not converging"
+        _ -> "the plan and the grader are not converging; the tester has not run yet"
+      end
+
+    "the dispatch cycle has returned to the same state #{repeats}× " <>
+      "(limit #{limit}) — #{gates}. State: #{fingerprint}"
   end
 
   # Human-readable on purpose: it's stored in plan metadata and quoted in the
@@ -1250,8 +1393,27 @@ defmodule SymphonyElixir.Orchestrator do
         nil -> "untested"
       end
 
-    rows <> " | " <> verdict <> " | head=" <> pr_head_sha(pr_url)
+    rows <> " | " <> verdict <> " | " <> progress_marker(identifier, pr_url)
   end
+
+  # BEFORE a PR exists the verdict and the PR head are both constants
+  # (`untested`, `head=?`), so the fingerprint collapses to the row states alone
+  # and a dispatch that closed a row and PUSHED looks identical to one that did
+  # nothing (first Fly run, GEA-9889: R1 closed and 9ee9986b pushed, and the
+  # breaker still counted three repeats). The evaluator records change totals on
+  # every run, so use them as the pre-PR progress signal.
+  defp progress_marker(_identifier, pr_url) when is_binary(pr_url) and pr_url != "" do
+    "head=" <> pr_head_sha(pr_url)
+  end
+
+  defp progress_marker(identifier, _pr_url) when is_binary(identifier) do
+    totals = History.issue_change_totals(identifier)
+    "changed=#{totals.files_changed}f/#{totals.lines_changed}l"
+  rescue
+    _ -> "changed=?"
+  end
+
+  defp progress_marker(_identifier, _pr_url), do: "head=?"
 
   # The PR head belongs in the fingerprint: post-approval phases (Resolve
   # Review, Fix CI) change no row states and add no tester verdict — new
@@ -2288,6 +2450,42 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_identifier), do: :ok
 
+  # Remove the workspace this run RECORDED at dispatch. Recomputing it from the
+  # live config sends the removal at whatever `workspace.root` says now — a
+  # reload between dispatch and cleanup then leaves the real workspace behind,
+  # still holding its pool slot (upstream 7cf29df).
+  defp cleanup_issue_workspace(running_entry, identifier) when is_map(running_entry) do
+    case Map.get(running_entry, :workspace_path) do
+      workspace_path when is_binary(workspace_path) and workspace_path != "" ->
+        Workspace.remove_recorded(workspace_path)
+        :ok
+
+      _ ->
+        cleanup_issue_workspace(identifier)
+    end
+  end
+
+  defp cleanup_issue_workspace(_running_entry, identifier), do: cleanup_issue_workspace(identifier)
+
+  defp kill_running_hook(running_entry) when is_map(running_entry) do
+    case Map.get(running_entry, :workspace_path) do
+      workspace_path when is_binary(workspace_path) and workspace_path != "" ->
+        case Workspace.kill_hook_tree(workspace_path) do
+          [] -> :ok
+          pids -> Logger.info("Killed abandoned workspace hook process tree workspace=#{workspace_path} pids=#{inspect(pids)}")
+        end
+
+      _ ->
+        :ok
+    end
+  rescue
+    error ->
+      Logger.warning("Failed to kill workspace hook process tree: #{Exception.message(error)}")
+      :ok
+  end
+
+  defp kill_running_hook(_running_entry), do: :ok
+
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.linear_terminal_states()) do
       {:ok, issues} ->
@@ -2312,7 +2510,32 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) do
-      {:noreply, dispatch_issue(state, issue, attempt, metadata)}
+      # The retry poll's read and the dispatch-time revalidation are two reads,
+      # and the second one decides. Act on its outcome rather than discarding it:
+      # `dispatch_issue/4` answers `state` for all three non-ok outcomes, which
+      # here would leave the issue claimed and no longer in the retry queue.
+      case refresh_issue_for_dispatch(issue) do
+        {:ok, %Issue{} = refreshed_issue} ->
+          {:noreply, dispatch_refreshed_issue(state, refreshed_issue, attempt, metadata)}
+
+        {:skip, :missing} ->
+          {:noreply, release_issue_claim(state, issue.id)}
+
+        {:skip, %Issue{} = refreshed_issue} ->
+          handle_retry_issue_lookup(refreshed_issue, state, issue.id, attempt, metadata)
+
+        {:error, reason} ->
+          {:noreply,
+           schedule_issue_retry(
+             state,
+             issue.id,
+             attempt + 1,
+             Map.merge(metadata, %{
+               identifier: issue.identifier,
+               error: "retry dispatch refresh failed: #{inspect(reason)}"
+             })
+           )}
+      end
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
 
@@ -2989,6 +3212,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp categorize_error({:terminated, :not_routable}),
     do: %{message: "issue no longer routed to this worker", category: "not_routable"}
+
+  defp categorize_error({:terminated, :label_removed}),
+    do: %{message: "the issue's routing label was removed", category: "label_removed"}
 
   defp categorize_error({:terminated, :non_active_state}),
     do: %{message: "issue moved to non-active Linear state", category: "non_active_state"}

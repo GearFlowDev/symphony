@@ -173,6 +173,14 @@ defmodule SymphonyElixir.Evaluator do
     # head whatever the local checkout is on, so this works even when the slot tree
     # is parked on main between dispatches.
     case check_pr(ws, branch) do
+      %{exists: true, url: url, number: number, draft: true} when is_binary(url) ->
+        # A PR an older image (or a person) left as a draft. Nothing promotes it any more —
+        # the promotion step went with the drafts — so it would sit unmergeable for ever,
+        # and `gh pr view --json mergeable` would keep calling it MERGEABLE.
+        run_in_workspace(ws, "gh pr ready #{number}")
+        Logger.info("Evaluator: made draft PR ##{number} ready — Symphony's PRs are never drafts")
+        url
+
       %{exists: true, url: url} when is_binary(url) ->
         url
 
@@ -224,19 +232,22 @@ defmodule SymphonyElixir.Evaluator do
     "'" <> String.replace(value, "'", "'\\''") <> "'"
   end
 
+  # `isDraft` is asked for because a draft PR is invisible to everything that judges one:
+  # `gh pr view --json mergeable` reports a draft as MERGEABLE, and neither a person nor the
+  # harness can merge it. `ensure_pr_open/4` uses it to finish a draft somebody else left.
   defp check_pr(workspace_path, branch) do
-    case run_in_workspace(workspace_path, "gh pr list --head #{safe_arg(branch)} --json url,number,state --limit 1") do
+    case run_in_workspace(workspace_path, "gh pr list --head #{safe_arg(branch)} --json url,number,state,isDraft --limit 1") do
       {:ok, output} ->
         case Jason.decode(output) do
-          {:ok, [%{"url" => url, "number" => number} | _]} ->
-            %{exists: true, url: url, number: number}
+          {:ok, [%{"url" => url, "number" => number} = pr | _]} ->
+            %{exists: true, url: url, number: number, draft: pr["isDraft"] == true}
 
           _ ->
-            %{exists: false, url: nil, number: nil}
+            %{exists: false, url: nil, number: nil, draft: false}
         end
 
       _ ->
-        %{exists: false, url: nil, number: nil}
+        %{exists: false, url: nil, number: nil, draft: false}
     end
   end
 

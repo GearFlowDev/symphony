@@ -1797,6 +1797,9 @@ defmodule SymphonyElixir.CoreTest do
         tracker_filter: %{"labels" => %{"include" => ["symphony-agent"]}}
       )
 
+      assert Config.required_issue_labels() == ["symphony-agent"],
+             "the routing label must be readable, or this test proves nothing"
+
       worker_pid = spawn(fn -> Process.sleep(:infinity) end)
 
       state = %Orchestrator.State{

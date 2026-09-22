@@ -152,6 +152,40 @@ defmodule SymphonyElixir.WorkingLabelAndHandOffTest do
     assert Config.hand_off_command() == nil
   end
 
+  describe "the hand-off is posted once per commit" do
+    # A COMPLETED ISSUE IS RE-ASSESSED EVERY POLL — that is what re-runs the ship gates —
+    # so the `:done` arm fires again roughly every two minutes for as long as the issue
+    # sits in In Review. Without this predicate the hand-off comment would repost on that
+    # cadence, and Linear's hourly write limit is shared by the whole workspace.
+    @marker "<!-- gf:handoff repo=GearFlowDev/symphony pr=3 sha=e2c34b3f1a9d4c7b2e5a8f0c1d6b3a7e9f2c4d80 -->"
+
+    test "a marker naming this commit means the hand-off is already posted" do
+      comments = [%{body: "proof and prose\n\n" <> @marker}]
+
+      assert Orchestrator.handed_off_for_sha?(comments, "e2c34b3f1a9d")
+    end
+
+    test "a marker naming a different commit is a different thing to judge" do
+      # Fix CI and Resolve Review push new commits after a hand-off. The harness judges a
+      # hand-off against the commit it names, so a new commit earns a fresh one.
+      comments = [%{body: @marker}]
+
+      refute Orchestrator.handed_off_for_sha?(comments, "0000000000aa")
+    end
+
+    test "a comment that merely quotes the sha is not a hand-off" do
+      comments = [%{body: "CI went red at sha=e2c34b3f1a9d, rerunning"}]
+
+      refute Orchestrator.handed_off_for_sha?(comments, "e2c34b3f1a9d")
+    end
+
+    test "an empty thread, a bodiless comment and a bad shape all mean not yet" do
+      refute Orchestrator.handed_off_for_sha?([], "e2c34b3f1a9d")
+      refute Orchestrator.handed_off_for_sha?([%{body: nil}], "e2c34b3f1a9d")
+      refute Orchestrator.handed_off_for_sha?(:unreadable, "e2c34b3f1a9d")
+    end
+  end
+
   describe "the live mark comes off when the run ends" do
     setup do
       write_workflow_file!(Workflow.workflow_file_path(),

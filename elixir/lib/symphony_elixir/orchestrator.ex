@@ -1238,10 +1238,53 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("#{identifier} finished with no PR to hand off — the run is incomplete")
         :error
 
+      already_handed_off?(issue, pr_url) ->
+        Logger.info("#{identifier} is already handed off at #{pr_url}'s head commit; nothing to post")
+        :ok
+
       true ->
         run_hand_off_command(issue, pr_url)
     end
   end
+
+  # HAS THIS EXACT COMMIT ALREADY BEEN HANDED OFF? It has to be asked, because a completed
+  # issue is re-assessed every poll — that is what re-runs the ship gates — so the `:done`
+  # arm fires again roughly every two minutes for as long as the issue sits in In Review.
+  # Without this the hand-off comment would repost on that cadence until somebody moved the
+  # issue, and Linear's hourly write limit is shared by the whole workspace.
+  #
+  # KEYED ON THE HEAD COMMIT, not on the PR. A later dispatch — Fix CI, Resolve Review —
+  # pushes new commits, and the harness judges a hand-off against the commit it names. A new
+  # commit is a new thing to judge and deserves a fresh hand-off; the same commit is not.
+  #
+  # A READ THAT FAILS ANSWERS "no". A hand-off that never posts strands the work with nobody
+  # told; a second hand-off supersedes the first (GEA-9955), which is the cheaper mistake.
+  defp already_handed_off?(issue, pr_url) do
+    # `pr_head_sha/1` answers with the first 12 characters, or "?" when `gh` cannot say.
+    # "?" is not an answer, so it means "post the hand-off".
+    with short when is_binary(short) and short != "?" <- pr_head_sha(pr_url),
+         {:ok, comments} <- SymphonyElixir.Linear.Client.fetch_all_issue_comments(Map.get(issue, :id)) do
+      handed_off_for_sha?(comments, short)
+    else
+      _ -> false
+    end
+  rescue
+    _ -> false
+  end
+
+  @doc false
+  @spec handed_off_for_sha?([map()], String.t()) :: boolean()
+  def handed_off_for_sha?(comments, short_sha) when is_list(comments) and is_binary(short_sha) do
+    # A PREFIX IS ENOUGH. The marker carries the full oid, so `sha=<12 chars>` matches that
+    # marker and no other commit's. Both halves are required: a comment that merely quotes a
+    # sha is not a hand-off, and a hand-off for another commit is not this one.
+    Enum.any?(comments, fn comment ->
+      body = Map.get(comment, :body) || ""
+      String.contains?(body, "gf:handoff") and String.contains?(body, "sha=" <> short_sha)
+    end)
+  end
+
+  def handed_off_for_sha?(_comments, _short_sha), do: false
 
   defp run_hand_off_command(issue, pr_url) do
     identifier = Map.get(issue, :identifier)

@@ -66,6 +66,12 @@ mix phx.server   # start with dashboard + status TUI
 The server reads `WORKFLOW.md` from the current directory, starts polling Linear, and serves the
 dashboard at the port configured in the `server.port` frontmatter field (default: 4040).
 
+The status TUI draws only when stdout is a terminal. Redirect it, pipe it, or hand it to a
+container's log stream, and Symphony writes one log line per state change instead — see
+[docs/logging.md](docs/logging.md). (A container with a TTY attached still gets the board; the
+device is what decides, not the word "container".) `SYMPHONY_STATUS_BOARD=off` forces the log
+on a terminal too; `=on` forces the board anywhere. The web dashboard is the same either way.
+
 ### Production (release)
 
 ```bash

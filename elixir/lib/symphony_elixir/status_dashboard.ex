@@ -8,6 +8,7 @@ defmodule SymphonyElixir.StatusDashboard do
 
   alias SymphonyElixir.{Config, HttpServer}
   alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.StatusOutput
   alias SymphonyElixirWeb.ObservabilityPubSub
 
   @minimum_idle_rerender_ms 1_000
@@ -127,15 +128,22 @@ defmodule SymphonyElixir.StatusDashboard do
 
   @spec render_offline_status() :: :ok
   def render_offline_status do
-    content =
-      [
-        colorize("╭─ SYMPHONY STATUS", @ansi_bold),
-        colorize("│ app_status=offline", @ansi_red),
-        closing_border()
-      ]
-      |> Enum.join("\n")
+    if StatusOutput.log?() do
+      # Shutting down is a state change like any other, and the log is where this
+      # process's state changes go when it does not own a terminal (GEA-10144).
+      Logger.info("Symphony status: app_status=offline")
+    else
+      content =
+        [
+          colorize("╭─ SYMPHONY STATUS", @ansi_bold),
+          colorize("│ app_status=offline", @ansi_red),
+          closing_border()
+        ]
+        |> Enum.join("\n")
 
-    render_to_terminal(content)
+      render_to_terminal(content)
+    end
+
     :ok
   rescue
     error in [ArgumentError, RuntimeError] ->
@@ -454,13 +462,22 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
+  # The one place the board reaches stdout, and so the one place that has to
+  # refuse. `enabled` is advisory — a caller may override it, and the offline
+  # render below does not consult it at all — but an escape sequence down a log
+  # pipe is never what anyone wanted (GEA-10144), so the refusal lives here where
+  # nothing can route around it.
   defp render_to_terminal(content) do
-    IO.write([
-      IO.ANSI.home(),
-      IO.ANSI.clear(),
-      normalize_status_lines(content),
-      "\n"
-    ])
+    if StatusOutput.board?() do
+      IO.write([
+        IO.ANSI.home(),
+        IO.ANSI.clear(),
+        normalize_status_lines(content),
+        "\n"
+      ])
+    else
+      :ok
+    end
   end
 
   defp update_token_samples(samples, now_ms, total_tokens) do
@@ -1991,15 +2008,22 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp truncate(value, _max), do: value
 
+  # The board draws only where a person can watch it: a terminal that owns stdout
+  # (`SymphonyElixir.StatusOutput`), and not under `mix test`, where its redraws
+  # would fight ExUnit for the same device.
   defp dashboard_enabled? do
+    StatusOutput.board?() and not test_env?()
+  end
+
+  defp test_env? do
     if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) do
       try do
-        Mix.env() != :test
+        Mix.env() == :test
       rescue
-        _ -> true
+        _ -> false
       end
     else
-      true
+      false
     end
   end
 

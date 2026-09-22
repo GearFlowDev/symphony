@@ -1311,6 +1311,17 @@ implementation-defined.
 If present, it should draw from orchestrator state/metrics only and must not be required for
 correctness.
 
+A surface that redraws itself — a full-screen terminal UI — should write only to a device that
+can be redrawn, and by default must decide that from the device rather than from configuration:
+on a stdout that is not a terminal it writes nothing, escape sequences included, and the
+implementation should log one line per state change in its place. A redrawing surface pointed
+at a log stream destroys the log, because the frames are the only thing left in a bounded
+window.
+
+An operator may override the decision in either direction — forcing the log on a terminal, or
+forcing the surface onto a device the check rejected. An override is the one way board output
+reaches a non-terminal stdout, and it must be explicit; the default must never get there.
+
 ### 13.5 Session Metrics and Token Accounting
 
 Token accounting rules:

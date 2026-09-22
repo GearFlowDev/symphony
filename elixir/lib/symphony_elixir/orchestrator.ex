@@ -50,7 +50,10 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      # The last {candidates, dispatched} pair the poll logged, so an unchanged
+      # answer stays silent (GEA-10144).
+      last_poll_result: nil
     ]
   end
 
@@ -197,9 +200,7 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
 
-        Logger.info(
-          "No pool slot for issue_id=#{issue_id} identifier=#{running_entry[:identifier]}; backing off"
-        )
+        Logger.info("No pool slot for issue_id=#{issue_id} identifier=#{running_entry[:identifier]}; backing off")
 
         # Close the run row opened at dispatch — skipping history here left
         # these 0-turn rows open forever (101 piled up by 2026-07-14). A
@@ -468,9 +469,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp do_dispatch(%State{} = state) do
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
+      dispatched =
+        if available_slots(state) > 0 do
+          choose_issues(issues, state)
+        else
+          state
+        end
+
+      log_poll_result(state, issues, dispatched)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -521,9 +528,23 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
         state
+    end
+  end
 
-      false ->
-        state
+  # One line per poll, and only when the answer moves. A poller that prints its
+  # result every interval refills a bounded log window the way the status board
+  # did (GEA-10144); a poller that never prints leaves "was it even looking?"
+  # unanswerable after an incident. So: print the counts when they change, and
+  # stay quiet while they do not.
+  defp log_poll_result(%State{running: before_running}, issues, %State{} = state) do
+    result = {length(issues), max(map_size(state.running) - map_size(before_running), 0)}
+
+    if result == state.last_poll_result do
+      state
+    else
+      {candidates, dispatched} = result
+      Logger.info("Poll: candidates=#{candidates} dispatched=#{dispatched} running=#{map_size(state.running)}")
+      %{state | last_poll_result: result}
     end
   end
 
@@ -1569,9 +1590,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     if head != "?" and head != already do
       Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-        case System.cmd("gh", ["pr", "comment", pr_url, "--body", "@coderabbitai review"],
-               stderr_to_stdout: true
-             ) do
+        case System.cmd("gh", ["pr", "comment", pr_url, "--body", "@coderabbitai review"], stderr_to_stdout: true) do
           {_out, 0} ->
             Logger.info("Requested CodeRabbit review on #{pr_url} (head #{head}) in parallel with the tester")
 
@@ -1791,16 +1810,14 @@ defmodule SymphonyElixir.Orchestrator do
               {:ok, decoded} ->
                 cond do
                   coderabbit_requested_changes?(decoded) ->
-                    {:request_changes,
-                     "CodeRabbit requested changes — resolve its comments and post `@coderabbitai resolve`"}
+                    {:request_changes, "CodeRabbit requested changes — resolve its comments and post `@coderabbitai resolve`"}
 
                   # A later CodeRabbit round can land as a COMMENTED review with
                   # unresolved threads and an empty reviewDecision — invisible to
                   # both checks above, so the issue completed with open Major
                   # comments (GEA-5242). Unresolved threads block the same way.
                   (n = unresolved_review_threads(repo, number)) > 0 ->
-                    {:request_changes,
-                     "#{n} unresolved review threads — address them and post `@coderabbitai resolve`"}
+                    {:request_changes, "#{n} unresolved review threads — address them and post `@coderabbitai resolve`"}
 
                   true ->
                     :ok
@@ -1849,6 +1866,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp coderabbit_requested_changes?(%{"latestReviews" => reviews}) when is_list(reviews) do
     Enum.any?(reviews, fn review ->
       login = get_in(review, ["author", "login"])
+
       is_binary(login) and String.starts_with?(login, "coderabbit") and
         Map.get(review, "state") == "CHANGES_REQUESTED"
     end)
@@ -2646,6 +2664,16 @@ defmodule SymphonyElixir.Orchestrator do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
 
+  # Between the dispatch line and the run's end line, this is the only thing a
+  # reader of `fly logs` learns about where an agent has got to — the board used
+  # to carry it and nothing else did (GEA-10144).
+  defp log_phase_change(running_entry, old_phase, phase) do
+    Logger.info(
+      "Phase change: #{issue_context(running_entry.issue)} session_id=#{running_entry.session_id} " <>
+        "#{old_phase || "none"} -> #{phase}"
+    )
+  end
+
   defp available_slots(%State{} = state) do
     max(
       (state.max_concurrent_agents || Config.max_concurrent_agents()) - map_size(state.running),
@@ -2912,6 +2940,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     {phase_changed_at, phases_seen} =
       if phase != old_phase and phase != nil do
+        log_phase_change(running_entry, old_phase, phase)
+
         updated_phases =
           if phase in existing_phases, do: existing_phases, else: existing_phases ++ [phase]
 
@@ -3756,9 +3786,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp open_pr_info(url) when is_binary(url) do
     with {out, 0} <-
-           System.cmd("gh", ["pr", "view", url, "--json", "state,headRefName,number"],
-             stderr_to_stdout: true
-           ),
+           System.cmd("gh", ["pr", "view", url, "--json", "state,headRefName,number"], stderr_to_stdout: true),
          {:ok, %{"state" => "OPEN", "headRefName" => branch, "number" => number}} <-
            Jason.decode(out) do
       %{url: url, branch: branch, number: number}

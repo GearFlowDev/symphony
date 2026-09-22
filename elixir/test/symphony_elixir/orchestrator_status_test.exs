@@ -1070,6 +1070,11 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "status dashboard renders offline marker to terminal" do
+    # The board only draws where it is wanted (GEA-10144), and a test runs down a
+    # pipe, so say so. `SymphonyElixir.StatusOutputTest` holds the other arm: the
+    # same call writes nothing at all in log mode.
+    force_status_board!()
+
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->
         assert :ok = StatusDashboard.render_offline_status()
@@ -1653,6 +1658,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "application stop renders offline status" do
+    force_status_board!()
+
     rendered =
       ExUnit.CaptureIO.capture_io(fn ->
         assert :ok = SymphonyElixir.Application.stop(:normal)
@@ -1660,6 +1667,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert rendered =~ "app_status=offline"
     refute rendered =~ "Timestamp:"
+  end
+
+  defp force_status_board! do
+    previous = System.get_env("SYMPHONY_STATUS_BOARD")
+    on_exit(fn -> restore_env("SYMPHONY_STATUS_BOARD", previous) end)
+    System.put_env("SYMPHONY_STATUS_BOARD", "on")
+    :ok
   end
 
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
@@ -1679,6 +1693,56 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         Process.sleep(5)
         do_wait_for_snapshot(pid, predicate, deadline_ms)
       end
+    end
+  end
+
+  describe "the poll's own log line (GEA-10144)" do
+    test "a poll logs its counts once and stays quiet while they do not move" do
+      # On `gf-symphony` the status board was the only thing that said the poller
+      # was alive, and it said so thirty lines a second. This line replaces it: one
+      # per poll whose answer moved, none for a poll that found what the last one
+      # found.
+      write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+      # The supervised orchestrator polls the same tracker and would write
+      # indistinguishable lines into the capture; stand it down for the duration.
+      stop_default_orchestrator()
+
+      name = Module.concat(__MODULE__, :PollLogOrchestrator)
+
+      log =
+        capture_log(fn ->
+          {:ok, pid} = Orchestrator.start_link(name: name)
+
+          # `init/1` schedules the first cycle at once; a sync call queues behind
+          # it, so each `:sys.get_state/1` below returns only after that cycle ran.
+          send(pid, :run_poll_cycle)
+          _ = :sys.get_state(pid)
+          send(pid, :run_poll_cycle)
+          _ = :sys.get_state(pid)
+
+          GenServer.stop(pid)
+        end)
+
+      assert [_single_line] = Regex.scan(~r/Poll: candidates=0 dispatched=0 running=0/, log)
+    end
+  end
+
+  defp stop_default_orchestrator do
+    case Process.whereis(SymphonyElixir.Orchestrator) do
+      nil ->
+        :ok
+
+      _pid ->
+        :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator)
+
+        on_exit(fn ->
+          case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator) do
+            {:ok, _pid} -> :ok
+            {:error, {:already_started, _pid}} -> :ok
+          end
+        end)
     end
   end
 

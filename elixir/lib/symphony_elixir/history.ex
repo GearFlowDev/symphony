@@ -121,9 +121,7 @@ defmodule SymphonyElixir.History do
     {count, _} =
       Run
       |> where([r], is_nil(r.finished_at))
-      |> Repo.update_all(
-        set: [finished_at: now, outcome: "orphaned", error_category: "orphaned", updated_at: now]
-      )
+      |> Repo.update_all(set: [finished_at: now, outcome: "orphaned", error_category: "orphaned", updated_at: now])
 
     count
   end

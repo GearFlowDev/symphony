@@ -45,7 +45,10 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      # The last {candidates, dispatched} pair the poll logged, so an unchanged
+      # answer stays silent (GEA-10144).
+      last_poll_result: nil
     ]
   end
 
@@ -436,9 +439,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp do_dispatch(%State{} = state) do
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
+      dispatched =
+        if available_slots(state) > 0 do
+          choose_issues(issues, state)
+        else
+          state
+        end
+
+      log_poll_result(state, issues, dispatched)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -489,9 +498,23 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
         state
+    end
+  end
 
-      false ->
-        state
+  # One line per poll, and only when the answer moves. A poller that prints its
+  # result every interval refills a bounded log window the way the status board
+  # did (GEA-10144); a poller that never prints leaves "was it even looking?"
+  # unanswerable after an incident. So: print the counts when they change, and
+  # stay quiet while they do not.
+  defp log_poll_result(%State{running: before_running}, issues, %State{} = state) do
+    result = {length(issues), max(map_size(state.running) - map_size(before_running), 0)}
+
+    if result == state.last_poll_result do
+      state
+    else
+      {candidates, dispatched} = result
+      Logger.info("Poll: candidates=#{candidates} dispatched=#{dispatched} running=#{map_size(state.running)}")
+      %{state | last_poll_result: result}
     end
   end
 
@@ -2397,6 +2420,16 @@ defmodule SymphonyElixir.Orchestrator do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
 
+  # Between the dispatch line and the run's end line, this is the only thing a
+  # reader of `fly logs` learns about where an agent has got to — the board used
+  # to carry it and nothing else did (GEA-10144).
+  defp log_phase_change(running_entry, old_phase, phase) do
+    Logger.info(
+      "Phase change: #{issue_context(running_entry.issue)} session_id=#{running_entry.session_id} " <>
+        "#{old_phase || "none"} -> #{phase}"
+    )
+  end
+
   defp available_slots(%State{} = state) do
     max(
       (state.max_concurrent_agents || Config.max_concurrent_agents()) - map_size(state.running),
@@ -2663,6 +2696,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     {phase_changed_at, phases_seen} =
       if phase != old_phase and phase != nil do
+        log_phase_change(running_entry, old_phase, phase)
+
         updated_phases =
           if phase in existing_phases, do: existing_phases, else: existing_phases ++ [phase]
 

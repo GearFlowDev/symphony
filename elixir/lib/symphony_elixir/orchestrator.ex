@@ -168,9 +168,7 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
 
-        Logger.info(
-          "No pool slot for issue_id=#{issue_id} identifier=#{running_entry[:identifier]}; backing off"
-        )
+        Logger.info("No pool slot for issue_id=#{issue_id} identifier=#{running_entry[:identifier]}; backing off")
 
         # Close the run row opened at dispatch — skipping history here left
         # these 0-turn rows open forever (101 piled up by 2026-07-14). A
@@ -1222,6 +1220,7 @@ defmodule SymphonyElixir.Orchestrator do
         if finished > last_seen do
           fingerprint =
             plan_cycle_fingerprint(plan, identifier, dispatch_metadata[:existing_pr_url])
+
           history = Enum.take([fingerprint | meta["cycle_history"] || []], 4 * limit)
           repeats = Enum.count(history, &(&1 == fingerprint))
           tripped? = repeats >= limit
@@ -1410,9 +1409,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     if head != "?" and head != already do
       Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-        case System.cmd("gh", ["pr", "comment", pr_url, "--body", "@coderabbitai review"],
-               stderr_to_stdout: true
-             ) do
+        case System.cmd("gh", ["pr", "comment", pr_url, "--body", "@coderabbitai review"], stderr_to_stdout: true) do
           {_out, 0} ->
             Logger.info("Requested CodeRabbit review on #{pr_url} (head #{head}) in parallel with the tester")
 
@@ -1632,16 +1629,14 @@ defmodule SymphonyElixir.Orchestrator do
               {:ok, decoded} ->
                 cond do
                   coderabbit_requested_changes?(decoded) ->
-                    {:request_changes,
-                     "CodeRabbit requested changes — resolve its comments and post `@coderabbitai resolve`"}
+                    {:request_changes, "CodeRabbit requested changes — resolve its comments and post `@coderabbitai resolve`"}
 
                   # A later CodeRabbit round can land as a COMMENTED review with
                   # unresolved threads and an empty reviewDecision — invisible to
                   # both checks above, so the issue completed with open Major
                   # comments (GEA-5242). Unresolved threads block the same way.
                   (n = unresolved_review_threads(repo, number)) > 0 ->
-                    {:request_changes,
-                     "#{n} unresolved review threads — address them and post `@coderabbitai resolve`"}
+                    {:request_changes, "#{n} unresolved review threads — address them and post `@coderabbitai resolve`"}
 
                   true ->
                     :ok
@@ -1690,6 +1685,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp coderabbit_requested_changes?(%{"latestReviews" => reviews}) when is_list(reviews) do
     Enum.any?(reviews, fn review ->
       login = get_in(review, ["author", "login"])
+
       is_binary(login) and String.starts_with?(login, "coderabbit") and
         Map.get(review, "state") == "CHANGES_REQUESTED"
     end)
@@ -3539,9 +3535,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp open_pr_info(url) when is_binary(url) do
     with {out, 0} <-
-           System.cmd("gh", ["pr", "view", url, "--json", "state,headRefName,number"],
-             stderr_to_stdout: true
-           ),
+           System.cmd("gh", ["pr", "view", url, "--json", "state,headRefName,number"], stderr_to_stdout: true),
          {:ok, %{"state" => "OPEN", "headRefName" => branch, "number" => number}} <-
            Jason.decode(out) do
       %{url: url, branch: branch, number: number}

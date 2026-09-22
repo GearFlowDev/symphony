@@ -379,13 +379,7 @@ defmodule SymphonyElixir.Config do
   @spec required_issue_labels() :: [String.t()]
   def required_issue_labels do
     linear_filter()
-    |> get_in_path(["labels", "include"])
-    |> case do
-      labels when is_list(labels) -> labels
-      label when is_binary(label) -> [label]
-      _ -> []
-    end
-    |> Enum.filter(&is_binary/1)
+    |> SymphonyElixir.Linear.FilterBuilder.include_labels()
     |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
@@ -484,11 +478,12 @@ defmodule SymphonyElixir.Config do
 
   defp resolve_workspace_root(_value), do: @default_workspace_root
 
-  # `~` and an absolute path mean what they say; a RELATIVE path is relative to
-  # THE WORKFLOW FILE, not to wherever the orchestrator happened to be launched
-  # from. A value that is not path-shaped at all (no separator — a bare token
-  # such as a legacy `env:NAME` reference) is left exactly as written; it is not
-  # ours to expand.
+  # `~` and an absolute path mean what they say. Everything else is a RELATIVE
+  # path, relative to THE WORKFLOW FILE rather than to wherever the orchestrator
+  # happened to be launched from — including a bare `workspaces` with no
+  # separator in it, which is a directory name like any other. The one thing
+  # left alone is a scheme-prefixed token (`env:NAME`, a URI): that is not a
+  # path and never was ours to expand.
   defp anchor_on_workflow_dir("~" <> _rest = path), do: Path.expand(path)
 
   defp anchor_on_workflow_dir(path) when is_binary(path) do
@@ -496,7 +491,7 @@ defmodule SymphonyElixir.Config do
       Path.type(path) == :absolute ->
         Path.expand(path)
 
-      not String.contains?(path, ["/", "\\"]) ->
+      scheme_prefixed?(path) ->
         path
 
       true ->
@@ -504,6 +499,8 @@ defmodule SymphonyElixir.Config do
         Path.expand(path, workflow_dir)
     end
   end
+
+  defp scheme_prefixed?(path), do: String.match?(path, ~r/^[a-zA-Z][a-zA-Z0-9+.-]*:/)
 
   @spec workspace_hooks() :: workspace_hooks()
   def workspace_hooks do

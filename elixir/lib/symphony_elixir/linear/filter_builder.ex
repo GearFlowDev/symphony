@@ -55,6 +55,19 @@ defmodule SymphonyElixir.Linear.FilterBuilder do
   # Label include filter
   # ---------------------------------------------------------------------------
 
+  @doc """
+  The labels `labels.include` targets, normalized.
+
+  Public so the LIVE gate (is a running issue still routed here?) and the
+  candidate QUERY read the same list through the same extraction — including
+  the bare-list shorthand and atom keys. Two readers of this config disagreeing
+  means dispatching an issue and stopping it again on the next poll.
+  """
+  @spec include_labels(map()) :: [String.t()]
+  def include_labels(config) when is_map(config), do: extract_labels_include(config)
+
+  def include_labels(_config), do: []
+
   defp maybe_add_labels_include(filters, config) do
     case extract_labels_include(config) do
       [] -> filters

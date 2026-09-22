@@ -6,10 +6,6 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     # own orchestrator caches a snapshot on its first poll, which used to be
     # prevented only by that orchestrator failing every cycle on an unusable
     # config — not something a test should depend on.
-    if :ets.whereis(:symphony_orchestrator_snapshot) != :undefined do
-      :ets.delete(:symphony_orchestrator_snapshot, :last)
-    end
-
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
 
@@ -24,6 +20,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end)
 
     assert_receive :snapshot_server_ready, 1_000
+
+    # Cleared immediately before the call: the application's own orchestrator
+    # polls while this test runs and would repopulate the entry in between.
+    if :ets.whereis(:symphony_orchestrator_snapshot) != :undefined do
+      :ets.delete(:symphony_orchestrator_snapshot, :last)
+    end
+
     assert Orchestrator.snapshot(server_name, 10) == :timeout
 
     send(pid, :stop)

@@ -1646,7 +1646,13 @@ defmodule SymphonyElixir.CoreTest do
   test "a retry whose dispatch-time refresh errors keeps its claim and reschedules" do
     # No token, tracker kind linear: the refresh fails at the header, with no
     # network involved — the same shape as the RATELIMITED read that dropped
-    # GEA-7671 for good on 2026-09-15.
+    # GEA-7671 for good on 2026-09-15. `linear_api_token/0` falls back to
+    # LINEAR_API_KEY, so clear it: on a machine that exports one, the refresh
+    # would reach the network instead and this would test something else.
+    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+    System.delete_env("LINEAR_API_KEY")
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", tracker_api_token: nil)
 
     issue_id = "retry-refresh-error"
@@ -1870,6 +1876,10 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "the orchestrator refuses to start on an invalid WORKFLOW.md" do
+    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+    System.delete_env("LINEAR_API_KEY")
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", tracker_api_token: nil)
 
     Process.flag(:trap_exit, true)

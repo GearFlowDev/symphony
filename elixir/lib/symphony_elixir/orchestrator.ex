@@ -782,7 +782,10 @@ defmodule SymphonyElixir.Orchestrator do
         timeout_ms
 
       _ ->
-        max(timeout_ms, Config.hook_timeout_ms())
+        # TWO hook budgets: `after_create` runs inside `create_for_issue/1` and
+        # `before_run` follows it, both before any session exists. One budget
+        # would still cut a slow provision off partway through the second.
+        max(timeout_ms, Config.hook_timeout_ms() * 2)
     end
   end
 
@@ -935,9 +938,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp issue_carries_required_labels?(%Issue{labels: []}), do: true
 
   defp issue_carries_required_labels?(%Issue{labels: labels}) when is_list(labels) do
-    issue_labels = MapSet.new(labels, &normalize_label/1)
+    case Config.required_issue_labels() do
+      [] ->
+        true
 
-    Enum.all?(Config.required_issue_labels(), &MapSet.member?(issue_labels, normalize_label(&1)))
+      required ->
+        # ANY, not all. The candidate query compiles `labels.include` to
+        # `labels: {name: {in: [...]}}`, which Linear matches on any one of
+        # them. A stricter live gate than the query means the poll dispatches an
+        # issue and this arm stops it again on the very next cycle.
+        issue_labels = MapSet.new(labels, &normalize_label/1)
+        Enum.any?(required, &MapSet.member?(issue_labels, normalize_label(&1)))
+    end
   end
 
   defp issue_carries_required_labels?(_issue), do: true
@@ -1032,6 +1044,11 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # The rescue lives HERE, not only on `dispatch_issue/4`: the retry path calls
+  # this directly, and everything that can raise — `spawn_worker/4`,
+  # `record_dispatch_to_history/3`, `Tracker.claim_issue/2` — is below this
+  # line. Leaving it on the caller meant a raise on the retry path took the
+  # orchestrator down with it.
   defp dispatch_refreshed_issue(%State{} = state, %Issue{} = refreshed_issue, attempt, metadata) do
     # Find the issue's open PR (if any) so the plan workflow assesses against
     # the right branch, and the worker checks it out. The plan — not a phase
@@ -1052,6 +1069,10 @@ defmodule SymphonyElixir.Orchestrator do
 
     pr_metadata = %{existing_pr_url: pr_url, existing_pr_branch: pr_branch}
     do_dispatch_issue(state, refreshed_issue, attempt, Map.merge(metadata, pr_metadata))
+  rescue
+    error ->
+      Logger.error("dispatch_issue crashed for #{issue_context(refreshed_issue)}: #{Exception.message(error)}")
+      state
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, metadata) do
@@ -2456,8 +2477,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp cleanup_issue_workspace(running_entry, identifier) when is_map(running_entry) do
     case Map.get(running_entry, :workspace_path) do
       workspace_path when is_binary(workspace_path) and workspace_path != "" ->
-        Workspace.remove_recorded(workspace_path)
-        :ok
+        case Workspace.remove_recorded(workspace_path) do
+          {:error, reason, _output} ->
+            # Swallowing this leaves the workspace in place AND its pool slot
+            # claimed, with nothing said. Fall back to the identifier so the
+            # slot is still released.
+            Logger.warning("Recorded workspace removal failed path=#{workspace_path} reason=#{inspect(reason)}; falling back to the identifier")
+
+            cleanup_issue_workspace(identifier)
+
+          _removed ->
+            :ok
+        end
 
       _ ->
         cleanup_issue_workspace(identifier)

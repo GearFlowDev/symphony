@@ -1198,7 +1198,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  # A ZOMBIE is a killed process: its parent was killed alongside it and cannot
+  # reap it, so it lingers in the table until init does. `ps -p` alone would
+  # report that as alive and make this test race the reaper.
   defp process_alive?(pid) when is_binary(pid) do
-    match?({_output, 0}, System.cmd("ps", ["-p", pid], stderr_to_stdout: true))
+    case System.cmd("ps", ["-o", "stat=", "-p", pid], stderr_to_stdout: true) do
+      {output, 0} ->
+        state = String.trim(output)
+        state != "" and not String.starts_with?(state, "Z")
+
+      _ ->
+        false
+    end
   end
 end

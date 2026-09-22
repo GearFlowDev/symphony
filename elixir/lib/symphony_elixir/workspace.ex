@@ -12,6 +12,11 @@ defmodule SymphonyElixir.Workspace do
   # its children. `$$` is this shell; every process the hook starts hangs below
   # it, and closing the port only ever reaches the shell itself.
   @hook_pid_preamble "printf '%s' \"$$\" > \"$SYMPHONY_HOOK_PIDFILE\" 2>/dev/null || true\n"
+  # A shell running `-c` will `exec` its LAST command and replace itself, which
+  # loses both the recorded pid's identity (`still_our_hook?/1` reads the
+  # command line for the marker) and the parent the children hang from. A
+  # trailing builtin leaves the shell in place.
+  @hook_pid_epilogue "\nexit $?"
 
   @spec create_for_issue(map() | String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier) do
@@ -563,7 +568,7 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", @hook_pid_preamble <> command],
+        System.cmd("sh", ["-lc", @hook_pid_preamble <> command <> @hook_pid_epilogue],
           cd: workspace,
           stderr_to_stdout: true,
           env: env
@@ -630,12 +635,23 @@ defmodule SymphonyElixir.Workspace do
   defp still_our_hook?(_pid), do: false
 
   defp kill_process_tree(pid) when is_integer(pid) and pid > 1 do
+    # STOP before enumerating. A live shell forks the next command while we are
+    # walking its children, and that fork is then never seen or killed — which
+    # is the whole failure being fixed here, one level down.
+    signal(pid, "-STOP")
     descendants = Enum.flat_map(child_pids(pid), &kill_process_tree/1)
-    System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+    signal(pid, "-KILL")
     descendants ++ [pid]
   end
 
   defp kill_process_tree(_pid), do: []
+
+  defp signal(pid, flag) when is_integer(pid) do
+    System.cmd("kill", [flag, Integer.to_string(pid)], stderr_to_stdout: true)
+    :ok
+  rescue
+    _ -> :ok
+  end
 
   defp child_pids(pid) when is_integer(pid) do
     case System.cmd("pgrep", ["-P", Integer.to_string(pid)], stderr_to_stdout: true) do

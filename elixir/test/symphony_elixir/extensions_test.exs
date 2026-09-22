@@ -460,17 +460,17 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do
-    # The timeout payload is only reached with NO cached snapshot: a cached one
-    # is served stale instead, by design. The application's own orchestrator
-    # caches on its first poll, so start from an empty cache rather than relying
-    # on that orchestrator never having completed one.
-    if :ets.whereis(:symphony_orchestrator_snapshot) != :undefined do
-      :ets.delete(:symphony_orchestrator_snapshot, :last)
-    end
-
     timeout_orchestrator = Module.concat(__MODULE__, :TimeoutOrchestrator)
     {:ok, _pid} = SlowOrchestrator.start_link(name: timeout_orchestrator)
     start_test_endpoint(orchestrator: timeout_orchestrator, snapshot_timeout_ms: 1)
+
+    # The timeout payload is only reached with NO cached snapshot: a cached one
+    # is served stale instead, by design. The application's own orchestrator
+    # caches on its first poll and polls again while this test runs, so clear
+    # the entry immediately before the call rather than at the top.
+    if :ets.whereis(:symphony_orchestrator_snapshot) != :undefined do
+      :ets.delete(:symphony_orchestrator_snapshot, :last)
+    end
 
     timeout_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
 

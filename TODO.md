@@ -9,7 +9,7 @@ step. Any place the pipeline can stall short of that line without a human being
 ## Upstream behaviours ported by hand (2026-09-22, GEA-9886)
 
 The fork is 182 commits past the fork point and upstream rewrote `config.ex`,
-`orchestrator.ex` and `workspace.ex`, so there is no merge path. Nine behaviours
+`orchestrator.ex` and `workspace.ex`, so there is no merge path. Ten behaviours
 an unattended run depends on were re-implemented against this fork's code, each
 with a regression in `elixir/test/`:
 
@@ -45,6 +45,13 @@ with a regression in `elixir/test/`:
   collapsed to row states and a dispatch that pushed looked identical to one
   that did nothing. It now carries the evaluator's cumulative change totals, and
   the trip message names only the gates that actually ran.
+
+- **A dispatch that died in `before_run` does not spend the daily budget** —
+  `dispatches_today/1` also excludes a finished run with no session id and no
+  turns. Twelve such runs — failed hooks and stall-abandoned attempts —
+  exhausted GEA-9699's day on 2026-09-22, and the block's only stated way out
+  was re-activating the issue. What bounds a hook that keeps failing is the
+  failure-retry cap, not this budget.
 
 Deliberately NOT ported: tracker adapters, SSH workers, the Ecto config schema,
 Burrito packaging.

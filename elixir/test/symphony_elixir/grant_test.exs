@@ -50,6 +50,13 @@ defmodule SymphonyElixir.GrantTest do
     end
   end
 
+  test "each grant spells its own Linear label, for a prompt and for a log line" do
+    assert Grant.label(:build) == "Auto-Build"
+    assert Grant.label(:design) == "Auto-Design"
+    assert Grant.label(:merge) == "Auto-Merge"
+    assert Grant.label(:user) == "Auto-User"
+  end
+
   test "Auto-User is Auto-Merge in this build" do
     assert Grant.finish_line(:user) == Grant.finish_line(:merge)
   end

@@ -1729,16 +1729,20 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end
   end
 
+  # The orchestrator is no longer a direct child of the application supervisor:
+  # it sits under AgentRuntimeSupervisor with the task supervisor that owns its
+  # agents, so stopping it means stopping that subtree. Addressing it by its own
+  # module id answers {:error, :not_found}.
   defp stop_default_orchestrator do
-    case Process.whereis(SymphonyElixir.Orchestrator) do
+    case Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do
       nil ->
         :ok
 
       _pid ->
-        :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator)
+        :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.AgentRuntimeSupervisor)
 
         on_exit(fn ->
-          case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator) do
+          case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.AgentRuntimeSupervisor) do
             {:ok, _pid} -> :ok
             {:error, {:already_started, _pid}} -> :ok
           end

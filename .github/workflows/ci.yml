@@ -1,0 +1,107 @@
+# The org fork's own fast gate (GEA-9891): three checks, and a worker's PR is not mergeable
+# until they answer.
+#
+# WHY THIS FILE EXISTS. `GearFlowDev/symphony` became a working home on 2026-09-22 — the
+# harness bot has write here, so a worker can be sent to fix Symphony's own defects instead of
+# a person doing it on a personal repository. A repository workers PR into needs a gate that
+# says whether the PR compiles and passes, and it needs one that answers in a minute.
+#
+# WHY THESE THREE AND NOT `make all`. `make-all.yml` beside this file is upstream's, it came
+# with the fork, and it is wider: `mix lint` (credo --strict plus a `@spec` check), `mix test
+# --cover` against a 100% threshold, and `mix dialyzer`. Whether the org keeps that bar is a
+# decision nobody has made, and it is not this file's to make. GEA-9891 named the three checks
+# a worker's PR has to pass, and they are the three below. `make all` stays where it is; this
+# is the fast gate in front of it, and the one that names WHICH of the three broke.
+#
+# ---- `main` IS RED TODAY, AND THIS FILE DOES NOT MAKE IT SO --------------------------------
+#
+# Read this before reading a red tick on your own PR as your fault.
+#
+# `mix test` fails 6 of 340 on `main` — measured on this runner, not inferred. Six pieces of
+# code the tests no longer describe: the observability payload grew `max_concurrent`, the
+# dashboard dropped its `Copy ID` control, the workspace re-creates a directory the test says
+# it reuses, a lifecycle hook runs twice, and the in-repo WORKFLOW.md no longer renders what
+# core_test expects. GEA-10258 holds the list and the evidence. `make all` is red on `main`
+# too, at `mix format --check-formatted`, which the commit that adds this file fixes.
+#
+# So a PR here is red on `ci` until GEA-10258 closes, and the red belongs to `main`. Compare
+# your run against `main`'s before you go looking in your own diff.
+#
+# DO NOT MAKE THE TEST STEP NON-BLOCKING to get past that. A gate that cannot fail is not a
+# gate, and this fork's whole problem is that nothing was watching. Fix GEA-10258 instead.
+#
+# ---- The shape ---------------------------------------------------------------------------
+#
+# Every PR and every push to main. No `concurrency: cancel-in-progress` — cancelling a
+# superseded run is how the breaking commit's own job gets killed before it ever reports.
+#
+# The toolchain comes from `elixir/mise.toml` (Erlang 28, Elixir 1.19.5-otp-28), the same pair
+# `devenv.nix` names for a Gearflow slot. They move together or a slot compiles what CI will
+# not. Actions are pinned by SHA and not by tag: this job runs `mix deps.get`, so an action
+# retargeted under us runs before any code review sees it.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: elixir
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: the toolchain elixir/mise.toml names
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          install: true
+          cache: true
+          working_directory: elixir
+
+      - name: cache deps and _build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            elixir/deps
+            elixir/_build
+          # MIX_ENV is in the key: the compile and the test steps below share one `test`
+          # build, and a cache restored from a `dev` build would be a compile nobody checked.
+          key: ${{ runner.os }}-mix-test-${{ hashFiles('elixir/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-test-
+
+      - name: dependencies
+        run: |
+          # `mix local.hex --force` before anything, and not only on a cache miss: a stale
+          # archive raises `Enum.__in__/2 is undefined` under Elixir 1.19 and `mix deps.get`
+          # then dies before it fetches a single package.
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+
+      - name: mix format --check-formatted
+        run: mix format --check-formatted
+
+      # MIX_ENV=test, so this build is the one `mix test` runs on. In `dev` the step would
+      # compile a second tree, pass, and leave the test build's warnings unseen.
+      - name: mix compile --warnings-as-errors
+        env:
+          MIX_ENV: test
+        run: mix compile --warnings-as-errors
+
+      - name: mix test
+        env:
+          MIX_ENV: test
+        run: mix test

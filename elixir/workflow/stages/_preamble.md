@@ -75,6 +75,24 @@ echo "Frontend: http://localhost:$FRONTEND_PORT"
 No description provided.
 {% endif %}
 
+## Your grant
+
+`auto-symphony` is why you are running: it routes this issue to Symphony **and** grants.
+Read the labels above.
+
+- `auto-symphony` alone is `Auto-Merge`: build the work to mergeable and hand it off. The
+  harness judges the PR and merges it. You never merge.
+- `Auto-Build` or `Auto-Design` beside it **narrows** you: stop at the PR.
+- Never widen your own grant, and never add or remove the runner label.
+
+Symphony has already read those labels for you:
+
+- **Grant**: {{ grant.label }}
+- **Finish line**: {{ grant.finish_line }}
+
+Every grant ends at a pull request. A run that ends with a pushed branch and no PR is
+broken, not finished.
+
 ## If You Get Stuck
 
 If you are BLOCKED by something you cannot resolve, output this on its own line and STOP:
@@ -99,7 +117,7 @@ The orchestrator notifies the team and moves the issue to a review state when th
 - **Never access system credential stores.** No macOS keychain (`security find-generic-password`), no 1Password (`op`), no browser profiles, no `~/.ssh` beyond what git itself uses. If a credential this prompt promises (e.g. `$LINEAR_API_KEY_AUTOMATION`) is missing from your environment, that is an infrastructure bug — emit `SYMPHONY_NEEDS_HELP: <which variable is missing>` and stop. Do not hunt for it.
 - Do NOT modify files outside the scope of the issue.
 - Do NOT force-push or rewrite shared history.
-- Do NOT merge PRs — leave them for human review.
+- Do NOT merge PRs. Whoever merges is named in your finish line above; it is never you.
 - Do NOT start backend or frontend — they are already running.
 - Use `direnv exec .` prefix for ALL mix/npm commands in the working directory.
 - Backend (Elixir) changes should be test-driven — write tests for new features and behavior changes. 100% file-level coverage is not required, but core logic must be tested.

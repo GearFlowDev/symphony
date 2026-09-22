@@ -68,6 +68,7 @@ defmodule SymphonyElixir.Config do
   @default_observability_render_interval_ms 16
   @default_server_host "127.0.0.1"
   @default_escalation_eval_score_threshold 60
+  @default_hand_off_timeout_ms 120_000
   @workflow_options_schema NimbleOptions.new!(
                              tracker: [
                                type: :map,
@@ -87,6 +88,13 @@ defmodule SymphonyElixir.Config do
                                  # (user id or email). Independent of routing — set this to a
                                  # human without restricting which issues are picked up.
                                  claim_assignee: [type: {:or, [:string, nil]}, default: nil],
+                                 # The MACHINE-ONLY label a live Symphony run wears, applied on
+                                 # claim and removed on every ending. It mirrors the agent pool's
+                                 # `auto-working`: a person reading the board can tell a claimed
+                                 # issue from a running one, and the pool's sweeps — which match
+                                 # `auto-working` and nothing else — keep ignoring ours (GEA-9888).
+                                 # nil leaves the board unmarked, which is the old behaviour.
+                                 working_label: [type: {:or, [:string, nil]}, default: nil],
                                  active_states: [
                                    type: {:list, :string},
                                    default: @default_active_states
@@ -319,6 +327,20 @@ defmodule SymphonyElixir.Config do
                                  ],
                                  webhook_url: [type: {:or, [:string, nil]}, default: nil],
                                  needs_human_state: [type: {:or, [:string, nil]}, default: nil]
+                               ]
+                             ],
+                             hand_off: [
+                               type: :map,
+                               default: %{},
+                               keys: [
+                                 # THE ONE ENDING A RUN HAS under a grant that hands off. The
+                                 # shell command that tells whoever merges that a PR is ready to
+                                 # judge; Symphony runs it once, with the issue, the PR and a
+                                 # proof file in its environment (Orchestrator.hand_off/3).
+                                 # nil means nothing is handed off, which is what a machine
+                                 # running Symphony alone wants (GEA-9888, GEA-9955).
+                                 command: [type: {:or, [:string, nil]}, default: nil],
+                                 timeout_ms: [type: :pos_integer, default: @default_hand_off_timeout_ms]
                                ]
                              ]
                            )
@@ -827,6 +849,30 @@ defmodule SymphonyElixir.Config do
     get_in(validated_workflow_options(), [:escalation, :webhook_url])
   end
 
+  @doc """
+  The machine-only label a live run wears, or nil when the board is left unmarked.
+  """
+  @spec tracker_working_label() :: String.t() | nil
+  def tracker_working_label do
+    validated_workflow_options()
+    |> get_in([:tracker, :working_label])
+    |> resolve_env_value(nil)
+    |> normalize_secret_value()
+  end
+
+  @doc """
+  The shell command that hands a finished PR to whoever merges it, or nil.
+  """
+  @spec hand_off_command() :: String.t() | nil
+  def hand_off_command do
+    get_in(validated_workflow_options(), [:hand_off, :command])
+  end
+
+  @spec hand_off_timeout_ms() :: pos_integer()
+  def hand_off_timeout_ms do
+    get_in(validated_workflow_options(), [:hand_off, :timeout_ms])
+  end
+
   @spec escalation_needs_human_state() :: String.t() | nil
   def escalation_needs_human_state do
     get_in(validated_workflow_options(), [:escalation, :needs_human_state])
@@ -939,7 +985,8 @@ defmodule SymphonyElixir.Config do
       hooks: extract_hooks_options(section_map(config, "hooks")),
       observability: extract_observability_options(section_map(config, "observability")),
       server: extract_server_options(section_map(config, "server")),
-      escalation: extract_escalation_options(section_map(config, "escalation"))
+      escalation: extract_escalation_options(section_map(config, "escalation")),
+      hand_off: extract_hand_off_options(section_map(config, "hand_off"))
     }
   end
 
@@ -951,6 +998,7 @@ defmodule SymphonyElixir.Config do
     |> put_if_present(:filter, map_value(Map.get(section, "filter")))
     |> put_if_present(:assignee, scalar_string_value(Map.get(section, "assignee")))
     |> put_if_present(:claim_assignee, scalar_string_value(Map.get(section, "claim_assignee")))
+    |> put_if_present(:working_label, scalar_string_value(Map.get(section, "working_label")))
     |> put_if_present(:active_states, csv_value(Map.get(section, "active_states")))
     |> put_if_present(:terminal_states, csv_value(Map.get(section, "terminal_states")))
   end
@@ -1050,6 +1098,12 @@ defmodule SymphonyElixir.Config do
     %{}
     |> put_if_present(:port, non_negative_integer_value(Map.get(section, "port")))
     |> put_if_present(:host, scalar_string_value(Map.get(section, "host")))
+  end
+
+  defp extract_hand_off_options(section) do
+    %{}
+    |> put_if_present(:command, hook_command_value(Map.get(section, "command")))
+    |> put_if_present(:timeout_ms, positive_integer_value(Map.get(section, "timeout_ms")))
   end
 
   defp extract_escalation_options(section) do

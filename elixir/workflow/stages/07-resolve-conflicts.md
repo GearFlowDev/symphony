@@ -43,7 +43,8 @@ gh pr view --json mergeable --jq .mergeable   # must print MERGEABLE
 
 ### Step 4: Stop
 
-End your turn. Do not mark the PR ready/draft, move the issue's status, or post
+End your turn. Do not run `gh pr ready` (the PR is already ready and no PR here is
+ever a draft), do not move the issue's status, and do not post
 Linear comments — the orchestrator handles those. CI re-runs on your push; the
 Fix CI phase handles it if it goes red.
 

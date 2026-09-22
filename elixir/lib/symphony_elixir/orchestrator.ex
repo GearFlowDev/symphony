@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{Config, Evaluator, History, Notifier, Planning, StatusDashboard, Suitability, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Evaluator, Grant, History, Notifier, Planning, StatusDashboard, Suitability, Tracker, Workspace}
   alias SymphonyElixir.Claude.StreamParser
   alias SymphonyElixir.Linear.Issue
 
@@ -369,7 +369,12 @@ defmodule SymphonyElixir.Orchestrator do
           help_message: message
         })
 
-        # Move issue to review state if configured
+        # The run is over, whatever a person does next.
+        clear_working_label(issue_id, identifier)
+
+        # Move issue to review state if configured. On the Gearflow boxes that is
+        # `Shaping`, which is where parking lives: nothing dispatches from it, and
+        # the `needs-human` label this used to reach for was retired 2026-09-17.
         needs_human_state = Config.escalation_needs_human_state()
 
         if is_binary(needs_human_state) do
@@ -583,6 +588,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec terminate_running_issue_for_test(term(), String.t(), boolean(), atom()) :: term()
+  def terminate_running_issue_for_test(%State{} = state, issue_id, cleanup_workspace, reason) do
+    terminate_running_issue(state, issue_id, cleanup_workspace, reason)
+  end
+
+  @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
@@ -677,7 +688,15 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # `:stalled` is the one reason a retry follows, so it is the one reason the live
+  # mark stays on. Every other reason ends Symphony's interest in the issue — a
+  # person moved it, took the label off, or stopped it from the dashboard — and a
+  # new reason added here inherits the removal rather than having to ask for it.
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, reason) do
+    if reason != :stalled do
+      clear_working_label(issue_id, running_identifier(state, issue_id))
+    end
+
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
@@ -724,6 +743,13 @@ defmodule SymphonyElixir.Orchestrator do
 
       _ ->
         release_issue_claim(state, issue_id)
+    end
+  end
+
+  defp running_identifier(%State{running: running}, issue_id) do
+    case Map.get(running, issue_id) do
+      %{identifier: identifier} when is_binary(identifier) -> identifier
+      _ -> issue_id
     end
   end
 
@@ -1103,17 +1129,12 @@ defmodule SymphonyElixir.Orchestrator do
     # the issue, or block it for a human.
     case plan_action(issue, metadata) do
       {:dispatch, metadata} ->
-        # Draft while the code is still being written/verified. The post-approval
-        # phases (Fix CI, Resolve Review) only run after a tester APPROVE, so
-        # promote the PR to ready there — that's what invites CodeRabbit, whose
-        # review the Resolve Review phase then triages.
-        enforce_pr_draft(issue, not post_approval_dispatch?(metadata), metadata[:existing_pr_url])
         spawn_worker(state, issue, attempt, metadata)
 
       :done ->
         Logger.info("Plan complete and tester-approved for #{issue_context(issue)}; completing issue")
-        # Plan graded complete: now promote the draft to ready-for-review.
-        enforce_pr_draft(issue, false, metadata[:existing_pr_url])
+        finish_run(issue, metadata[:existing_pr_url])
+        clear_working_label(issue.id, issue.identifier)
         complete_issue(state, issue.id)
 
       {:blocked, reason} ->
@@ -1121,47 +1142,216 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  # Fix CI, Resolve Review, and Resolve Conflicts are only ever dispatched after
-  # a tester APPROVE, so their presence in retask_phases is the "tested and
-  # approved" signal.
-  defp post_approval_dispatch?(metadata) do
-    Enum.any?(
-      Map.get(metadata, :retask_phases) || [],
-      &(&1 in ["Fix CI", "Resolve Review", "Resolve Conflicts"])
-    )
-  end
-
-  # Keep a worker's PR draft until the tester approves, then promote it.
-  # Best-effort + off the orchestrator loop: never let a gh hiccup stall dispatch.
-  defp enforce_pr_draft(issue, want_draft?, pr_url) do
+  # THE ONE ENDING A RUN HAS: a PR exists, and under a grant that hands off, the
+  # hand-off comment is posted on it. A run that ends without a PR is broken, not
+  # handed off — the machine owner's rule of 2026-09-22 (GEA-9888).
+  #
+  # Best-effort + off the orchestrator loop: never let a gh or a Linear hiccup
+  # stall dispatch.
+  defp finish_run(issue, pr_url) do
     identifier = Map.get(issue, :identifier)
 
     if is_binary(identifier) do
       Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
         try do
-          case Workspace.slot_lease_for_issue(identifier) do
-            {slot_dir, branch} when is_binary(branch) and branch != "" ->
-              Evaluator.set_pr_draft(slot_dir, branch, want_draft?)
-
-            _ when is_binary(pr_url) ->
-              # No live lease (slots are released between dispatches) — flip the
-              # PR by URL; gh resolves the repo from it, no local checkout needed.
-              args = ["pr", "ready", pr_url] ++ if want_draft?, do: ["--undo"], else: []
-              System.cmd("gh", args, stderr_to_stdout: true)
-              Logger.info("enforce_pr_draft: set #{pr_url} draft=#{want_draft?} via URL")
-
-            _ ->
-              :ok
-          end
+          url = pr_url || ensure_pr_for_issue(issue)
+          hand_off(issue, url)
         rescue
           error ->
-            Logger.warning("enforce_pr_draft failed for #{identifier}: #{Exception.message(error)}")
+            Logger.warning("finish_run failed for #{identifier}: #{Exception.message(error)}")
         end
       end)
     end
 
     :ok
   end
+
+  # THE PR THIS RUN MUST LEAVE BEHIND. Returns its URL, opening one when the
+  # branch is pushed and has none.
+  #
+  # The cheap answers first: the PR the evaluator recorded, then the one the
+  # Linear-GitHub integration attached. Only when neither answers does this reach
+  # for the issue's slot — `before_remove` keeps it leased between dispatches, so
+  # `gh` resolves the repo from that checkout and needs no `--repo` guess.
+  #
+  # Never fatal. This runs on the orchestrator loop from the park guard, and a
+  # `gh` that is slow or unauthenticated must not take the poller down with it.
+  defp ensure_pr_for_issue(issue) do
+    identifier = Map.get(issue, :identifier)
+
+    case stored_pr(issue) || attachment_pr(issue) do
+      {:pr_exists, url, _branch} ->
+        url
+
+      _ ->
+        case Workspace.slot_lease_for_issue(identifier) do
+          {slot_dir, lease_branch} ->
+            Evaluator.ensure_pr_open(
+              slot_dir,
+              first_present([lease_branch, Map.get(issue, :branch_name)]),
+              "#{identifier}: #{Map.get(issue, :title)}",
+              pr_body(issue)
+            )
+
+          _ ->
+            Logger.warning("No slot leased to #{identifier} and no PR on it; none could be opened")
+            nil
+        end
+    end
+  rescue
+    error ->
+      Logger.warning("ensure_pr_for_issue failed for #{issue_context(issue)}: #{Exception.message(error)}")
+      nil
+  end
+
+  defp pr_body(issue) do
+    identifier = Map.get(issue, :identifier)
+    url = Map.get(issue, :url)
+
+    ["Linear: #{identifier}", url]
+    |> Enum.reject(&(is_nil(&1) or &1 == ""))
+    |> Enum.join("\n\n")
+  end
+
+  defp first_present(values) do
+    Enum.find(values, fn value -> is_binary(value) and value != "" end)
+  end
+
+  # HAND THE PR TO WHOEVER MERGES IT. Under `Auto-Merge` and `Auto-User` that is
+  # the harness, which judges from one tooling-written comment (GEA-9955) and
+  # never from a bare branch. Under `Auto-Build` and `Auto-Design` a person
+  # merges, so there is nothing to hand to a machine and this is a no-op.
+  defp hand_off(issue, pr_url) do
+    grant = Grant.of(Map.get(issue, :labels))
+    identifier = Map.get(issue, :identifier)
+
+    cond do
+      not Grant.hands_off?(grant) ->
+        Logger.info("#{identifier} holds #{Grant.label(grant)}; a person merges, so no hand-off is posted")
+        :ok
+
+      is_nil(Config.hand_off_command()) ->
+        Logger.info("No hand_off.command configured; #{identifier} ends at its PR")
+        :ok
+
+      not is_binary(pr_url) ->
+        Logger.warning("#{identifier} finished with no PR to hand off — the run is incomplete")
+        :error
+
+      true ->
+        run_hand_off_command(issue, pr_url)
+    end
+  end
+
+  defp run_hand_off_command(issue, pr_url) do
+    identifier = Map.get(issue, :identifier)
+    proof_path = Path.join(System.tmp_dir!(), "symphony-handoff-#{identifier}.md")
+    File.write!(proof_path, hand_off_proof(issue, pr_url))
+
+    env = [
+      {"SYMPHONY_ISSUE_IDENTIFIER", identifier},
+      {"SYMPHONY_ISSUE_ID", to_string(Map.get(issue, :id))},
+      {"SYMPHONY_PR_URL", pr_url},
+      {"SYMPHONY_PROOF_FILE", proof_path}
+    ]
+
+    task =
+      Task.async(fn ->
+        System.cmd("sh", ["-lc", Config.hand_off_command()], env: env, stderr_to_stdout: true)
+      end)
+
+    case Task.yield(task, Config.hand_off_timeout_ms()) || Task.shutdown(task) do
+      {:ok, {output, 0}} ->
+        Logger.info("Handed #{identifier} off at #{pr_url}: #{String.trim(output)}")
+        File.rm(proof_path)
+        :ok
+
+      {:ok, {output, code}} ->
+        Logger.error("Hand-off for #{identifier} exited #{code}; the proof stays at #{proof_path}: #{String.trim(output)}")
+        :error
+
+      _ ->
+        Logger.error("Hand-off for #{identifier} timed out after #{Config.hand_off_timeout_ms()}ms")
+        :error
+    end
+  end
+
+  # The proof the hand-off carries: what the plan closed, how the tester confirmed
+  # it, and where to look. Assembled from Symphony's own record rather than asked
+  # of the agent — a proof a model must remember to write goes missing (GEA-9955).
+  defp hand_off_proof(issue, pr_url) do
+    identifier = Map.get(issue, :identifier)
+
+    plan_section =
+      case Planning.get_plan_by_issue(identifier) do
+        %Planning.Plan{} = plan -> Planning.render_plan_comment(plan)
+        _ -> "## Plan\n\n_(Symphony kept no plan for this issue.)_"
+      end
+
+    tester_section =
+      case History.latest_tester_verdict(identifier) do
+        %{verdict: verdict} = record ->
+          reason = Map.get(record, :reason)
+          base = "## Tester\n\nVerdict: **#{verdict}**"
+          if is_binary(reason) and reason != "", do: base <> "\n\n#{reason}", else: base
+
+        _ ->
+          "## Tester\n\n_(no tester verdict recorded)_"
+      end
+
+    """
+    **#{identifier} is built and its PR is ready to judge.** Symphony closed the plan below and the tester approved it.
+
+    #{plan_section}
+
+    #{tester_section}
+
+    ## How to confirm
+
+    - The PR and its checks: #{pr_url}
+    - Symphony's plan mirror and tester report are the comments above this one.
+    """
+  end
+
+  # THE LIVE-RUN MARK. `symphony-working` goes on when Symphony claims an issue and
+  # comes off at every ending, mirroring the agent pool's `auto-working`. The pool's
+  # reaper and liveness sweep match `auto-working` and nothing else, so this label
+  # tells a person which issues are live here without making the pool touch them
+  # (GEA-9888). Configured per machine: `tracker.working_label`, nil to leave the
+  # board unmarked.
+  defp mark_working_label(issue_id, identifier), do: update_working_label(:add, issue_id, identifier)
+
+  defp clear_working_label(issue_id, identifier), do: update_working_label(:remove, issue_id, identifier)
+
+  defp update_working_label(op, issue_id, identifier) when is_binary(issue_id) do
+    case Config.tracker_working_label() do
+      label when is_binary(label) and label != "" ->
+        # Off the orchestrator loop and never fatal: an unmarked board is a smaller
+        # failure than a dispatch that Linear held up.
+        Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+          result =
+            case op do
+              :add -> Tracker.add_label(issue_id, label)
+              :remove -> Tracker.remove_label(issue_id, label)
+            end
+
+          case result do
+            :ok ->
+              Logger.info("#{op} #{label} on #{identifier}")
+
+            {:error, reason} ->
+              Logger.warning("Could not #{op} #{label} on #{identifier}: #{inspect(reason)}")
+          end
+        end)
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp update_working_label(_op, _issue_id, _identifier), do: :ok
 
   defp spawn_worker(%State{} = state, issue, attempt, metadata) do
     recipient = self()
@@ -1201,6 +1391,10 @@ defmodule SymphonyElixir.Orchestrator do
           {:error, reason} ->
             Logger.warning("Failed to claim issue in Linear: #{issue_context(issue)} reason=#{inspect(reason)}")
         end
+
+        # The live mark goes on with the claim, and comes off at every ending.
+        # Idempotent, so a re-dispatch of a running issue re-asserts it for free.
+        mark_working_label(issue.id, issue.identifier)
 
         # Remove any stale completed_history entry if this issue is being re-dispatched
         completed_history =
@@ -1999,10 +2193,14 @@ defmodule SymphonyElixir.Orchestrator do
         end
       end
 
-      # A parked issue gets no more dispatches, so nothing would ever undraft
-      # its PR. If the work is there with green CI, hand it to human review
-      # rather than stranding it (GEA-5247 sat draft with 7/7 checks green).
-      undraft_parked_pr(issue)
+      # A PARKED ISSUE STILL OWES A PR. It gets no more dispatches, so whatever
+      # the worker pushed is all there will ever be — and a person (or the
+      # harness) judges from a PR, never from a bare branch. GEA-9699 was parked
+      # with commit `9ee9986b` pushed and no PR, which is the case this closes
+      # (GEA-9888, the machine owner's rule of 2026-09-22). Opening it costs
+      # nothing when the branch has one already.
+      ensure_pr_for_issue(issue)
+      clear_working_label(issue.id, issue.identifier)
 
       # Sticky: `completed` issues are re-assessed every poll, which for a
       # blocked issue meant re-blocking — and re-posting the needs-human
@@ -2010,26 +2208,6 @@ defmodule SymphonyElixir.Orchestrator do
       state = %{state | blocked: MapSet.put(state.blocked, issue.id)}
       complete_issue(state, issue.id)
     end
-  end
-
-  defp undraft_parked_pr(issue) do
-    case stored_pr(issue) || attachment_pr(issue) do
-      {:pr_exists, url, _branch} ->
-        if ci_gate(url) == :ok do
-          case System.cmd("gh", ["pr", "ready", url], stderr_to_stdout: true) do
-            {_out, 0} ->
-              Logger.info("Undrafted parked PR #{url} (CI green) so human review can proceed")
-
-            {out, _} ->
-              Logger.warning("Failed to undraft parked PR #{url}: #{String.trim(out)}")
-          end
-        end
-
-      _ ->
-        :ok
-    end
-  rescue
-    error -> Logger.warning("undraft_parked_pr failed for #{issue_context(issue)}: #{Exception.message(error)}")
   end
 
   # Transient plan-generation failures are session-startup blips (the planner's
@@ -2381,6 +2559,7 @@ defmodule SymphonyElixir.Orchestrator do
       max_retries: Config.max_failure_retries()
     })
 
+    clear_working_label(issue_id, identifier)
     state = complete_issue(state, issue_id)
     record_max_retries_event(state, issue_id, identifier, next_attempt)
     state

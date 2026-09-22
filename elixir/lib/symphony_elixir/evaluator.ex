@@ -10,6 +10,11 @@ defmodule SymphonyElixir.Evaluator do
 
   alias SymphonyElixir.History
 
+  # The branch a Symphony PR targets. The rest of this module already reads
+  # `origin/main` for its diff and commit checks; a repo whose trunk is not `main`
+  # would need all of them changed together, not this one alone.
+  @pr_base_branch "main"
+
   @default_weights %{
     pr_created: 25,
     ci_passed: 20,
@@ -139,28 +144,84 @@ defmodule SymphonyElixir.Evaluator do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Force the PR for `branch` in `workspace_path` to draft (`want_draft? = true`) or
-  ready-for-review (`false`). Idempotent and best-effort: a no-op when there is no
-  PR or no workspace. This is how the orchestrator keeps a worker's PR a draft
-  until the plan is graded complete — workers must never promote their own PR.
+  The PR for `branch`, opening a ready one when the branch is pushed and has none.
+  Returns the PR's URL, or nil when there is nothing to open a PR for.
+
+  WHY THE ORCHESTRATOR OPENS IT AND NOT ONLY THE WORKER. A run that ends with a
+  pushed branch and no PR is broken, not handed off — the machine owner's rule of
+  2026-09-22 (GEA-9888). GEA-9699 ended exactly that way: commit `9ee9986b` pushed
+  and nothing for a person or the harness to judge. The execution stage tells the
+  worker to open the PR in the same step as the push; this is what keeps the
+  promise when a stall, a retry cap or a park ends the run before it gets there.
+
+  READY, NEVER A DRAFT. Symphony used to hold every PR draft until the plan graded
+  complete, on the reasoning that a ready PR trips the PR-opened -> In Review
+  automation and pulls CodeRabbit onto half-finished work. That is the behaviour
+  the agent pool already lives with, and the hand-off — not the draft flag — is
+  where completeness is decided (GEA-9888, decided 2026-09-22).
+
+  Idempotent and best-effort: a no-op with no workspace, no branch, an unpushed
+  branch, or a PR that already exists.
   """
-  @spec set_pr_draft(String.t() | nil, String.t() | nil, boolean()) :: :ok
-  def set_pr_draft(workspace_path, branch, want_draft?) do
+  @spec ensure_pr_open(String.t() | nil, String.t() | nil, String.t(), String.t()) ::
+          String.t() | nil
+  def ensure_pr_open(workspace_path, branch, title, body)
+      when is_binary(title) and is_binary(body) do
     ws = resolve_workspace_path(workspace_path)
 
-    # Use the issue's branch as given — `gh pr list --head <branch>` matches the
-    # PR's head regardless of what the local checkout is on, so this works even
-    # when the slot tree is parked on main between dispatches.
+    # The issue's branch as given — `gh pr list --head <branch>` matches the PR's
+    # head whatever the local checkout is on, so this works even when the slot tree
+    # is parked on main between dispatches.
     case check_pr(ws, branch) do
-      %{exists: true, number: num} when is_integer(num) ->
-        flag = if want_draft?, do: " --undo", else: ""
-        run_in_workspace(ws, "gh pr ready #{num}#{flag} 2>/dev/null")
-        Logger.info("Evaluator: set PR ##{num} draft=#{want_draft?}")
-        :ok
+      %{exists: true, url: url} when is_binary(url) ->
+        url
 
       _ ->
-        :ok
+        open_pr(ws, branch, title, body)
     end
+  end
+
+  def ensure_pr_open(_workspace_path, _branch, _title, _body), do: nil
+
+  # A PR needs a pushed branch to point at. An unpushed branch is a run that closed
+  # no rows, not a run missing its PR, and `gh pr create` on one would push work
+  # nobody graded.
+  defp open_pr(ws, branch, title, body) when is_binary(branch) and branch != "" do
+    if branch_on_origin?(ws, branch) do
+      command =
+        "gh pr create --base #{@pr_base_branch} --head #{safe_arg(branch)} " <>
+          "--title #{shell_quote(title)} --body #{shell_quote(body)}"
+
+      case run_in_workspace(ws, command) do
+        {:ok, output} ->
+          url = output |> String.split("\n", trim: true) |> Enum.find(&String.starts_with?(&1, "http"))
+          Logger.info("Evaluator: opened PR for #{branch}: #{inspect(url)}")
+          url
+
+        {:error, reason} ->
+          Logger.warning("Evaluator: could not open a PR for #{branch}: #{inspect(reason)}")
+          nil
+      end
+    else
+      Logger.info("Evaluator: no PR opened for #{branch} — the branch is not pushed")
+      nil
+    end
+  end
+
+  defp open_pr(_ws, _branch, _title, _body), do: nil
+
+  # Is the branch on origin? ASKED OF THE REMOTE, not of `origin/<branch>..HEAD`:
+  # between dispatches the slot tree is parked on main, so a local comparison
+  # reports a pushed branch as unpushed and the PR never opens — the exact failure
+  # this function exists to prevent.
+  defp branch_on_origin?(ws, branch) do
+    match?({:ok, _}, run_in_workspace(ws, "git ls-remote --exit-code --heads origin #{safe_arg(branch)}"))
+  end
+
+  # Single quotes, with the shell's own escape for an embedded one. The title comes
+  # from Linear, which accepts every metacharacter a shell reads.
+  defp shell_quote(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\\''") <> "'"
   end
 
   defp check_pr(workspace_path, branch) do

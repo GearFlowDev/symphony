@@ -7,6 +7,11 @@
 .devenv.flake.nix
 devenv.local.nix
 .direnv/
+# `.envrc` is per-machine, not per-repo: a Gearflow slot is handed one by the provisioner
+# and has two exports appended to it. Tracked, every slot of this repo reads dirty for ever
+# — which is how a finished slot stops being reusable, and how one `git add -A` commits a
+# machine's own paths.
+.envrc
 
 # The per-machine environment a slot or a laptop renders. The key-set it fills is
 # `local-dev/configs/symphony/env.template` in the gf_engineering workspace.

@@ -13,8 +13,17 @@ defmodule SymphonyElixir.GrantTest do
     # tracker filter admits nothing without it, so an issue with no Auto label
     # beside it is an Auto-Merge issue and not an ungranted one.
     assert Grant.of(["auto-symphony"]) == :merge
-    assert Grant.of([]) == :merge
-    assert Grant.of(nil) == :merge
+    assert Grant.of(["Bugfix", "3.0", "auto-symphony"]) == :merge
+  end
+
+  test "no labels at all is a failed read, and reads as the narrower grant" do
+    # An issue with NO labels cannot have passed the tracker filter, so an empty
+    # list says the labels did not load rather than anything about the issue. The
+    # two mistakes are different sizes: stopping at the PR costs somebody a merge
+    # click, and handing off wrongly merges work nobody reviewed.
+    assert Grant.of([]) == :build
+    assert Grant.of(nil) == :build
+    assert Grant.of("auto-merge") == :build
   end
 
   test "an explicit Auto label narrows the run" do

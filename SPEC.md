@@ -1311,6 +1311,12 @@ implementation-defined.
 If present, it should draw from orchestrator state/metrics only and must not be required for
 correctness.
 
+A surface that redraws itself — a full-screen terminal UI — must write only to a device that
+can be redrawn, and must decide that from the device rather than from configuration alone. On
+any other stdout it must write nothing, escape sequences included, and the implementation
+should log one line per state change in its place. A redrawing surface pointed at a log stream
+destroys the log: the frames are the only thing left in a bounded window.
+
 ### 13.5 Session Metrics and Token Accounting
 
 Token accounting rules:

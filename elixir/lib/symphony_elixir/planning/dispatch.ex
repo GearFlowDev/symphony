@@ -56,5 +56,6 @@ defmodule SymphonyElixir.Planning.Dispatch do
     |> cast(attrs, [:grade_json, :finished_at])
   end
 
+  @spec roles() :: [String.t()]
   def roles, do: @roles
 end

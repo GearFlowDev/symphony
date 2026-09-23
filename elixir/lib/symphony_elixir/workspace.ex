@@ -512,24 +512,16 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp maybe_run_after_create_hook(workspace, issue_context, created?) do
-    # Run after_create hook if either:
-    # 1. The workspace was just created, or
-    # 2. The workspace exists but has no .symphony_slot (slot not claimed yet)
-    needs_hook = created? or not File.exists?(Path.join(workspace, ".symphony_slot"))
+  # `after_create` runs once, when this call created the directory (SPEC.md § after_create).
+  # It used to re-run on any reuse without a `.symphony_slot`, because the slot claim lived in
+  # this hook (d4c68db). The claim now lives in `before_run`, which runs every attempt and
+  # re-claims idempotently, so re-running `after_create` only overwrote a reused workspace.
+  defp maybe_run_after_create_hook(_workspace, _issue_context, false), do: :ok
 
-    case needs_hook do
-      true ->
-        case Config.workspace_hooks()[:after_create] do
-          nil ->
-            :ok
-
-          command ->
-            run_hook(command, workspace, issue_context, "after_create")
-        end
-
-      false ->
-        :ok
+  defp maybe_run_after_create_hook(workspace, issue_context, true) do
+    case Config.workspace_hooks()[:after_create] do
+      nil -> :ok
+      command -> run_hook(command, workspace, issue_context, "after_create")
     end
   end
 
@@ -892,6 +884,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   @doc false
+  @spec scripts_path(String.t()) :: String.t()
   def scripts_path(script_name) do
     Application.app_dir(:symphony_elixir, Path.join("priv/scripts", script_name))
   end

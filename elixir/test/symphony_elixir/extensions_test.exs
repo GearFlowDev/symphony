@@ -342,14 +342,21 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
+             "stale" => false,
+             "stale_age_ms" => nil,
+             "counts" => %{"running" => 1, "max_concurrent" => Config.max_concurrent_agents(), "retrying" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
                  "state" => "In Progress",
                  "phase" => nil,
+                 "phases_seen" => [],
                  "pr_url" => nil,
+                 "screenshot_urls" => [],
+                 "history_run_id" => nil,
+                 "frontend_url" => nil,
+                 "backend_url" => nil,
                  "session_id" => "thread-http",
                  "turn_count" => 7,
                  "last_event" => "notification",
@@ -550,7 +557,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Runtime"
     assert html =~ "Live"
     assert html =~ "Offline"
-    assert html =~ "Copy ID"
+    # The session "Copy ID" button became the issue identifier itself (e31a63c), clickable
+    # into the run timeline once the row has a history run.
+    assert html =~ ~s(<span class="issue-id">MT-HTTP</span>)
     assert html =~ "Activity"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
@@ -645,7 +654,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "max_concurrent" => Config.max_concurrent_agents(), "retrying" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200

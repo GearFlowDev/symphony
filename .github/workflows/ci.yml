@@ -13,22 +13,14 @@
 # a worker's PR has to pass, and they are the three below. `make all` stays where it is; this
 # is the fast gate in front of it, and the one that names WHICH of the three broke.
 #
-# ---- `main` IS RED TODAY, AND THIS FILE DOES NOT MAKE IT SO --------------------------------
+# ---- A RED `ci` IS YOURS, NOT `main`'S ----------------------------------------------------
 #
-# Read this before reading a red tick on your own PR as your fault.
+# `main` passes all three since GEA-10241. Until then it failed 6 of 340 tests, and nothing
+# said so, because Actions had never run on this fork. So a red `ci` on your PR is your diff,
+# or a flake to name in an issue; compare against `main`'s latest run before you decide which.
 #
-# `mix test` fails 6 of 340 on `main` — measured on this runner, not inferred. Six pieces of
-# code the tests no longer describe: the observability payload grew `max_concurrent`, the
-# dashboard dropped its `Copy ID` control, the workspace re-creates a directory the test says
-# it reuses, a lifecycle hook runs twice, and the in-repo WORKFLOW.md no longer renders what
-# core_test expects. GEA-10258 holds the list and the evidence. `make all` is red on `main`
-# too, at `mix format --check-formatted`, which the commit that adds this file fixes.
-#
-# So a PR here is red on `ci` until GEA-10258 closes, and the red belongs to `main`. Compare
-# your run against `main`'s before you go looking in your own diff.
-#
-# DO NOT MAKE THE TEST STEP NON-BLOCKING to get past that. A gate that cannot fail is not a
-# gate, and this fork's whole problem is that nothing was watching. Fix GEA-10258 instead.
+# DO NOT MAKE THE TEST STEP NON-BLOCKING to get past a red. A gate that cannot fail is not a
+# gate, and this fork's whole problem was that nothing was watching.
 #
 # ---- The shape ---------------------------------------------------------------------------
 #

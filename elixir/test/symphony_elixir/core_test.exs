@@ -215,28 +215,30 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, :workflow_front_matter_not_a_map} = Workflow.load(workflow_path)
   end
 
-  test "SymphonyElixir.start_link delegates to the orchestrator" do
+  test "SymphonyElixir.start_link starts the orchestrator with the task supervisor that owns its agents" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
-    orchestrator_pid = Process.whereis(SymphonyElixir.Orchestrator)
+    runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)
 
     on_exit(fn ->
-      if is_nil(Process.whereis(SymphonyElixir.Orchestrator)) do
-        case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator) do
+      if is_nil(Process.whereis(SymphonyElixir.AgentRuntimeSupervisor)) do
+        case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.AgentRuntimeSupervisor) do
           {:ok, _pid} -> :ok
           {:error, {:already_started, _pid}} -> :ok
         end
       end
     end)
 
-    if is_pid(orchestrator_pid) do
-      assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.Orchestrator)
+    if is_pid(runtime_pid) do
+      assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.AgentRuntimeSupervisor)
     end
 
     assert {:ok, pid} = SymphonyElixir.start_link()
-    assert Process.whereis(SymphonyElixir.Orchestrator) == pid
+    assert Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) == pid
+    assert is_pid(Process.whereis(SymphonyElixir.Orchestrator))
+    assert is_pid(Process.whereis(SymphonyElixir.TaskSupervisor))
 
-    GenServer.stop(pid)
+    Supervisor.stop(pid)
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do
@@ -1636,6 +1638,352 @@ defmodule SymphonyElixir.CoreTest do
              end)
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  # --- Ported upstream behaviours (GEA-9886) -------------------------------
+
+  test "a retry whose dispatch-time refresh errors keeps its claim and reschedules" do
+    # No token, tracker kind linear: the refresh fails at the header, with no
+    # network involved — the same shape as the RATELIMITED read that dropped
+    # GEA-7671 for good on 2026-09-15. `linear_api_token/0` falls back to
+    # LINEAR_API_KEY, so clear it: on a machine that exports one, the refresh
+    # would reach the network instead and this would test something else.
+    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+    System.delete_env("LINEAR_API_KEY")
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", tracker_api_token: nil)
+
+    issue_id = "retry-refresh-error"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-900",
+      title: "Refresh errors on retry",
+      state: "In Progress",
+      labels: ["symphony-agent"]
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{},
+      max_concurrent_agents: 5
+    }
+
+    updated = Orchestrator.handle_active_retry_for_test(issue, state, 1, %{identifier: "MT-900"})
+
+    assert MapSet.member?(updated.claimed, issue_id), "a refresh error must not drop the claim"
+    assert %{attempt: 2, error: "retry dispatch refresh failed:" <> _} = updated.retry_attempts[issue_id]
+  end
+
+  test "a retry whose issue is no longer visible releases its claim" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    issue_id = "retry-refresh-missing"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-901",
+      title: "Gone by the time the retry fires",
+      state: "In Progress",
+      labels: ["symphony-agent"]
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{},
+      max_concurrent_agents: 5
+    }
+
+    updated = Orchestrator.handle_active_retry_for_test(issue, state, 1, %{identifier: "MT-901"})
+
+    refute MapSet.member?(updated.claimed, issue_id)
+    refute Map.has_key?(updated.retry_attempts, issue_id)
+  end
+
+  test "terminal cleanup stops the worker before before_remove runs, and removes the recorded workspace" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-terminal-cleanup-#{System.unique_integer([:positive])}")
+
+    issue_id = "issue-terminal-cleanup"
+    issue_identifier = "MT-902"
+    recorded_root = Path.join(test_root, "recorded")
+    moved_root = Path.join(test_root, "moved")
+    workspace = Path.join(recorded_root, issue_identifier)
+    order_log = Path.join(test_root, "order.log")
+
+    try do
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(moved_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: recorded_root,
+        hook_before_remove: "echo before_remove >> \"#{order_log}\""
+      )
+
+      {:ok, task_supervisor} = Task.Supervisor.start_link()
+
+      {:ok, worker_pid} =
+        Task.Supervisor.start_child(task_supervisor, fn ->
+          Process.flag(:trap_exit, true)
+
+          receive do
+            {:EXIT, _from, _reason} -> File.write!(order_log, "worker stopped\n", [:append])
+          end
+        end)
+
+      state = %Orchestrator.State{
+        task_supervisor: task_supervisor,
+        running: %{
+          issue_id => %{
+            pid: worker_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            workspace_path: workspace,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      # The config MOVES between dispatch and cleanup. Cleanup must still aim at
+      # the directory this run recorded, not at the one the new root implies.
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: moved_root,
+        hook_before_remove: "echo before_remove >> \"#{order_log}\""
+      )
+
+      terminal_issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        title: "Closed",
+        state: "Done",
+        labels: ["symphony-agent"]
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute File.exists?(workspace), "the RECORDED workspace must be the one removed"
+
+      assert File.read!(order_log) == "worker stopped\nbefore_remove\n",
+             "the worker must be stopped before before_remove releases its slot"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "removing the routing label stops a running agent and releases its slot" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-elixir-label-removed-#{System.unique_integer([:positive])}")
+
+    issue_id = "issue-label-removed"
+    issue_identifier = "MT-903"
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_filter: %{"labels" => %{"include" => ["symphony-agent"]}}
+      )
+
+      assert Config.required_issue_labels() == ["symphony-agent"],
+             "the routing label must be readable, or this test proves nothing"
+
+      worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: worker_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            workspace_path: workspace,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      # Still active, still assigned — only the routing label is gone.
+      relabelled = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        title: "Label pulled mid-run",
+        state: "In Progress",
+        labels: ["some-other-label"]
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([relabelled], state)
+
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute MapSet.member?(updated_state.claimed, issue_id)
+      refute Process.alive?(worker_pid)
+      refute File.exists?(workspace), "the slot must be released, which is what removing the workspace does"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "an issue whose refresh carries no labels at all keeps running" do
+    # Empty labels is a thin projection, not proof the label was removed.
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_filter: %{"labels" => %{"include" => ["symphony-agent"]}}
+    )
+
+    issue_id = "issue-labels-absent"
+    worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: worker_pid,
+          ref: nil,
+          identifier: "MT-904",
+          issue: %Issue{id: issue_id, state: "In Progress", identifier: "MT-904"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    unlabelled = %Issue{
+      id: issue_id,
+      identifier: "MT-904",
+      title: "Refresh without labels",
+      state: "In Progress",
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([unlabelled], state)
+
+    assert Map.has_key?(updated_state.running, issue_id)
+    assert Process.alive?(worker_pid)
+    Process.exit(worker_pid, :kill)
+  end
+
+  test "the orchestrator refuses to start on an invalid WORKFLOW.md" do
+    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+    System.delete_env("LINEAR_API_KEY")
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear", tracker_api_token: nil)
+
+    Process.flag(:trap_exit, true)
+    name = Module.concat(__MODULE__, :InvalidConfigOrchestrator)
+
+    assert {:error, :missing_linear_api_token} = Orchestrator.start_link(name: name)
+    refute is_pid(Process.whereis(name))
+  end
+
+  test "killing the orchestrator takes the agents it owned down with it" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    runtime_name = Module.concat(__MODULE__, :RuntimeSupervisor)
+    orchestrator_name = Module.concat(__MODULE__, :RuntimeOrchestrator)
+    task_supervisor_name = Module.concat(__MODULE__, :RuntimeTaskSupervisor)
+
+    {:ok, runtime} =
+      SymphonyElixir.AgentRuntimeSupervisor.start_link(
+        name: runtime_name,
+        orchestrator_name: orchestrator_name,
+        task_supervisor_name: task_supervisor_name
+      )
+
+    # No on_exit stop: start_link links the runtime to this test process, so it
+    # goes down with the test.
+    _runtime = runtime
+
+    {:ok, agent_pid} =
+      Task.Supervisor.start_child(task_supervisor_name, fn -> Process.sleep(:infinity) end)
+
+    agent_ref = Process.monitor(agent_pid)
+    orchestrator_pid = Process.whereis(orchestrator_name)
+    Process.exit(orchestrator_pid, :kill)
+
+    assert_receive {:DOWN, ^agent_ref, :process, ^agent_pid, _reason}, 2_000
+
+    # :one_for_all — both halves come back together, so the restarted
+    # orchestrator never believes a dead agent is still running.
+    wait_until(fn ->
+      is_pid(Process.whereis(orchestrator_name)) and Process.whereis(orchestrator_name) != orchestrator_pid
+    end)
+
+    assert is_pid(Process.whereis(task_supervisor_name))
+  end
+
+  test "a row-closer's continuation guidance keys on its rows, not on a push" do
+    rows = [
+      %{"id" => "R1", "state" => "done", "description" => "Add the filter"},
+      %{"id" => "R2", "state" => "partial", "description" => "Wire it into the view"},
+      %{"id" => "R3", "state" => "missing", "description" => "Cover it with a test"}
+    ]
+
+    prompt =
+      PromptBuilder.build_phase_continuation_prompt(
+        %Issue{id: "i", identifier: "MT-905", title: "t", state: "In Progress"},
+        "Implement",
+        3,
+        20,
+        [],
+        assigned_rows: rows
+      )
+
+    # The rows and their states must be in front of the agent...
+    assert prompt =~ "**R2** (partial)"
+    assert prompt =~ "**R3** (missing)"
+
+    # ...and a push must not read as permission to end the turn. This is the
+    # sentence two re-dispatched row-closers took literally while R2 and R3 sat
+    # open (first Fly run, GEA-9889).
+    refute prompt =~ "your fix is pushed"
+    assert prompt =~ "EVERY row above is `done`"
+    assert prompt =~ "do NOT complete a row"
+  end
+
+  test "a phase with no assigned rows still ends on its own report" do
+    prompt =
+      PromptBuilder.build_phase_continuation_prompt(
+        %Issue{id: "i", identifier: "MT-906", title: "t", state: "In Progress"},
+        "Test",
+        2,
+        20,
+        []
+      )
+
+    assert prompt =~ "already complete"
+    assert prompt =~ "verdict is"
+    refute prompt =~ "EVERY row above"
+  end
+
+  defp wait_until(fun, remaining_ms \\ 2_000) do
+    cond do
+      fun.() ->
+        :ok
+
+      remaining_ms <= 0 ->
+        flunk("condition never became true")
+
+      true ->
+        Process.sleep(25)
+        wait_until(fun, remaining_ms - 25)
     end
   end
 end

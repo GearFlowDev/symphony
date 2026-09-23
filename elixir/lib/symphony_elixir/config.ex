@@ -370,6 +370,21 @@ defmodule SymphonyElixir.Config do
     get_in(opts, [:tracker, :filter]) || %{}
   end
 
+  @doc """
+  The labels an issue must carry for this orchestrator to run it.
+
+  Read from `tracker.filter.labels.include` — the same list the candidate query
+  filters on — so the dispatch gate and the live gate cannot disagree.
+  """
+  @spec required_issue_labels() :: [String.t()]
+  def required_issue_labels do
+    linear_filter()
+    |> SymphonyElixir.Linear.FilterBuilder.include_labels()
+    |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
   @spec linear_assignee() :: String.t() | nil
   def linear_assignee do
     validated_workflow_options()
@@ -437,12 +452,55 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @doc """
+  The directory per-issue workspaces are created under.
+
+  A RELATIVE `workspace.root` anchors on the directory holding `WORKFLOW.md`,
+  not on the orchestrator's current working directory. `Path.expand/1` against
+  cwd made the root move whenever the process was started from somewhere else —
+  the orchestrator then created workspaces in one tree and looked for them in
+  another (upstream cbd2158).
+  """
   @spec workspace_root() :: Path.t()
   def workspace_root do
     validated_workflow_options()
     |> get_in([:workspace, :root])
-    |> resolve_path_value(@default_workspace_root)
+    |> resolve_workspace_root()
   end
+
+  defp resolve_workspace_root(value) when is_binary(value) do
+    case normalize_path_token(value) do
+      :missing -> @default_workspace_root
+      "" -> @default_workspace_root
+      token -> anchor_on_workflow_dir(String.trim(token))
+    end
+  end
+
+  defp resolve_workspace_root(_value), do: @default_workspace_root
+
+  # `~` and an absolute path mean what they say. Everything else is a RELATIVE
+  # path, relative to THE WORKFLOW FILE rather than to wherever the orchestrator
+  # happened to be launched from — including a bare `workspaces` with no
+  # separator in it, which is a directory name like any other. The one thing
+  # left alone is a scheme-prefixed token (`env:NAME`, a URI): that is not a
+  # path and never was ours to expand.
+  defp anchor_on_workflow_dir("~" <> _rest = path), do: Path.expand(path)
+
+  defp anchor_on_workflow_dir(path) when is_binary(path) do
+    cond do
+      Path.type(path) == :absolute ->
+        Path.expand(path)
+
+      scheme_prefixed?(path) ->
+        path
+
+      true ->
+        workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+        Path.expand(path, workflow_dir)
+    end
+  end
+
+  defp scheme_prefixed?(path), do: String.match?(path, ~r/^[a-zA-Z][a-zA-Z0-9+.-]*:/)
 
   @spec workspace_hooks() :: workspace_hooks()
   def workspace_hooks do
@@ -695,6 +753,24 @@ defmodule SymphonyElixir.Config do
     validated_workflow_options()
     |> get_in([:codex, :stall_timeout_ms])
     |> max(0)
+  end
+
+  @doc """
+  The stall timeout the watchdog should use for the ACTIVE agent backend.
+
+  The watchdog read `codex.stall_timeout_ms` whatever the backend was, so
+  `claude.stall_timeout_ms` never reached it and a claude run was policed by a
+  key describing a different runner. The only way to make the claude timeout
+  effective was to set the codex key, which is how `WORKFLOW.md` ended up
+  carrying a 30-minute `codex.stall_timeout_ms` for a claude-only orchestrator
+  (TODO.md "Stall watchdog counts before_run provisioning as agent inactivity").
+  """
+  @spec agent_stall_timeout_ms() :: non_neg_integer()
+  def agent_stall_timeout_ms do
+    case agent_backend() do
+      "claude" -> claude_stall_timeout_ms()
+      _ -> codex_stall_timeout_ms()
+    end
   end
 
   @spec workflow_prompt() :: String.t()
@@ -1307,44 +1383,6 @@ defmodule SymphonyElixir.Config do
 
   defp normalize_key(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_key(value), do: to_string(value)
-
-  defp resolve_path_value(:missing, default), do: default
-  defp resolve_path_value(nil, default), do: default
-
-  defp resolve_path_value(value, default) when is_binary(value) do
-    case normalize_path_token(value) do
-      :missing ->
-        default
-
-      path ->
-        path
-        |> String.trim()
-        |> preserve_command_name()
-        |> then(fn
-          "" -> default
-          resolved -> resolved
-        end)
-    end
-  end
-
-  defp resolve_path_value(_value, default), do: default
-
-  defp preserve_command_name(path) do
-    cond do
-      uri_path?(path) ->
-        path
-
-      String.contains?(path, "/") or String.contains?(path, "\\") ->
-        Path.expand(path)
-
-      true ->
-        path
-    end
-  end
-
-  defp uri_path?(path) do
-    String.match?(to_string(path), ~r/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//)
-  end
 
   defp resolve_env_value(:missing, fallback), do: fallback
   defp resolve_env_value(nil, fallback), do: fallback

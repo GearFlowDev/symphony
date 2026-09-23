@@ -294,7 +294,14 @@ defmodule SymphonyElixir.Claude.AgentRunner do
     # to "close the assigned rows" derails it into a needs-help escalation.
     case Keyword.get(opts, :retask_phases) do
       [single_phase] ->
-        PromptBuilder.build_phase_continuation_prompt(issue, single_phase, turn_number, max_turns, comments)
+        PromptBuilder.build_phase_continuation_prompt(
+          issue,
+          single_phase,
+          turn_number,
+          max_turns,
+          comments,
+          assigned_rows: Keyword.get(opts, :assigned_rows)
+        )
 
       _ ->
         PromptBuilder.build_continuation_prompt(issue, turn_number, max_turns, comments)

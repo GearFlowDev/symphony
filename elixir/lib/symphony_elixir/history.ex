@@ -43,8 +43,16 @@ defmodule SymphonyElixir.History do
 
   @doc """
   Count of runs dispatched for an issue since UTC midnight, excluding rows that
-  never became a worker (`no_capacity` claim failures and `orphaned` sweep
-  closures). The daily dispatch budget reads this.
+  never became a worker. The daily dispatch budget reads this.
+
+  Two exclusions. `no_capacity` claim failures and `orphaned` sweep closures
+  never reached an agent by construction. And neither did a run with no agent
+  session and no turns: that is a dispatch that died in `before_run` — a failed
+  provisioning hook, or an attempt the stall watchdog abandoned before a session
+  existed. Counting those spent the budget on infrastructure faults rather than
+  on issue churn, and blocked GEA-9699 at `12 dispatches since 00:00 UTC` with a
+  message offering re-activation as the only way out (2026-09-22). The
+  failure-retry cap, not this budget, is what bounds a hook that keeps failing.
   """
   @spec dispatches_today(String.t()) :: non_neg_integer()
   def dispatches_today(issue_identifier) when is_binary(issue_identifier) do
@@ -54,6 +62,7 @@ defmodule SymphonyElixir.History do
     |> where([r], r.issue_identifier == ^issue_identifier)
     |> where([r], r.started_at >= ^midnight)
     |> where([r], is_nil(r.outcome) or r.outcome not in ["no_capacity", "orphaned"])
+    |> where([r], not (is_nil(r.session_id) and coalesce(r.turns_used, 0) == 0 and not is_nil(r.finished_at)))
     |> select([r], count(r.id))
     |> Repo.one()
   end
@@ -340,6 +349,26 @@ defmodule SymphonyElixir.History do
       total_tokens: coalesce(sum(r.total_tokens), 0)
     })
     |> Repo.one() || %{input_tokens: 0, output_tokens: 0, total_tokens: 0}
+  end
+
+  @doc """
+  Cumulative code-change evidence across an issue's finished runs.
+
+  The no-progress breaker needs a progress signal that exists BEFORE a PR does.
+  These totals are recorded by the evaluator on every run, so a dispatch that
+  closed a row and pushed is distinguishable from one that changed nothing.
+  """
+  @spec issue_change_totals(String.t()) :: %{
+          files_changed: non_neg_integer(),
+          lines_changed: non_neg_integer()
+        }
+  def issue_change_totals(issue_identifier) when is_binary(issue_identifier) do
+    completed_runs_query(issue_identifier: issue_identifier)
+    |> select([r], %{
+      files_changed: coalesce(sum(r.eval_files_changed), 0),
+      lines_changed: coalesce(sum(r.eval_lines_changed), 0)
+    })
+    |> Repo.one() || %{files_changed: 0, lines_changed: 0}
   end
 
   @doc "Most recent PR URL the evaluator recorded for an issue, or nil."

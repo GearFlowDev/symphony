@@ -164,20 +164,20 @@ defmodule SymphonyElixir.Linear.Client do
 
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
-    cond do
-      is_nil(Config.linear_api_token()) ->
-        {:error, :missing_linear_api_token}
+    if is_nil(Config.linear_api_token()) do
+      {:error, :missing_linear_api_token}
+    else
+      fetch_candidate_issues_by_filter(Config.linear_filter())
+    end
+  end
 
-      true ->
-        filter_config = Config.linear_filter()
-
-        if FilterBuilder.valid?(filter_config) do
-          with {:ok, assignee_filter} <- routing_assignee_filter() do
-            do_fetch_by_filter(filter_config, Config.linear_active_states(), assignee_filter)
-          end
-        else
-          {:error, :missing_linear_filter}
-        end
+  defp fetch_candidate_issues_by_filter(filter_config) do
+    if FilterBuilder.valid?(filter_config) do
+      with {:ok, assignee_filter} <- routing_assignee_filter() do
+        do_fetch_by_filter(filter_config, Config.linear_active_states(), assignee_filter)
+      end
+    else
+      {:error, :missing_linear_filter}
     end
   end
 
@@ -185,12 +185,14 @@ defmodule SymphonyElixir.Linear.Client do
   def fetch_issues_by_states(state_names) when is_list(state_names) do
     normalized_states = Enum.map(state_names, &to_string/1) |> Enum.uniq()
 
-    if normalized_states == [] do
-      {:ok, []}
-    else
-      if is_nil(Config.linear_api_token()) do
+    cond do
+      normalized_states == [] ->
+        {:ok, []}
+
+      is_nil(Config.linear_api_token()) ->
         {:error, :missing_linear_api_token}
-      else
+
+      true ->
         filter_config = Config.linear_filter()
 
         if FilterBuilder.valid?(filter_config) do
@@ -198,7 +200,6 @@ defmodule SymphonyElixir.Linear.Client do
         else
           {:error, :missing_linear_filter}
         end
-      end
     end
   end
 
@@ -241,17 +242,7 @@ defmodule SymphonyElixir.Linear.Client do
             # Strip the @agent prefix from the body before passing to the agent
             %{c | body: c.body |> String.trim() |> String.trim_leading(@agent_prefix) |> String.trim()}
           end)
-          |> then(fn comments ->
-            case since do
-              %DateTime{} = dt ->
-                Enum.filter(comments, fn c ->
-                  c.created_at != nil and DateTime.compare(c.created_at, dt) == :gt
-                end)
-
-              _ ->
-                comments
-            end
-          end)
+          |> comments_created_after(since)
 
         {:ok, comments}
 
@@ -263,6 +254,14 @@ defmodule SymphonyElixir.Linear.Client do
         {:ok, []}
     end
   end
+
+  defp comments_created_after(comments, %DateTime{} = dt) do
+    Enum.filter(comments, fn c ->
+      c.created_at != nil and DateTime.compare(c.created_at, dt) == :gt
+    end)
+  end
+
+  defp comments_created_after(comments, _since), do: comments
 
   @doc """
   Fetch ALL comments on an issue (no @agent filter). Used by the evaluator

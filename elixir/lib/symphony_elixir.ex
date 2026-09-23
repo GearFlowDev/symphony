@@ -20,6 +20,8 @@ defmodule SymphonyElixir.Application do
 
   use Application
 
+  alias SymphonyElixir.Claude.TmuxCLI
+
   require Logger
 
   @impl true
@@ -59,7 +61,7 @@ defmodule SymphonyElixir.Application do
   # Clean up tmux sessions leaked by a previous run that crashed before its
   # AgentRunner could stop them. Never let this block or fail startup.
   defp reap_orphan_tmux_sessions do
-    case SymphonyElixir.Claude.TmuxCLI.reap_orphan_sessions() do
+    case TmuxCLI.reap_orphan_sessions() do
       [] -> :ok
       reaped -> Logger.info("Reaped #{length(reaped)} orphaned Claude tmux session(s): #{inspect(reaped)}")
     end

@@ -674,39 +674,13 @@ defmodule SymphonyElixir.StatusDashboard do
     outcome_color = if outcome == "completed", do: @ansi_green, else: @ansi_red
     outcome_icon = if outcome == "completed", do: "✓", else: "✗"
 
-    time_str =
-      if completed_at do
-        Calendar.strftime(completed_at, "%H:%M:%S")
-      else
-        "??:??:??"
-      end
+    time_str = completed_time_str(completed_at)
 
     phase = entry[:phase] || "—"
     turns = entry[:turn_count] || 0
 
-    pr_part =
-      if pr_url do
-        " " <> colorize(pr_url, @ansi_cyan)
-      else
-        ""
-      end
-
-    detail_part =
-      if outcome != "completed" do
-        error = entry[:error]
-        last_message = entry[:last_message]
-
-        detail =
-          cond do
-            is_binary(error) and error != "" -> error
-            is_binary(last_message) and last_message != "" -> last_message
-            true -> nil
-          end
-
-        if detail, do: "\n│    " <> colorize(detail, @ansi_gray), else: ""
-      else
-        ""
-      end
+    pr_part = completed_pr_part(pr_url)
+    detail_part = completed_detail_part(outcome, entry)
 
     "│  " <>
       colorize(outcome_icon, outcome_color) <>
@@ -720,6 +694,38 @@ defmodule SymphonyElixir.StatusDashboard do
       colorize("#{turns}t", @ansi_yellow) <>
       pr_part <>
       detail_part
+  end
+
+  defp completed_time_str(completed_at) do
+    if completed_at do
+      Calendar.strftime(completed_at, "%H:%M:%S")
+    else
+      "??:??:??"
+    end
+  end
+
+  defp completed_pr_part(pr_url) do
+    if pr_url do
+      " " <> colorize(pr_url, @ansi_cyan)
+    else
+      ""
+    end
+  end
+
+  defp completed_detail_part("completed", _entry), do: ""
+
+  defp completed_detail_part(_outcome, entry) do
+    error = entry[:error]
+    last_message = entry[:last_message]
+
+    detail =
+      cond do
+        is_binary(error) and error != "" -> error
+        is_binary(last_message) and last_message != "" -> last_message
+        true -> nil
+      end
+
+    if detail, do: "\n│    " <> colorize(detail, @ansi_gray), else: ""
   end
 
   defp format_retry_rows(retrying) do

@@ -94,26 +94,27 @@ defmodule SymphonyElixir.Claude.OneShot do
     case request(system_prompt, user_prompt, opts) do
       {:ok, text} ->
         case decode_json(text) do
-          {:ok, _} = ok ->
-            ok
-
-          {:error, _} = err ->
-            if attempt < @json_max_attempts do
-              Logger.warning("OneShot JSON decode failed (attempt #{attempt}/#{@json_max_attempts}); retrying.")
-
-              retry_user =
-                user_prompt <>
-                  "\n\n[reminder] Reply with ONLY a single JSON object — no prose, no explanation, no tool calls, no code fences."
-
-              request_json_attempt(system_prompt, retry_user, opts, attempt + 1)
-            else
-              Logger.warning("OneShot JSON decode failed after #{@json_max_attempts} attempts.")
-              err
-            end
+          {:ok, _} = ok -> ok
+          {:error, _} = err -> retry_json_attempt(system_prompt, user_prompt, opts, attempt, err)
         end
 
       err ->
         err
+    end
+  end
+
+  defp retry_json_attempt(system_prompt, user_prompt, opts, attempt, err) do
+    if attempt < @json_max_attempts do
+      Logger.warning("OneShot JSON decode failed (attempt #{attempt}/#{@json_max_attempts}); retrying.")
+
+      retry_user =
+        user_prompt <>
+          "\n\n[reminder] Reply with ONLY a single JSON object — no prose, no explanation, no tool calls, no code fences."
+
+      request_json_attempt(system_prompt, retry_user, opts, attempt + 1)
+    else
+      Logger.warning("OneShot JSON decode failed after #{@json_max_attempts} attempts.")
+      err
     end
   end
 
@@ -147,12 +148,7 @@ defmodule SymphonyElixir.Claude.OneShot do
         text =
           contents
           |> String.split("\n", trim: true)
-          |> Enum.flat_map(fn line ->
-            case StreamParser.parse_line(line) do
-              {:ok, event} -> [event]
-              _ -> []
-            end
-          end)
+          |> Enum.flat_map(&parse_event_line/1)
           |> Enum.filter(&assistant_text_event?/1)
           |> List.last()
           |> case do
@@ -164,6 +160,13 @@ defmodule SymphonyElixir.Claude.OneShot do
 
       {:error, reason} ->
         {:error, {:jsonl_read_failed, reason}}
+    end
+  end
+
+  defp parse_event_line(line) do
+    case StreamParser.parse_line(line) do
+      {:ok, event} -> [event]
+      _ -> []
     end
   end
 

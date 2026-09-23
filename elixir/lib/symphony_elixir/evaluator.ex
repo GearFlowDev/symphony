@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Evaluator do
   require Logger
 
   alias SymphonyElixir.History
+  alias SymphonyElixir.Linear.Client
 
   # The branch a Symphony PR targets. The rest of this module already reads
   # `origin/main` for its diff and commit checks; a repo whose trunk is not `main`
@@ -258,11 +259,7 @@ defmodule SymphonyElixir.Evaluator do
       {:ok, output} ->
         case Jason.decode(output) do
           {:ok, checks} when is_list(checks) ->
-            cond do
-              Enum.all?(checks, &(&1["state"] == "SUCCESS")) -> "passed"
-              Enum.any?(checks, &(&1["state"] == "FAILURE")) -> "failed"
-              true -> "pending"
-            end
+            ci_status(checks)
 
           _ ->
             "none"
@@ -270,6 +267,14 @@ defmodule SymphonyElixir.Evaluator do
 
       _ ->
         "none"
+    end
+  end
+
+  defp ci_status(checks) do
+    cond do
+      Enum.all?(checks, &(&1["state"] == "SUCCESS")) -> "passed"
+      Enum.any?(checks, &(&1["state"] == "FAILURE")) -> "failed"
+      true -> "pending"
     end
   end
 
@@ -316,7 +321,7 @@ defmodule SymphonyElixir.Evaluator do
   defp check_linear_comments(nil), do: {false, false}
 
   defp check_linear_comments(issue_id) do
-    case SymphonyElixir.Linear.Client.fetch_all_issue_comments(issue_id) do
+    case Client.fetch_all_issue_comments(issue_id) do
       {:ok, comments} ->
         bodies = Enum.map(comments, & &1.body)
         all_text = Enum.join(bodies, "\n")
@@ -346,9 +351,9 @@ defmodule SymphonyElixir.Evaluator do
         test_files = Enum.filter(files, &test_file?/1)
         source_files = Enum.reject(files, &test_file?/1)
 
-        has_tests = length(test_files) > 0
+        has_tests = test_files != []
 
-        if has_tests and length(source_files) > 0 do
+        if has_tests and source_files != [] do
           Logger.info("Evaluator: test coverage — #{length(test_files)} test files for #{length(source_files)} source files")
         end
 
@@ -369,9 +374,9 @@ defmodule SymphonyElixir.Evaluator do
   defp check_plan_posted(nil), do: false
 
   defp check_plan_posted(issue_id) do
-    case SymphonyElixir.Linear.Client.fetch_all_issue_comments(issue_id) do
+    case Client.fetch_all_issue_comments(issue_id) do
       {:ok, comments} ->
-        all_text = comments |> Enum.map(& &1.body) |> Enum.join("\n")
+        all_text = Enum.map_join(comments, "\n", & &1.body)
 
         String.contains?(all_text, "## Requirements") or
           String.contains?(all_text, "- [ ]") or
@@ -401,7 +406,7 @@ defmodule SymphonyElixir.Evaluator do
       end
 
     no_changes_comment =
-      case SymphonyElixir.Linear.Client.fetch_all_issue_comments(issue_id) do
+      case Client.fetch_all_issue_comments(issue_id) do
         {:ok, comments} ->
           Enum.any?(comments, fn c ->
             String.contains?(String.downcase(c.body), "no simplification needed") or
@@ -479,28 +484,21 @@ defmodule SymphonyElixir.Evaluator do
     slot_file = Path.join(path, ".symphony_slot")
 
     if File.exists?(slot_file) do
-      case File.read(slot_file) do
-        {:ok, content} ->
-          case Regex.run(~r/DIRECTORY=(.+)/, content) do
-            [_, dir] ->
-              resolved = String.trim(dir)
-
-              if File.dir?(resolved) do
-                Logger.info("Evaluator: resolved workspace #{path} -> #{resolved}")
-                resolved
-              else
-                path
-              end
-
-            _ ->
-              path
-          end
-
-        _ ->
-          path
-      end
+      resolve_slot_directory(path, slot_file)
     else
       path
+    end
+  end
+
+  defp resolve_slot_directory(path, slot_file) do
+    with {:ok, content} <- File.read(slot_file),
+         [_, dir] <- Regex.run(~r/DIRECTORY=(.+)/, content),
+         resolved = String.trim(dir),
+         true <- File.dir?(resolved) do
+      Logger.info("Evaluator: resolved workspace #{path} -> #{resolved}")
+      resolved
+    else
+      _ -> path
     end
   end
 end

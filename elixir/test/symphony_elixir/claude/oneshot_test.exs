@@ -112,7 +112,7 @@ defmodule SymphonyElixir.Claude.OneShotTest do
   end
 
   test "request_json decodes a fenced JSON reply" do
-    fixture = assistant_line("```json\n{\"verdict\": \"approve\"}\n```")
+    fixture = assistant_line(~s(```json\n{"verdict": "approve"}\n```))
 
     assert {:ok, %{"verdict" => "approve"}} =
              OneShot.request_json("sys", "grade this", fakes(fixture))
@@ -121,7 +121,7 @@ defmodule SymphonyElixir.Claude.OneShotTest do
   test "request_json retries once when the first reply is not JSON" do
     fixtures = [
       assistant_line("sorry, here is the grade:"),
-      assistant_line("{\"verdict\": \"request_changes\"}")
+      assistant_line(~s({"verdict": "request_changes"}))
     ]
 
     assert {:ok, %{"verdict" => "request_changes"}} =

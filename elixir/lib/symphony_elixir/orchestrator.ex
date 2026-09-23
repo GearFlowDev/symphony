@@ -7,10 +7,11 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{Config, Evaluator, Grant, History, Notifier, Planning, StatusDashboard, Suitability, Tracker, Workspace}
-  alias SymphonyElixir.Claude.StreamParser
-  alias SymphonyElixir.Linear.Client
-  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Claude.{StreamParser, TmuxCLI}
+  alias SymphonyElixir.{Config, Evaluator, Grant, History, Notifier, Planning}
+  alias SymphonyElixir.Linear.{Client, Issue}
+  alias SymphonyElixir.Planning.Workflow, as: PlanningWorkflow
+  alias SymphonyElixir.{StatusDashboard, Suitability, Tracker, Workspace}
 
   @continuation_retry_delay_ms 30_000
   # Fixed poll interval while waiting for a shared pool slot to free.
@@ -249,46 +250,9 @@ defmodule SymphonyElixir.Orchestrator do
 
         # Release the pool slot immediately — the agent process is done.
         # If the issue gets retasked/retried, the slot will be re-claimed on next dispatch.
-        if identifier = running_entry[:identifier] do
-          Task.start(fn -> Workspace.release_pool_slot_for_issue(identifier) end)
-        end
+        release_pool_slot_async(running_entry[:identifier])
 
-        state =
-          case reason do
-            :normal ->
-              continuation_count = Map.get(running_entry, :continuation_count, 0) + 1
-
-              if continuation_count > @max_continuations do
-                Logger.warning("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; reached max continuations (#{@max_continuations}), completing")
-
-                complete_issue(state, issue_id)
-              else
-                # The plan is the sole authority. The dispatch this run produced was
-                # already graded above (row states are fresh). Schedule a continuation
-                # that re-assesses the plan on the next dispatch — plan_action/2 then
-                # decides whether to dispatch the remaining open rows (Implement),
-                # dispatch the tester (Test), finish the issue, or block it.
-                Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling plan continuation #{continuation_count}/#{@max_continuations}")
-
-                state
-                |> complete_issue(issue_id)
-                |> schedule_issue_retry(issue_id, continuation_count, %{
-                  identifier: running_entry.identifier,
-                  delay_type: :continuation,
-                  continuation_count: continuation_count
-                })
-              end
-
-            _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
-              next_attempt = next_retry_attempt_from_running(running_entry)
-
-              schedule_issue_retry(state, issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}"
-              })
-          end
+        state = schedule_after_agent_exit(state, issue_id, session_id, running_entry, reason)
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -313,30 +277,11 @@ defmodule SymphonyElixir.Orchestrator do
 
         # Detect SYMPHONY_NEEDS_HELP marker
         raw_event = Map.get(update, :raw)
-        needs_help_message = if raw_event, do: StreamParser.extract_needs_help(raw_event)
         already_flagged = Map.get(running_entry, :needs_human, false)
-
-        updated_running_entry =
-          if needs_help_message && !already_flagged do
-            send(self(), {:agent_needs_help, issue_id, needs_help_message})
-            Map.merge(updated_running_entry, %{needs_human: true, needs_human_message: needs_help_message})
-          else
-            updated_running_entry
-          end
+        updated_running_entry = flag_needs_help(updated_running_entry, issue_id, raw_event, already_flagged)
 
         # Record the tester's machine verdict (SYMPHONY_VERDICT marker) to the DB.
-        # The gate reads this record — not the human-facing Linear report — so a
-        # verdict can't be lost to wording variance or a report posted to GitHub.
-        if raw_event do
-          case StreamParser.extract_verdict(raw_event) do
-            {verdict, sha, reason} ->
-              if identifier = Map.get(running_entry, :identifier),
-                do: History.record_tester_verdict(identifier, verdict, sha, reason)
-
-            _ ->
-              :ok
-          end
-        end
+        maybe_record_tester_verdict(running_entry, raw_event)
 
         updated_running_entry = maybe_persist_run_progress(updated_running_entry)
 
@@ -373,20 +318,8 @@ defmodule SymphonyElixir.Orchestrator do
         # The run is over, whatever a person does next.
         clear_working_label(issue_id, identifier)
 
-        # Move issue to review state if configured. On the Gearflow boxes that is
-        # `Shaping`, which is where parking lives: nothing dispatches from it, and
-        # the `needs-human` label this used to reach for was retired 2026-09-17.
-        needs_human_state = Config.escalation_needs_human_state()
-
-        if is_binary(needs_human_state) do
-          case Tracker.update_issue_state(issue_id, needs_human_state) do
-            :ok ->
-              Logger.info("Moved issue #{identifier} to state '#{needs_human_state}'")
-
-            {:error, reason} ->
-              Logger.warning("Failed to move issue #{identifier} to '#{needs_human_state}': #{inspect(reason)}")
-          end
-        end
+        # Move issue to review state if configured (Shaping on the Gearflow boxes).
+        move_issue_to_needs_human_state(issue_id, identifier, Config.escalation_needs_human_state())
 
         # Record escalation in history
         run_id = Map.get(running_entry, :history_run_id)
@@ -419,6 +352,91 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  defp release_pool_slot_async(identifier) do
+    if identifier do
+      Task.start(fn -> Workspace.release_pool_slot_for_issue(identifier) end)
+    end
+  end
+
+  defp schedule_after_agent_exit(state, issue_id, session_id, running_entry, :normal) do
+    continuation_count = Map.get(running_entry, :continuation_count, 0) + 1
+
+    if continuation_count > @max_continuations do
+      Logger.warning("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; reached max continuations (#{@max_continuations}), completing")
+
+      complete_issue(state, issue_id)
+    else
+      # The plan is the sole authority. The dispatch this run produced was
+      # already graded above (row states are fresh). Schedule a continuation
+      # that re-assesses the plan on the next dispatch — plan_action/2 then
+      # decides whether to dispatch the remaining open rows (Implement),
+      # dispatch the tester (Test), finish the issue, or block it.
+      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling plan continuation #{continuation_count}/#{@max_continuations}")
+
+      state
+      |> complete_issue(issue_id)
+      |> schedule_issue_retry(issue_id, continuation_count, %{
+        identifier: running_entry.identifier,
+        delay_type: :continuation,
+        continuation_count: continuation_count
+      })
+    end
+  end
+
+  defp schedule_after_agent_exit(state, issue_id, session_id, running_entry, reason) do
+    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+
+    next_attempt = next_retry_attempt_from_running(running_entry)
+
+    schedule_issue_retry(state, issue_id, next_attempt, %{
+      identifier: running_entry.identifier,
+      error: "agent exited: #{inspect(reason)}"
+    })
+  end
+
+  # Detect SYMPHONY_NEEDS_HELP marker
+  defp flag_needs_help(running_entry, issue_id, raw_event, already_flagged) do
+    needs_help_message = if raw_event, do: StreamParser.extract_needs_help(raw_event)
+
+    if needs_help_message && !already_flagged do
+      send(self(), {:agent_needs_help, issue_id, needs_help_message})
+      Map.merge(running_entry, %{needs_human: true, needs_human_message: needs_help_message})
+    else
+      running_entry
+    end
+  end
+
+  # Record the tester's machine verdict (SYMPHONY_VERDICT marker) to the DB.
+  # The gate reads this record — not the human-facing Linear report — so a
+  # verdict can't be lost to wording variance or a report posted to GitHub.
+  defp maybe_record_tester_verdict(_running_entry, raw_event) when raw_event in [nil, false], do: nil
+
+  defp maybe_record_tester_verdict(running_entry, raw_event) do
+    case StreamParser.extract_verdict(raw_event) do
+      {verdict, sha, reason} ->
+        if identifier = Map.get(running_entry, :identifier),
+          do: History.record_tester_verdict(identifier, verdict, sha, reason)
+
+      _ ->
+        :ok
+    end
+  end
+
+  # Move issue to review state if configured. On the Gearflow boxes that is
+  # `Shaping`, which is where parking lives: nothing dispatches from it, and
+  # the `needs-human` label this used to reach for was retired 2026-09-17.
+  defp move_issue_to_needs_human_state(issue_id, identifier, needs_human_state) when is_binary(needs_human_state) do
+    case Tracker.update_issue_state(issue_id, needs_human_state) do
+      :ok ->
+        Logger.info("Moved issue #{identifier} to state '#{needs_human_state}'")
+
+      {:error, reason} ->
+        Logger.warning("Failed to move issue #{identifier} to '#{needs_human_state}': #{inspect(reason)}")
+    end
+  end
+
+  defp move_issue_to_needs_human_state(_issue_id, _identifier, _needs_human_state), do: nil
+
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
@@ -432,13 +450,13 @@ defmodule SymphonyElixir.Orchestrator do
       reap_orphan_tmux_sessions(state)
     end
 
-    if not Config.within_active_hours?() do
-      Logger.debug("Outside active hours, skipping dispatch")
-      state
-    else
+    if Config.within_active_hours?() do
       state
       |> check_completed_pr_health()
       |> do_dispatch()
+    else
+      Logger.debug("Outside active hours, skipping dispatch")
+      state
     end
   end
 
@@ -465,7 +483,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     # 120s grace: a just-launched worker's tmux session exists before its
     # session_id propagates into `running`, so don't reap young sessions.
-    case SymphonyElixir.Claude.TmuxCLI.reap_orphan_sessions_except(active_session_ids, min_age_seconds: 120) do
+    case TmuxCLI.reap_orphan_sessions_except(active_session_ids, min_age_seconds: 120) do
       [] -> :ok
       reaped -> Logger.info("Reaped #{length(reaped)} orphaned Claude tmux session(s): #{inspect(reaped)}")
     end
@@ -720,7 +738,7 @@ defmodule SymphonyElixir.Orchestrator do
         # tmux session that outlives the task (the runner's `after`-block
         # cleanup doesn't fire under an external kill). Kill it explicitly so a
         # terminated/restarted worker can't keep editing its slot.
-        SymphonyElixir.Claude.TmuxCLI.kill_by_session_id(Map.get(running_entry, :session_id))
+        TmuxCLI.kill_by_session_id(Map.get(running_entry, :session_id))
 
         # Nor is the task enough for a hook: closing its port kills `sh` and
         # leaves the provisioner it spawned running. An abandoned `before_run`
@@ -1373,19 +1391,7 @@ defmodule SymphonyElixir.Orchestrator do
         # Off the orchestrator loop and never fatal: an unmarked board is a smaller
         # failure than a dispatch that Linear held up.
         Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-          result =
-            case op do
-              :add -> Tracker.add_label(issue_id, label)
-              :remove -> Tracker.remove_label(issue_id, label)
-            end
-
-          case result do
-            :ok ->
-              Logger.info("#{op} #{label} on #{identifier}")
-
-            {:error, reason} ->
-              Logger.warning("Could not #{op} #{label} on #{identifier}: #{inspect(reason)}")
-          end
+          apply_working_label(op, issue_id, identifier, label)
         end)
 
         :ok
@@ -1396,6 +1402,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp update_working_label(_op, _issue_id, _identifier), do: :ok
+
+  defp apply_working_label(op, issue_id, identifier, label) do
+    result =
+      case op do
+        :add -> Tracker.add_label(issue_id, label)
+        :remove -> Tracker.remove_label(issue_id, label)
+      end
+
+    case result do
+      :ok ->
+        Logger.info("#{op} #{label} on #{identifier}")
+
+      {:error, reason} ->
+        Logger.warning("Could not #{op} #{label} on #{identifier}: #{inspect(reason)}")
+    end
+  end
 
   defp spawn_worker(%State{} = state, issue, attempt, metadata) do
     recipient = self()
@@ -1553,7 +1575,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp plan_action_decision(issue, metadata) do
-    case SymphonyElixir.Planning.Workflow.assess(issue, pr_url: metadata[:existing_pr_url]) do
+    case PlanningWorkflow.assess(issue, pr_url: metadata[:existing_pr_url]) do
       {:ok, {:has_open_rows, plan, rows}} ->
         dispatch_implement(issue, metadata, plan, rows, "#{length(rows)} open rows")
 
@@ -1609,29 +1631,7 @@ defmodule SymphonyElixir.Orchestrator do
         last_seen = meta["cycle_run_count"] || 0
 
         if finished > last_seen do
-          fingerprint =
-            plan_cycle_fingerprint(plan, identifier, dispatch_metadata[:existing_pr_url])
-
-          history = Enum.take([fingerprint | meta["cycle_history"] || []], 4 * limit)
-          repeats = Enum.count(history, &(&1 == fingerprint))
-          tripped? = repeats >= limit
-
-          # Tripping resets the history: a human re-activating the issue gets a
-          # fresh breaker budget instead of an instant re-trip.
-          {:ok, _} =
-            Planning.update_plan(plan, %{
-              metadata:
-                Map.merge(meta, %{
-                  "cycle_history" => if(tripped?, do: [], else: history),
-                  "cycle_run_count" => finished
-                })
-            })
-
-          if tripped? do
-            {:blocked, {:no_progress, no_progress_message(repeats, limit, fingerprint, identifier)}}
-          else
-            result
-          end
+          record_plan_cycle(plan, meta, finished, identifier, limit, dispatch_metadata, result)
         else
           result
         end
@@ -1641,6 +1641,32 @@ defmodule SymphonyElixir.Orchestrator do
     error ->
       Logger.warning("no_progress_check failed for #{issue_context(issue)}: #{Exception.message(error)}")
       result
+  end
+
+  defp record_plan_cycle(plan, meta, finished, identifier, limit, dispatch_metadata, result) do
+    fingerprint =
+      plan_cycle_fingerprint(plan, identifier, dispatch_metadata[:existing_pr_url])
+
+    history = Enum.take([fingerprint | meta["cycle_history"] || []], 4 * limit)
+    repeats = Enum.count(history, &(&1 == fingerprint))
+    tripped? = repeats >= limit
+
+    # Tripping resets the history: a human re-activating the issue gets a
+    # fresh breaker budget instead of an instant re-trip.
+    {:ok, _} =
+      Planning.update_plan(plan, %{
+        metadata:
+          Map.merge(meta, %{
+            "cycle_history" => if(tripped?, do: [], else: history),
+            "cycle_run_count" => finished
+          })
+      })
+
+    if tripped? do
+      {:blocked, {:no_progress, no_progress_message(repeats, limit, fingerprint, identifier)}}
+    else
+      result
+    end
   end
 
   # Name only the gates that actually ran. The fixed text blamed "plan, grader,
@@ -1828,26 +1854,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     if head != "?" and head != already do
       Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-        case System.cmd("gh", ["pr", "comment", pr_url, "--body", "@coderabbitai review"], stderr_to_stdout: true) do
-          {_out, 0} ->
-            Logger.info("Requested CodeRabbit review on #{pr_url} (head #{head}) in parallel with the tester")
-
-            # Record only on success, against a fresh plan row, so a failed
-            # request retries next poll and a concurrent metadata write isn't
-            # clobbered.
-            case SymphonyElixir.Repo.get(SymphonyElixir.Planning.Plan, plan.id) do
-              %SymphonyElixir.Planning.Plan{} = fresh ->
-                Planning.update_plan(fresh, %{
-                  metadata: Map.put(fresh.metadata || %{}, "cr_review_head", head)
-                })
-
-              _ ->
-                :ok
-            end
-
-          {out, _} ->
-            Logger.warning("Failed to request CodeRabbit review on #{pr_url}: #{String.trim(out)}")
-        end
+        request_coderabbit_review(plan, pr_url, head)
       end)
     end
 
@@ -1860,6 +1867,33 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_request_coderabbit_review(_, _), do: :ok
 
+  defp request_coderabbit_review(plan, pr_url, head) do
+    case System.cmd("gh", ["pr", "comment", pr_url, "--body", "@coderabbitai review"], stderr_to_stdout: true) do
+      {_out, 0} ->
+        Logger.info("Requested CodeRabbit review on #{pr_url} (head #{head}) in parallel with the tester")
+
+        # Record only on success, against a fresh plan row, so a failed
+        # request retries next poll and a concurrent metadata write isn't
+        # clobbered.
+        record_coderabbit_review_head(plan, head)
+
+      {out, _} ->
+        Logger.warning("Failed to request CodeRabbit review on #{pr_url}: #{String.trim(out)}")
+    end
+  end
+
+  defp record_coderabbit_review_head(plan, head) do
+    case SymphonyElixir.Repo.get(SymphonyElixir.Planning.Plan, plan.id) do
+      %SymphonyElixir.Planning.Plan{} = fresh ->
+        Planning.update_plan(fresh, %{
+          metadata: Map.put(fresh.metadata || %{}, "cr_review_head", head)
+        })
+
+      _ ->
+        :ok
+    end
+  end
+
   # The latest @agent comment, if no feedback-triggered Implement dispatch has
   # STARTED since it was posted. Only a dispatch this gate itself triggered
   # counts as handling the comment: an unrelated dispatch (Fix CI, a row-closer
@@ -1867,7 +1901,7 @@ defmodule SymphonyElixir.Orchestrator do
   # its prompt, so neither its start nor its finish may mark the comment
   # handled. Returns {:ok, body} | :none. Best-effort: fetch errors → :none.
   defp fresh_agent_feedback(issue, plan) do
-    case SymphonyElixir.Linear.Client.fetch_issue_comments(Map.get(issue, :id)) do
+    case Client.fetch_issue_comments(Map.get(issue, :id)) do
       {:ok, comments} ->
         latest =
           comments
@@ -1922,7 +1956,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   # Record a Dispatch and build the metadata for an Implement row-closer dispatch.
   defp dispatch_implement(issue, metadata, plan, rows, why, phase \\ "Implement") do
-    case SymphonyElixir.Planning.Workflow.start_implement_dispatch(plan, rows) do
+    case PlanningWorkflow.start_implement_dispatch(plan, rows) do
       {:ok, dispatch} ->
         Logger.info("Dispatching #{phase} row-closer for #{issue.identifier} (#{why}, #{length(rows)} rows)")
 
@@ -1969,9 +2003,8 @@ defmodule SymphonyElixir.Orchestrator do
   # CI, so checks are effectively always resolved by the time the gate runs.
   defp external_ship_gate(pr_url) do
     with :ok <- merge_gate(pr_url),
-         :ok <- ci_gate(pr_url),
-         :ok <- review_gate(pr_url) do
-      :ok
+         :ok <- ci_gate(pr_url) do
+      review_gate(pr_url)
     end
   end
 
@@ -2034,40 +2067,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp review_gate(pr_url) do
     case pr_ref(pr_url) do
       {repo, number} ->
-        case gh_cmd(["pr", "view", number, "--repo", repo, "--json", "reviewDecision,latestReviews"]) do
-          {output, 0} ->
-            case Jason.decode(output) do
-              {:ok, %{"reviewDecision" => "CHANGES_REQUESTED"}} ->
-                {:request_changes, "PR review requested changes"}
-
-              # CodeRabbit runs in request-changes mode and is a hard merge gate,
-              # but it is not always a "required" reviewer, so reviewDecision can
-              # be nil while CodeRabbit's own review still sits at CHANGES_REQUESTED.
-              # Block on its review directly; the worker clears it by resolving the
-              # comments and posting `@coderabbitai resolve` (auto-approves on green CI).
-              {:ok, decoded} ->
-                cond do
-                  coderabbit_requested_changes?(decoded) ->
-                    {:request_changes, "CodeRabbit requested changes — resolve its comments and post `@coderabbitai resolve`"}
-
-                  # A later CodeRabbit round can land as a COMMENTED review with
-                  # unresolved threads and an empty reviewDecision — invisible to
-                  # both checks above, so the issue completed with open Major
-                  # comments (GEA-5242). Unresolved threads block the same way.
-                  (n = unresolved_review_threads(repo, number)) > 0 ->
-                    {:request_changes, "#{n} unresolved review threads — address them and post `@coderabbitai resolve`"}
-
-                  true ->
-                    :ok
-                end
-
-              _ ->
-                :ok
-            end
-
-          _ ->
-            :ok
-        end
+        pr_review_gate(repo, number)
 
       :error ->
         :ok
@@ -2075,6 +2075,46 @@ defmodule SymphonyElixir.Orchestrator do
   rescue
     _ -> :ok
   end
+
+  defp pr_review_gate(repo, number) do
+    case gh_cmd(["pr", "view", number, "--repo", repo, "--json", "reviewDecision,latestReviews"]) do
+      {output, 0} ->
+        output
+        |> Jason.decode()
+        |> review_decision_gate(repo, number)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp review_decision_gate({:ok, %{"reviewDecision" => "CHANGES_REQUESTED"}}, _repo, _number) do
+    {:request_changes, "PR review requested changes"}
+  end
+
+  # CodeRabbit runs in request-changes mode and is a hard merge gate,
+  # but it is not always a "required" reviewer, so reviewDecision can
+  # be nil while CodeRabbit's own review still sits at CHANGES_REQUESTED.
+  # Block on its review directly; the worker clears it by resolving the
+  # comments and posting `@coderabbitai resolve` (auto-approves on green CI).
+  defp review_decision_gate({:ok, decoded}, repo, number) do
+    cond do
+      coderabbit_requested_changes?(decoded) ->
+        {:request_changes, "CodeRabbit requested changes — resolve its comments and post `@coderabbitai resolve`"}
+
+      # A later CodeRabbit round can land as a COMMENTED review with
+      # unresolved threads and an empty reviewDecision — invisible to
+      # both checks above, so the issue completed with open Major
+      # comments (GEA-5242). Unresolved threads block the same way.
+      (n = unresolved_review_threads(repo, number)) > 0 ->
+        {:request_changes, "#{n} unresolved review threads — address them and post `@coderabbitai resolve`"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp review_decision_gate(_decoded, _repo, _number), do: :ok
 
   # Count of unresolved PR review threads. Fail-safe like the other gates: any
   # gh/parse failure counts as 0 so a transient error never wedges a finished
@@ -2181,7 +2221,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp verdict_at_head?(_, _), do: false
 
   defp tester_gate_from_linear(issue, last_implement) do
-    case SymphonyElixir.Linear.Client.fetch_all_issue_comments(Map.get(issue, :id)) do
+    case Client.fetch_all_issue_comments(Map.get(issue, :id)) do
       {:ok, comments} ->
         latest = latest_tester_report(comments)
 
@@ -2228,14 +2268,7 @@ defmodule SymphonyElixir.Orchestrator do
         help_message: message
       })
 
-      needs_human_state = Config.escalation_needs_human_state()
-
-      if is_binary(needs_human_state) do
-        case Tracker.update_issue_state(issue.id, needs_human_state) do
-          :ok -> Logger.info("Moved blocked issue #{issue.identifier} to state '#{needs_human_state}'")
-          {:error, reason} -> Logger.warning("Failed to move blocked issue #{issue.identifier}: #{inspect(reason)}")
-        end
-      end
+      move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())
 
       # A PARKED ISSUE STILL OWES A PR. It gets no more dispatches, so whatever
       # the worker pushed is all there will ever be — and a person (or the
@@ -2253,6 +2286,15 @@ defmodule SymphonyElixir.Orchestrator do
       complete_issue(state, issue.id)
     end
   end
+
+  defp move_blocked_issue_to_needs_human_state(issue, needs_human_state) when is_binary(needs_human_state) do
+    case Tracker.update_issue_state(issue.id, needs_human_state) do
+      :ok -> Logger.info("Moved blocked issue #{issue.identifier} to state '#{needs_human_state}'")
+      {:error, reason} -> Logger.warning("Failed to move blocked issue #{issue.identifier}: #{inspect(reason)}")
+    end
+  end
+
+  defp move_blocked_issue_to_needs_human_state(_issue, _needs_human_state), do: :ok
 
   # Transient plan-generation failures are session-startup blips (the planner's
   # tmux OneShot not becoming ready in time), not genuine "needs a human"
@@ -2366,53 +2408,57 @@ defmodule SymphonyElixir.Orchestrator do
         :ok
 
       dispatch_id when is_binary(dispatch_id) ->
-        with %SymphonyElixir.Planning.Dispatch{} = dispatch <-
-               SymphonyElixir.Repo.get(SymphonyElixir.Planning.Dispatch, dispatch_id),
-             %SymphonyElixir.Planning.Plan{} = plan <-
-               SymphonyElixir.Repo.get(SymphonyElixir.Planning.Plan, dispatch.plan_id),
-             {:ok, diff} <- fetch_dispatch_diff(running_entry) do
-          # External evidence: PR description. Worker can edit it via
-          # `gh pr edit --body`, but it's not in `git diff`. Without this
-          # the Grader can never verify "update PR description" rows.
-          pr_body = fetch_pr_body(running_entry)
-
-          # Code-context evidence: the change census re-derives, from the diff,
-          # which lib/ callers of changed functions the diff did NOT touch — the
-          # "signature changed, did every caller follow?" gap the stat-only diff
-          # can't show. Un-blinds the grader on the #1 defect class.
-          census = fetch_dispatch_census(running_entry)
-
-          case SymphonyElixir.Planning.Workflow.grade_dispatch(dispatch,
-                 plan: plan,
-                 diff: diff,
-                 test_output: "",
-                 pr_body: pr_body,
-                 census: census
-               ) do
-            {:ok, {verdict, _updated_plan}} ->
-              Logger.info("Grader verdict for plan dispatch=#{dispatch_id} verdict=#{verdict} issue=#{running_entry[:identifier]}")
-
-              :ok
-
-            {:error, reason} ->
-              Logger.warning("Grader failed for plan dispatch=#{dispatch_id} reason=#{inspect(reason)}")
-
-              :ok
-          end
-        else
-          nil ->
-            Logger.warning("Grader skipped: plan dispatch=#{dispatch_id} not found")
-            :ok
-
-          {:error, reason} ->
-            Logger.warning("Grader skipped: #{inspect(reason)}")
-            :ok
-        end
+        grade_plan_dispatch(running_entry, dispatch_id)
     end
   rescue
     error ->
       Logger.error("maybe_grade_plan_dispatch crashed: #{Exception.message(error)}")
       :ok
+  end
+
+  defp grade_plan_dispatch(running_entry, dispatch_id) do
+    with %SymphonyElixir.Planning.Dispatch{} = dispatch <-
+           SymphonyElixir.Repo.get(SymphonyElixir.Planning.Dispatch, dispatch_id),
+         %SymphonyElixir.Planning.Plan{} = plan <-
+           SymphonyElixir.Repo.get(SymphonyElixir.Planning.Plan, dispatch.plan_id),
+         {:ok, diff} <- fetch_dispatch_diff(running_entry) do
+      # External evidence: PR description. Worker can edit it via
+      # `gh pr edit --body`, but it's not in `git diff`. Without this
+      # the Grader can never verify "update PR description" rows.
+      pr_body = fetch_pr_body(running_entry)
+
+      # Code-context evidence: the change census re-derives, from the diff,
+      # which lib/ callers of changed functions the diff did NOT touch — the
+      # "signature changed, did every caller follow?" gap the stat-only diff
+      # can't show. Un-blinds the grader on the #1 defect class.
+      census = fetch_dispatch_census(running_entry)
+
+      case PlanningWorkflow.grade_dispatch(dispatch,
+             plan: plan,
+             diff: diff,
+             test_output: "",
+             pr_body: pr_body,
+             census: census
+           ) do
+        {:ok, {verdict, _updated_plan}} ->
+          Logger.info("Grader verdict for plan dispatch=#{dispatch_id} verdict=#{verdict} issue=#{running_entry[:identifier]}")
+
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("Grader failed for plan dispatch=#{dispatch_id} reason=#{inspect(reason)}")
+
+          :ok
+      end
+    else
+      nil ->
+        Logger.warning("Grader skipped: plan dispatch=#{dispatch_id} not found")
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Grader skipped: #{inspect(reason)}")
+        :ok
+    end
   end
 
   # Read the working-directory diff from the slot so the Grader has evidence.
@@ -2514,22 +2560,25 @@ defmodule SymphonyElixir.Orchestrator do
         nil
 
       true ->
-        identifier = running_entry[:identifier]
-        # `gh pr list --search "<id>"` is repo-scoped via the slot's git remote.
-        cmd =
-          ~s|gh pr list --search "#{identifier}" --state open --json number,url,body,title --jq '.[0]'|
-
-        case System.cmd("sh", ["-c", cmd], cd: workspace_path, stderr_to_stdout: true) do
-          {output, 0} ->
-            trimmed = String.trim(output)
-            if trimmed in ["", "null"], do: nil, else: trimmed
-
-          _ ->
-            nil
-        end
+        open_pr_json(running_entry[:identifier], workspace_path)
     end
   rescue
     _ -> nil
+  end
+
+  defp open_pr_json(identifier, workspace_path) do
+    # `gh pr list --search "<id>"` is repo-scoped via the slot's git remote.
+    cmd =
+      ~s|gh pr list --search "#{identifier}" --state open --json number,url,body,title --jq '.[0]'|
+
+    case System.cmd("sh", ["-c", cmd], cd: workspace_path, stderr_to_stdout: true) do
+      {output, 0} ->
+        trimmed = String.trim(output)
+        if trimmed in ["", "null"], do: nil, else: trimmed
+
+      _ ->
+        nil
+    end
   end
 
   defp read_base_branch(workspace_path) do
@@ -3079,7 +3128,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     case Tracker.fetch_candidate_issues() do
       {:ok, issues} ->
-        case Enum.find(issues, fn i -> i.identifier == normalized end) do
+        case Enum.find(issues, &(&1.identifier == normalized)) do
           %Issue{} = issue ->
             {:reply, :ok, do_force_dispatch(state, issue)}
 
@@ -3475,6 +3524,16 @@ defmodule SymphonyElixir.Orchestrator do
       nil
   end
 
+  # Checked in order; the first category whose needles appear in the inspected
+  # reason wins, and an unmatched reason is a crash.
+  @error_message_categories [
+    {"max_retries_exhausted", ["max_retries_exhausted"]},
+    {"timeout", ["timeout", "Timeout"]},
+    {"stall", ["stall", "Stall"]},
+    {"rate_limit", ["rate_limit", "429"]},
+    {"spawn_failure", ["spawn"]}
+  ]
+
   defp categorize_error(:normal), do: %{message: nil, category: nil}
 
   defp categorize_error({:shutdown, :stopped}),
@@ -3508,14 +3567,9 @@ defmodule SymphonyElixir.Orchestrator do
     message = inspect(reason)
 
     category =
-      cond do
-        message =~ "max_retries_exhausted" -> "max_retries_exhausted"
-        message =~ "timeout" or message =~ "Timeout" -> "timeout"
-        message =~ "stall" or message =~ "Stall" -> "stall"
-        message =~ "rate_limit" or message =~ "429" -> "rate_limit"
-        message =~ "spawn" -> "spawn_failure"
-        true -> "crash"
-      end
+      Enum.find_value(@error_message_categories, "crash", fn {candidate, needles} ->
+        if Enum.any?(needles, &(message =~ &1)), do: candidate
+      end)
 
     %{message: message, category: category}
   end
@@ -3908,13 +3962,15 @@ defmodule SymphonyElixir.Orchestrator do
         end)
         |> Enum.uniq_by(& &1[:issue_identifier])
 
-      Enum.reduce(entries_with_prs, state, fn entry, state_acc ->
-        if available_slots(state_acc) == 0 do
-          state_acc
-        else
-          check_completed_entry_pr(state_acc, entry)
-        end
-      end)
+      Enum.reduce(entries_with_prs, state, &maybe_check_completed_entry_pr(&2, &1))
+    end
+  end
+
+  defp maybe_check_completed_entry_pr(%State{} = state, entry) do
+    if available_slots(state) == 0 do
+      state
+    else
+      check_completed_entry_pr(state, entry)
     end
   end
 
@@ -3987,7 +4043,7 @@ defmodule SymphonyElixir.Orchestrator do
   # invisible to the branch search). Oldest open PR wins: the original work PR
   # beats later side-PRs sharing the issue prefix.
   defp attachment_pr(%Issue{id: issue_id}) when is_binary(issue_id) do
-    case SymphonyElixir.Linear.Client.fetch_issue_pr_urls(issue_id) do
+    case Client.fetch_issue_pr_urls(issue_id) do
       {:ok, [_ | _] = urls} ->
         urls
         |> Enum.map(&open_pr_info/1)
@@ -4026,57 +4082,13 @@ defmodule SymphonyElixir.Orchestrator do
     # (e.g. "gea-1205-some-description" starts with "gea-1205")
     branches = [identifier, lower]
 
+    # Exact branch match first. Fall back: list all open PRs and find one whose
+    # branch starts with the identifier. Also check the issue's gitBranchName
+    # from Linear if available.
     result =
-      Enum.find_value(repos, fn repo ->
-        # Exact branch match
-        Enum.find_value(branches, fn branch ->
-          case System.cmd("gh", ["pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--json", "url,headRefName", "--jq", ".[0]"], stderr_to_stdout: true) do
-            {output, 0} -> parse_pr_result(output)
-            _ -> nil
-          end
-        end)
-      end)
-
-    # Fall back: list all open PRs and find one whose branch starts with the identifier
-    result =
-      result ||
-        Enum.find_value(repos, fn repo ->
-          case System.cmd("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "url,headRefName", "--limit", "50"], stderr_to_stdout: true) do
-            {output, 0} ->
-              case Jason.decode(output) do
-                {:ok, prs} when is_list(prs) ->
-                  Enum.find_value(prs, fn pr ->
-                    branch = pr["headRefName"] || ""
-
-                    if String.starts_with?(String.downcase(branch), lower <> "-") or String.downcase(branch) == lower do
-                      parse_pr_result(Jason.encode!(pr))
-                    end
-                  end)
-
-                _ ->
-                  nil
-              end
-
-            _ ->
-              nil
-          end
-        end)
-
-    # Also check the issue's gitBranchName from Linear if available
-    result =
-      result ||
-        case Map.get(issue, :git_branch_name) do
-          branch when is_binary(branch) and branch != "" ->
-            Enum.find_value(repos, fn repo ->
-              case System.cmd("gh", ["pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--json", "url,headRefName", "--jq", ".[0]"], stderr_to_stdout: true) do
-                {output, 0} -> parse_pr_result(output)
-                _ -> nil
-              end
-            end)
-
-          _ ->
-            nil
-        end
+      find_pr_by_exact_branch(repos, branches) ||
+        find_pr_by_branch_prefix(repos, lower) ||
+        find_pr_by_linear_branch(repos, Map.get(issue, :git_branch_name))
 
     case result do
       nil -> :no_pr
@@ -4088,6 +4100,51 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp check_existing_pr(_issue), do: :no_pr
+
+  defp find_pr_by_exact_branch(repos, branches) do
+    Enum.find_value(repos, fn repo ->
+      # Exact branch match
+      Enum.find_value(branches, &open_pr_for_head(repo, &1))
+    end)
+  end
+
+  defp find_pr_by_branch_prefix(repos, lower) do
+    Enum.find_value(repos, &open_pr_with_branch_prefix(&1, lower))
+  end
+
+  defp find_pr_by_linear_branch(repos, branch) when is_binary(branch) and branch != "" do
+    Enum.find_value(repos, &open_pr_for_head(&1, branch))
+  end
+
+  defp find_pr_by_linear_branch(_repos, _branch), do: nil
+
+  defp open_pr_for_head(repo, branch) do
+    case System.cmd("gh", ["pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--json", "url,headRefName", "--jq", ".[0]"], stderr_to_stdout: true) do
+      {output, 0} -> parse_pr_result(output)
+      _ -> nil
+    end
+  end
+
+  defp open_pr_with_branch_prefix(repo, lower) do
+    case System.cmd("gh", ["pr", "list", "--repo", repo, "--state", "open", "--json", "url,headRefName", "--limit", "50"], stderr_to_stdout: true) do
+      {output, 0} ->
+        case Jason.decode(output) do
+          {:ok, prs} when is_list(prs) -> Enum.find_value(prs, &pr_with_branch_prefix(&1, lower))
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp pr_with_branch_prefix(pr, lower) do
+    branch = pr["headRefName"] || ""
+
+    if String.starts_with?(String.downcase(branch), lower <> "-") or String.downcase(branch) == lower do
+      parse_pr_result(Jason.encode!(pr))
+    end
+  end
 
   defp parse_pr_result(output) do
     trimmed = String.trim(output)
@@ -4210,8 +4267,7 @@ defmodule SymphonyElixir.Orchestrator do
     normalized_old = old_phase && String.downcase(old_phase)
 
     cond do
-      (normalized_new && String.contains?(normalized_new, "implement")) and
-          (normalized_old == nil or not String.contains?(normalized_old, "implement")) ->
+      entered_phase?(normalized_new, normalized_old, "implement") ->
         History.record_event(%{
           run_id: run_id,
           event_type: "milestone_first_edit",
@@ -4219,8 +4275,7 @@ defmodule SymphonyElixir.Orchestrator do
           timestamp: now
         })
 
-      (normalized_new && String.contains?(normalized_new, "test")) and
-          (normalized_old == nil or not String.contains?(normalized_old, "test")) ->
+      entered_phase?(normalized_new, normalized_old, "test") ->
         History.record_event(%{
           run_id: run_id,
           event_type: "milestone_tests_run",
@@ -4231,6 +4286,11 @@ defmodule SymphonyElixir.Orchestrator do
       true ->
         :ok
     end
+  end
+
+  defp entered_phase?(normalized_new, normalized_old, keyword) do
+    (normalized_new && String.contains?(normalized_new, keyword)) and
+      (normalized_old == nil or not String.contains?(normalized_old, keyword))
   end
 
   defp record_max_retries_event(_state, issue_id, identifier, attempt) do

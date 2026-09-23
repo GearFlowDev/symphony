@@ -1741,12 +1741,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       _pid ->
         :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, SymphonyElixir.AgentRuntimeSupervisor)
 
-        on_exit(fn ->
-          case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.AgentRuntimeSupervisor) do
-            {:ok, _pid} -> :ok
-            {:error, {:already_started, _pid}} -> :ok
-          end
-        end)
+        on_exit(&restart_agent_runtime_supervisor/0)
+    end
+  end
+
+  defp restart_agent_runtime_supervisor do
+    case Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.AgentRuntimeSupervisor) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
     end
   end
 

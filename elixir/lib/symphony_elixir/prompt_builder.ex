@@ -97,25 +97,31 @@ defmodule SymphonyElixir.PromptBuilder do
   defp render_rows_md([]), do: ""
 
   defp render_rows_md(rows) when is_list(rows) do
-    Enum.map_join(rows, "\n\n", fn row ->
-      id = Map.get(row, "id") || Map.get(row, :id) || "?"
-      desc = Map.get(row, "description") || Map.get(row, :description) || ""
-      touches = Map.get(row, "touches") || Map.get(row, :touches) || []
-      tests = Map.get(row, "tests") || Map.get(row, :tests) || []
-      deps = Map.get(row, "depends_on") || Map.get(row, :depends_on) || []
-      state = Map.get(row, "state") || Map.get(row, :state) || "missing"
-      rationale = Map.get(row, "rationale") || Map.get(row, :rationale)
+    Enum.map_join(rows, "\n\n", &render_row_md/1)
+  end
 
-      lines = [
-        "- **#{id}** (#{state}): #{desc}",
-        format_list_line("Touches", touches),
-        format_list_line("Tests", tests),
-        format_list_line("Depends on", deps),
-        if(rationale, do: "  - Note: #{rationale}", else: nil)
-      ]
+  defp render_row_md(row) do
+    id = row_field(row, "id", :id, "?")
+    desc = row_field(row, "description", :description, "")
+    touches = row_field(row, "touches", :touches, [])
+    tests = row_field(row, "tests", :tests, [])
+    deps = row_field(row, "depends_on", :depends_on, [])
+    state = row_field(row, "state", :state, "missing")
+    rationale = row_field(row, "rationale", :rationale, nil)
 
-      lines |> Enum.reject(&is_nil/1) |> Enum.join("\n")
-    end)
+    lines = [
+      "- **#{id}** (#{state}): #{desc}",
+      format_list_line("Touches", touches),
+      format_list_line("Tests", tests),
+      format_list_line("Depends on", deps),
+      if(rationale, do: "  - Note: #{rationale}", else: nil)
+    ]
+
+    lines |> Enum.reject(&is_nil/1) |> Enum.join("\n")
+  end
+
+  defp row_field(row, string_key, atom_key, default) do
+    Map.get(row, string_key) || Map.get(row, atom_key) || default
   end
 
   defp format_list_line(_label, []), do: nil
@@ -249,15 +255,11 @@ defmodule SymphonyElixir.PromptBuilder do
     stages = StageLoader.load_stages(stages_dir)
 
     # Build completed phases list
-    completed_list =
-      completed_phases
-      |> Enum.map(&"- #{&1}")
-      |> Enum.join("\n")
+    completed_list = Enum.map_join(completed_phases, "\n", &"- #{&1}")
 
     # Build missing phases content by extracting each phase's section from the stage files
     missing_content =
-      missing_phases
-      |> Enum.map(fn phase ->
+      Enum.map_join(missing_phases, "\n\n---\n\n", fn phase ->
         content = StageLoader.phase_content(stages, phase)
 
         if content do
@@ -266,7 +268,6 @@ defmodule SymphonyElixir.PromptBuilder do
           "### #{phase} (INCOMPLETE)\n\nComplete the #{phase} phase."
         end
       end)
-      |> Enum.join("\n\n---\n\n")
 
     # Load retask template or use default
     template = StageLoader.load_retask_template(stages_dir) || default_retask_template()
@@ -361,12 +362,10 @@ defmodule SymphonyElixir.PromptBuilder do
 
   defp format_comments_section(comments) do
     formatted =
-      comments
-      |> Enum.map(fn c ->
+      Enum.map_join(comments, "\n", fn c ->
         time = if c[:created_at], do: Calendar.strftime(c.created_at, "%H:%M UTC"), else: "?"
         "  [#{time}] #{c[:author]}: #{c[:body]}"
       end)
-      |> Enum.join("\n")
 
     """
 

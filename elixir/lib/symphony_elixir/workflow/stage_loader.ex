@@ -19,17 +19,19 @@ defmodule SymphonyElixir.Workflow.StageLoader do
         files
         |> Enum.filter(&String.ends_with?(&1, ".md"))
         |> Enum.sort()
-        |> Enum.reduce(%{}, fn filename, acc ->
-          path = Path.join(stages_dir, filename)
-
-          case File.read(path) do
-            {:ok, content} -> Map.put(acc, filename, content)
-            {:error, _} -> acc
-          end
-        end)
+        |> Enum.reduce(%{}, &put_stage_content(stages_dir, &1, &2))
 
       {:error, _} ->
         %{}
+    end
+  end
+
+  defp put_stage_content(stages_dir, filename, acc) do
+    path = Path.join(stages_dir, filename)
+
+    case File.read(path) do
+      {:ok, content} -> Map.put(acc, filename, content)
+      {:error, _} -> acc
     end
   end
 
@@ -86,12 +88,10 @@ defmodule SymphonyElixir.Workflow.StageLoader do
 
   defp format_comments(comments) do
     formatted =
-      comments
-      |> Enum.map(fn c ->
+      Enum.map_join(comments, "\n", fn c ->
         time = if c[:created_at], do: Calendar.strftime(c.created_at, "%H:%M UTC"), else: "?"
         "  [#{time}] #{c[:author]}: #{c[:body]}"
       end)
-      |> Enum.join("\n")
 
     """
 
@@ -201,20 +201,21 @@ defmodule SymphonyElixir.Workflow.StageLoader do
           |> Enum.filter(&String.ends_with?(&1, ".md"))
           |> Enum.sort()
 
-        stamps =
-          Enum.map(md_files, fn filename ->
-            path = Path.join(stages_dir, filename)
-
-            case File.stat(path, time: :posix) do
-              {:ok, stat} -> {filename, stat.mtime, stat.size}
-              {:error, _} -> {filename, 0, 0}
-            end
-          end)
+        stamps = Enum.map(md_files, &stage_file_stamp(stages_dir, &1))
 
         {:ok, :erlang.phash2(stamps)}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp stage_file_stamp(stages_dir, filename) do
+    path = Path.join(stages_dir, filename)
+
+    case File.stat(path, time: :posix) do
+      {:ok, stat} -> {filename, stat.mtime, stat.size}
+      {:error, _} -> {filename, 0, 0}
     end
   end
 end

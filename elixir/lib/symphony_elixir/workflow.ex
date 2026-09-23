@@ -3,8 +3,8 @@ defmodule SymphonyElixir.Workflow do
   Loads workflow configuration and prompt from WORKFLOW.md.
   """
 
-  alias SymphonyElixir.WorkflowStore
   alias SymphonyElixir.Workflow.StageLoader
+  alias SymphonyElixir.WorkflowStore
 
   @workflow_file_name "WORKFLOW.md"
   @local_workflow_file_name "WORKFLOW.local.md"
@@ -79,19 +79,7 @@ defmodule SymphonyElixir.Workflow do
 
         # Check for staged workflow directory relative to workflow file
         stages_dir = stages_directory()
-
-        prompt_template =
-          if File.dir?(stages_dir) do
-            stages = StageLoader.load_stages(stages_dir)
-
-            if map_size(stages) > 0 do
-              StageLoader.assemble_prompt(stages)
-            else
-              prompt
-            end
-          else
-            prompt
-          end
+        prompt_template = staged_prompt_template(stages_dir, prompt)
 
         {:ok,
          %{
@@ -105,6 +93,20 @@ defmodule SymphonyElixir.Workflow do
 
       {:error, reason} ->
         {:error, {:workflow_parse_error, reason}}
+    end
+  end
+
+  defp staged_prompt_template(stages_dir, prompt) do
+    if File.dir?(stages_dir) do
+      stages = StageLoader.load_stages(stages_dir)
+
+      if map_size(stages) > 0 do
+        StageLoader.assemble_prompt(stages)
+      else
+        prompt
+      end
+    else
+      prompt
     end
   end
 

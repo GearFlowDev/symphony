@@ -17,7 +17,7 @@ defmodule SymphonyElixir.Planning.Workflow do
   require Logger
 
   alias SymphonyElixir.Planning
-  alias SymphonyElixir.Planning.{Auditor, Plan, Planner, Grader, Dispatch}
+  alias SymphonyElixir.Planning.{Auditor, Dispatch, Grader, Plan, Planner}
 
   @type assess_result ::
           {:has_open_rows, Plan.t(), [map()]}
@@ -47,16 +47,7 @@ defmodule SymphonyElixir.Planning.Workflow do
           # already on the WIP branch, and feed the summary in as
           # :audit_summary. Auditor failures don't block planning; we just
           # plan from the issue body alone.
-          audit_summary =
-            case Auditor.audit(issue, pr_url: opts[:pr_url]) do
-              {:ok, summary} ->
-                summary
-
-              {:error, reason} ->
-                Logger.warning("Auditor failed for #{identifier}: #{inspect(reason)}; planning from issue body only")
-                nil
-            end
-
+          audit_summary = audit_summary(issue, identifier, opts)
           Planner.plan(issue, Keyword.put(opts, :audit_summary, audit_summary))
 
         %Plan{} = plan ->
@@ -64,14 +55,26 @@ defmodule SymphonyElixir.Planning.Workflow do
       end
 
     case plan_result do
-      {:ok, plan} ->
-        case Plan.open_rows(plan) do
-          [] -> {:ok, {:complete, plan}}
-          rows -> {:ok, {:has_open_rows, plan, rows}}
-        end
+      {:ok, plan} -> {:ok, open_rows_result(plan)}
+      err -> err
+    end
+  end
 
-      err ->
-        err
+  defp audit_summary(issue, identifier, opts) do
+    case Auditor.audit(issue, pr_url: opts[:pr_url]) do
+      {:ok, summary} ->
+        summary
+
+      {:error, reason} ->
+        Logger.warning("Auditor failed for #{identifier}: #{inspect(reason)}; planning from issue body only")
+        nil
+    end
+  end
+
+  defp open_rows_result(plan) do
+    case Plan.open_rows(plan) do
+      [] -> {:complete, plan}
+      rows -> {:has_open_rows, plan, rows}
     end
   end
 

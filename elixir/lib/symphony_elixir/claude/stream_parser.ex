@@ -67,18 +67,21 @@ defmodule SymphonyElixir.Claude.StreamParser do
     # so token accounting reflects actual API usage.
     cache_creation = integer_field(usage, ["cache_creation_input_tokens", :cache_creation_input_tokens])
     cache_read = integer_field(usage, ["cache_read_input_tokens", :cache_read_input_tokens])
-    effective_input = (input || 0) + (cache_creation || 0) + (cache_read || 0)
+    effective_input = zero_if_nil(input) + zero_if_nil(cache_creation) + zero_if_nil(cache_read)
 
-    if input || output || total || cache_creation || cache_read do
+    if Enum.any?([input, output, total, cache_creation, cache_read]) do
       %{
         input_tokens: effective_input,
-        output_tokens: output || 0,
-        total_tokens: total || effective_input + (output || 0)
+        output_tokens: zero_if_nil(output),
+        total_tokens: total || effective_input + zero_if_nil(output)
       }
     end
   end
 
   defp normalize_usage(_), do: nil
+
+  defp zero_if_nil(nil), do: 0
+  defp zero_if_nil(value), do: value
 
   defp normalize_event(payload) do
     type = Map.get(payload, "type") || Map.get(payload, :type)
@@ -243,45 +246,54 @@ defmodule SymphonyElixir.Claude.StreamParser do
   defp infer_phase_from_tools([]), do: nil
 
   defp infer_phase_from_tools(tool_uses) do
-    Enum.find_value(tool_uses, fn {name, input} ->
-      command = get_command(input)
+    Enum.find_value(tool_uses, fn {name, input} -> infer_phase_from_tool(name, input) end)
+  end
 
-      cond do
-        # Ship: gh pr create, git push
-        name == "Bash" and command_matches?(command, ["gh pr create", "git push"]) ->
-          "Ship"
+  defp infer_phase_from_tool("Bash", input) do
+    command = get_command(input)
 
-        # Test: mix test, mix check, playwright
-        name == "Bash" and command_matches?(command, @test_commands) ->
-          "Test"
+    cond do
+      # Ship: gh pr create, git push
+      command_matches?(command, ["gh pr create", "git push"]) ->
+        "Ship"
 
-        name == "Bash" and String.contains?(command, "playwright") ->
-          "Test"
+      # Test: mix test, mix check, playwright
+      command_matches?(command, @test_commands) ->
+        "Test"
 
-        String.starts_with?(name, "mcp__playwright") or
-            String.starts_with?(name, "mcp__plugin_playwright") ->
-          "Test"
+      String.contains?(command, "playwright") ->
+        "Test"
 
-        # Ship: Agent tool (often used for PR creation)
-        name in @ship_tools and agent_is_pr?(input) ->
-          "Ship"
+      # Bash with curl to Linear API = sharing evidence
+      command_matches?(command, ["curl", "linear.app"]) ->
+        "Share Evidence"
 
-        # Implement: Edit, Write
-        name in @implement_tools ->
-          "Implement"
+      true ->
+        nil
+    end
+  end
 
-        # Investigate: Read, Grep, Glob, search
-        name in @investigate_tools ->
-          "Investigate"
+  defp infer_phase_from_tool(name, input) do
+    cond do
+      String.starts_with?(name, "mcp__playwright") or
+          String.starts_with?(name, "mcp__plugin_playwright") ->
+        "Test"
 
-        # Bash with curl to Linear API = sharing evidence
-        name == "Bash" and command_matches?(command, ["curl", "linear.app"]) ->
-          "Share Evidence"
+      # Ship: Agent tool (often used for PR creation)
+      name in @ship_tools and agent_is_pr?(input) ->
+        "Ship"
 
-        true ->
-          nil
-      end
-    end)
+      # Implement: Edit, Write
+      name in @implement_tools ->
+        "Implement"
+
+      # Investigate: Read, Grep, Glob, search
+      name in @investigate_tools ->
+        "Investigate"
+
+      true ->
+        nil
+    end
   end
 
   defp get_command(input) when is_map(input) do

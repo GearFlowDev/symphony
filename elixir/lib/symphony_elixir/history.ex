@@ -4,8 +4,8 @@ defmodule SymphonyElixir.History do
   """
 
   import Ecto.Query
-  alias SymphonyElixir.Repo
   alias SymphonyElixir.History.{Run, RunEvent, TesterVerdict}
+  alias SymphonyElixir.Repo
 
   # ---------------------------------------------------------------------------
   # Write operations

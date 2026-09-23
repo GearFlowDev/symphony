@@ -211,17 +211,15 @@ defmodule SymphonyElixir.Claude.AgentRunner do
           "Completed Claude agent turn for #{issue_context(issue)} workspace=#{ctx.workspace} turn=#{turn_number}/#{ctx.max_turns} progress=#{inspect(progress)} no_progress_count=#{next_no_progress}"
         )
 
-        cond do
-          # Stop a stuck agent: no workspace progress for several turns in a row.
-          # Completion routing (plan done / re-dispatch) is the orchestrator's job
-          # via the Grader, not this in-run loop.
-          next_no_progress >= 3 ->
-            Logger.warning("No progress for #{next_no_progress} consecutive turns for #{issue_context(issue)}, stopping early")
+        # Stop a stuck agent: no workspace progress for several turns in a row.
+        # Completion routing (plan done / re-dispatch) is the orchestrator's job
+        # via the Grader, not this in-run loop.
+        if next_no_progress >= 3 do
+          Logger.warning("No progress for #{next_no_progress} consecutive turns for #{issue_context(issue)}, stopping early")
 
-            :ok
-
-          true ->
-            maybe_send_next_turn(ctx, issue, session, watcher, turn_number, comments_after, next_no_progress)
+          :ok
+        else
+          maybe_send_next_turn(ctx, issue, session, watcher, turn_number, comments_after, next_no_progress)
         end
 
       {:error, reason} ->

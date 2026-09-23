@@ -6,6 +6,8 @@ defmodule SymphonyElixir.History.RunEvent do
   use Ecto.Schema
   import Ecto.Changeset
 
+  @type t :: %__MODULE__{}
+
   schema "run_events" do
     field(:run_id, :binary_id)
     field(:event_type, :string)

@@ -52,15 +52,7 @@ defmodule SymphonyElixir.Notifier do
 
     # Post Linear comment (skip for operational events)
     if is_binary(issue_id) and event_type not in @webhook_only_events do
-      body = format_linear_comment(event_type, details)
-
-      case comment_fn.(issue_id, body) do
-        :ok ->
-          Logger.info("Notifier: posted #{event_type} comment on #{details[:identifier] || issue_id}")
-
-        {:error, reason} ->
-          Logger.warning("Notifier: failed to post comment for #{event_type}: #{inspect(reason)}")
-      end
+      post_linear_comment(event_type, details, issue_id, comment_fn)
     else
       Logger.info("Notifier: #{event_type} for #{details[:identifier] || issue_id} (webhook only)")
     end
@@ -69,19 +61,35 @@ defmodule SymphonyElixir.Notifier do
     webhook_url = Config.escalation_webhook_url()
 
     if is_binary(webhook_url) do
-      payload = build_webhook_payload(event_type, details)
-
-      case webhook_fn.(webhook_url, payload) do
-        :ok ->
-          Logger.info("Notifier: sent #{event_type} webhook")
-
-        {:error, reason} ->
-          Logger.warning("Notifier: webhook failed for #{event_type}: #{inspect(reason)}")
-      end
+      send_webhook_notification(event_type, details, webhook_url, webhook_fn)
     end
   rescue
     error ->
       Logger.warning("Notifier: unexpected error in #{event_type}: #{Exception.message(error)}")
+  end
+
+  defp post_linear_comment(event_type, details, issue_id, comment_fn) do
+    body = format_linear_comment(event_type, details)
+
+    case comment_fn.(issue_id, body) do
+      :ok ->
+        Logger.info("Notifier: posted #{event_type} comment on #{details[:identifier] || issue_id}")
+
+      {:error, reason} ->
+        Logger.warning("Notifier: failed to post comment for #{event_type}: #{inspect(reason)}")
+    end
+  end
+
+  defp send_webhook_notification(event_type, details, webhook_url, webhook_fn) do
+    payload = build_webhook_payload(event_type, details)
+
+    case webhook_fn.(webhook_url, payload) do
+      :ok ->
+        Logger.info("Notifier: sent #{event_type} webhook")
+
+      {:error, reason} ->
+        Logger.warning("Notifier: webhook failed for #{event_type}: #{inspect(reason)}")
+    end
   end
 
   # ---------------------------------------------------------------------------

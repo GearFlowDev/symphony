@@ -14,8 +14,8 @@ defmodule SymphonyElixir.Planning do
 
   import Ecto.Query
   require Logger
+  alias SymphonyElixir.Planning.{Dispatch, Plan}
   alias SymphonyElixir.Repo
-  alias SymphonyElixir.Planning.{Plan, Dispatch}
   alias SymphonyElixir.Tracker
 
   # ---------------------------------------------------------------------------
@@ -62,17 +62,7 @@ defmodule SymphonyElixir.Planning do
 
     case plan.linear_comment_id do
       nil ->
-        case Tracker.create_comment_with_id(plan.issue_id, body) do
-          {:ok, comment_id} ->
-            case update_plan(plan, %{linear_comment_id: comment_id}) do
-              {:ok, updated} -> updated
-              _ -> plan
-            end
-
-          {:error, reason} ->
-            Logger.warning("Plan mirror: failed to post comment for #{plan.issue_identifier}: #{inspect(reason)}")
-            plan
-        end
+        post_plan_comment(plan, body)
 
       comment_id ->
         case Tracker.update_comment(comment_id, body) do
@@ -86,6 +76,20 @@ defmodule SymphonyElixir.Planning do
     error ->
       Logger.error("Plan mirror crashed for #{plan.issue_identifier}: #{Exception.message(error)}")
       plan
+  end
+
+  defp post_plan_comment(plan, body) do
+    case Tracker.create_comment_with_id(plan.issue_id, body) do
+      {:ok, comment_id} ->
+        case update_plan(plan, %{linear_comment_id: comment_id}) do
+          {:ok, updated} -> updated
+          _ -> plan
+        end
+
+      {:error, reason} ->
+        Logger.warning("Plan mirror: failed to post comment for #{plan.issue_identifier}: #{inspect(reason)}")
+        plan
+    end
   end
 
   @doc "Render the plan as a Linear `## Plan` checklist comment."

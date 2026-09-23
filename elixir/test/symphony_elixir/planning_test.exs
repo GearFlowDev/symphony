@@ -2,7 +2,7 @@ defmodule SymphonyElixir.PlanningTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.Planning
-  alias SymphonyElixir.Planning.{Plan, Dispatch}
+  alias SymphonyElixir.Planning.{Dispatch, Plan, Planner}
   alias SymphonyElixir.Repo
 
   @moduletag :planning
@@ -80,7 +80,7 @@ defmodule SymphonyElixir.PlanningTest do
 
       ExUnit.CaptureLog.capture_log(fn ->
         assert {:error, {:start_session_failed, :model_unavailable}} =
-                 SymphonyElixir.Planning.Planner.plan(issue, opts)
+                 Planner.plan(issue, opts)
       end)
 
       assert Process.get(:models_tried) == ["fable", "opus"]

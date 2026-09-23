@@ -11,7 +11,7 @@ defmodule SymphonyElixir.Workspace do
   # Recorded before the hook body runs, so an abandoned hook can be killed WITH
   # its children. `$$` is this shell; every process the hook starts hangs below
   # it, and closing the port only ever reaches the shell itself.
-  @hook_pid_preamble "printf '%s' \"$$\" > \"$SYMPHONY_HOOK_PIDFILE\" 2>/dev/null || true\n"
+  @hook_pid_preamble ~s(printf '%s' "$$" > "$SYMPHONY_HOOK_PIDFILE" 2>/dev/null || true\n)
   # A shell running `-c` will `exec` its LAST command and replace itself, which
   # loses both the recorded pid's identity (`still_our_hook?/1` reads the
   # command line for the marker) and the parent the children hang from. A
@@ -316,27 +316,31 @@ defmodule SymphonyElixir.Workspace do
   defp registry_leases do
     case local_dev_dir() do
       ld when is_binary(ld) ->
-        dir = Path.join(ld, "registry")
-
-        case File.ls(dir) do
-          {:ok, files} ->
-            files
-            |> Enum.filter(&Regex.match?(~r/^gf_(?:platform|procurement)-slot\d+\.json$/, &1))
-            |> Enum.flat_map(fn file ->
-              with {:ok, content} <- File.read(Path.join(dir, file)),
-                   {:ok, lease} <- Jason.decode(content) do
-                [{String.replace_suffix(file, ".json", ""), lease}]
-              else
-                _ -> []
-              end
-            end)
-
-          _ ->
-            []
-        end
+        ld |> Path.join("registry") |> read_registry_leases()
 
       _ ->
         []
+    end
+  end
+
+  defp read_registry_leases(dir) do
+    case File.ls(dir) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&Regex.match?(~r/^gf_(?:platform|procurement)-slot\d+\.json$/, &1))
+        |> Enum.flat_map(&read_registry_lease(dir, &1))
+
+      _ ->
+        []
+    end
+  end
+
+  defp read_registry_lease(dir, file) do
+    with {:ok, content} <- File.read(Path.join(dir, file)),
+         {:ok, lease} <- Jason.decode(content) do
+      [{String.replace_suffix(file, ".json", ""), lease}]
+    else
+      _ -> []
     end
   end
 
@@ -410,18 +414,20 @@ defmodule SymphonyElixir.Workspace do
         ["-C", slot_dir, "checkout", "main"],
         ["-C", slot_dir, "reset", "--hard", "origin/main"]
       ]
-      |> Enum.reduce(true, fn args, ok ->
-        case System.cmd("git", args, stderr_to_stdout: true) do
-          {_, 0} ->
-            ok
-
-          {out, code} ->
-            Logger.warning("git #{Enum.join(args, " ")} failed (#{code}) in #{slot_dir}: #{String.trim(out)}")
-            false
-        end
-      end)
+      |> Enum.reduce(true, &run_slot_reset_step(slot_dir, &1, &2))
     else
       true
+    end
+  end
+
+  defp run_slot_reset_step(slot_dir, args, ok) do
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {_, 0} ->
+        ok
+
+      {out, code} ->
+        Logger.warning("git #{Enum.join(args, " ")} failed (#{code}) in #{slot_dir}: #{String.trim(out)}")
+        false
     end
   end
 
@@ -650,12 +656,7 @@ defmodule SymphonyElixir.Workspace do
       {output, 0} ->
         output
         |> String.split(~r/\s+/, trim: true)
-        |> Enum.flat_map(fn token ->
-          case Integer.parse(token) do
-            {child, ""} -> [child]
-            _ -> []
-          end
-        end)
+        |> Enum.flat_map(&parse_pid_token/1)
 
       _ ->
         []
@@ -666,6 +667,13 @@ defmodule SymphonyElixir.Workspace do
     error ->
       Logger.warning("Cannot enumerate hook child processes pid=#{pid}: #{Exception.message(error)}")
       []
+  end
+
+  defp parse_pid_token(token) do
+    case Integer.parse(token) do
+      {child, ""} -> [child]
+      _ -> []
+    end
   end
 
   # Outside the workspace on purpose. A bootstrap `after_create` hook is often

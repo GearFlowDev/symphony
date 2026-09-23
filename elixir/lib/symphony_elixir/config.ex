@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Config do
   """
 
   alias NimbleOptions
+  alias SymphonyElixir.Linear.FilterBuilder
   alias SymphonyElixir.Workflow
 
   @default_active_states ["Todo", "In Progress"]
@@ -401,7 +402,7 @@ defmodule SymphonyElixir.Config do
   @spec required_issue_labels() :: [String.t()]
   def required_issue_labels do
     linear_filter()
-    |> SymphonyElixir.Linear.FilterBuilder.include_labels()
+    |> FilterBuilder.include_labels()
     |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
@@ -884,11 +885,14 @@ defmodule SymphonyElixir.Config do
          :ok <- require_tracker_kind(),
          :ok <- require_linear_token(),
          :ok <- require_linear_target() do
-      case agent_backend() do
-        "claude" -> require_claude_command()
-        _ -> with(:ok <- require_valid_codex_runtime_settings(), do: require_codex_command())
-      end
+      require_agent_backend_command(agent_backend())
     end
+  end
+
+  defp require_agent_backend_command("claude"), do: require_claude_command()
+
+  defp require_agent_backend_command(_backend) do
+    with :ok <- require_valid_codex_runtime_settings(), do: require_codex_command()
   end
 
   @spec codex_runtime_settings(Path.t() | nil) :: {:ok, codex_runtime_settings()} | {:error, term()}
@@ -933,7 +937,7 @@ defmodule SymphonyElixir.Config do
       "linear" ->
         filter = linear_filter()
 
-        if SymphonyElixir.Linear.FilterBuilder.valid?(filter) do
+        if FilterBuilder.valid?(filter) do
           :ok
         else
           {:error, :missing_linear_filter}

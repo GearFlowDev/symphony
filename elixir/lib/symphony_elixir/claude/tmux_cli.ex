@@ -203,7 +203,7 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
   Returns the list of session names reaped. Safe to call when no tmux server is
   running (returns `[]`).
   """
-  @spec reap_orphan_sessions(String.t()) :: [String.t()]
+  @spec reap_orphan_sessions(String.t() | nil) :: [String.t()]
   def reap_orphan_sessions(prefix \\ nil), do: reap_orphan_sessions_except([], prefix: prefix)
 
   @doc """

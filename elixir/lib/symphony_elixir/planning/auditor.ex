@@ -55,24 +55,28 @@ defmodule SymphonyElixir.Planning.Auditor do
     identifier = Map.get(issue, :identifier) || Map.get(issue, "identifier")
 
     if is_binary(identifier) do
-      case run([
-             "gh",
-             "search",
-             "prs",
-             "--state=open",
-             "--json=url",
-             "--match=title,body",
-             identifier
-           ]) do
-        {:ok, json} ->
-          case Jason.decode(json) do
-            {:ok, [%{"url" => url} | _]} -> url
-            _ -> nil
-          end
+      search_open_pr_url(identifier)
+    end
+  end
 
-        _ ->
-          nil
-      end
+  defp search_open_pr_url(identifier) do
+    case run([
+           "gh",
+           "search",
+           "prs",
+           "--state=open",
+           "--json=url",
+           "--match=title,body",
+           identifier
+         ]) do
+      {:ok, json} ->
+        case Jason.decode(json) do
+          {:ok, [%{"url" => url} | _]} -> url
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 

@@ -4074,7 +4074,7 @@ defmodule SymphonyElixir.Orchestrator do
     result =
       find_pr_by_exact_branch(repos, branches) ||
         find_pr_by_branch_prefix(repos, lower) ||
-        find_pr_by_linear_branch(repos, Map.get(issue, :git_branch_name))
+        find_pr_by_linear_branch(repos, issue.branch_name)
 
     case result do
       nil -> :no_pr

@@ -222,7 +222,7 @@ defmodule SymphonyElixir.Linear.Client do
   Fetch comments on an issue, optionally filtered to those created after `since`.
   Returns `{:ok, [%{body: String.t(), author: String.t(), created_at: DateTime.t()}]}`.
   """
-  @spec fetch_issue_comments(String.t(), DateTime.t() | nil) :: {:ok, list(map())} | {:error, term()}
+  @spec fetch_issue_comments(String.t(), DateTime.t() | nil) :: {:ok, list(map())}
   @agent_prefix "@agent"
 
   def fetch_issue_comments(issue_id, since \\ nil) when is_binary(issue_id) do
@@ -267,7 +267,7 @@ defmodule SymphonyElixir.Linear.Client do
   Fetch ALL comments on an issue (no @agent filter). Used by the evaluator
   to check for evidence and plan comments posted by the agent itself.
   """
-  @spec fetch_all_issue_comments(String.t()) :: {:ok, list(map())} | {:error, term()}
+  @spec fetch_all_issue_comments(String.t()) :: {:ok, list(map())}
   def fetch_all_issue_comments(issue_id) when is_binary(issue_id) do
     case graphql(@comments_query, %{issueId: issue_id, first: 50}) do
       {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}}} ->

@@ -146,10 +146,10 @@ defmodule SymphonyElixir.Claude.StreamParser do
   @doc """
   Extract a `SYMPHONY_VERDICT` marker from an event.
 
-  Returns `{verdict, commit_sha | nil}` (verdict is "APPROVE" | "REQUEST_CHANGES"
-  | "BLOCKED") or nil when no marker is present.
+  Returns `{verdict, commit_sha | nil, reason | nil}` (verdict is "APPROVE" |
+  "REQUEST_CHANGES" | "BLOCKED") or nil when no marker is present.
   """
-  @spec extract_verdict(map()) :: {String.t(), String.t() | nil} | nil
+  @spec extract_verdict(map()) :: {String.t(), String.t() | nil, String.t() | nil} | nil
   def extract_verdict(%{event_type: :assistant} = event) do
     event |> extract_text_content() |> detect_verdict()
   end

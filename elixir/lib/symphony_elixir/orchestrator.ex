@@ -1901,24 +1901,20 @@ defmodule SymphonyElixir.Orchestrator do
   # its prompt, so neither its start nor its finish may mark the comment
   # handled. Returns {:ok, body} | :none. Best-effort: fetch errors → :none.
   defp fresh_agent_feedback(issue, plan) do
-    case Client.fetch_issue_comments(Map.get(issue, :id)) do
-      {:ok, comments} ->
-        latest =
-          comments
-          |> Enum.filter(fn c -> c.created_at != nil and is_binary(c.body) and String.trim(c.body) != "" end)
-          |> Enum.max_by(fn c -> DateTime.to_unix(c.created_at) end, fn -> nil end)
+    {:ok, comments} = Client.fetch_issue_comments(Map.get(issue, :id))
 
-        last = last_feedback_dispatch_start(plan)
+    latest =
+      comments
+      |> Enum.filter(fn c -> c.created_at != nil and is_binary(c.body) and String.trim(c.body) != "" end)
+      |> Enum.max_by(fn c -> DateTime.to_unix(c.created_at) end, fn -> nil end)
 
-        cond do
-          is_nil(latest) -> :none
-          is_nil(last) -> {:ok, latest.body}
-          DateTime.compare(latest.created_at, last) == :gt -> {:ok, latest.body}
-          true -> :none
-        end
+    last = last_feedback_dispatch_start(plan)
 
-      _ ->
-        :none
+    cond do
+      is_nil(latest) -> :none
+      is_nil(last) -> {:ok, latest.body}
+      DateTime.compare(latest.created_at, last) == :gt -> {:ok, latest.body}
+      true -> :none
     end
   rescue
     _ -> :none
@@ -2221,26 +2217,21 @@ defmodule SymphonyElixir.Orchestrator do
   defp verdict_at_head?(_, _), do: false
 
   defp tester_gate_from_linear(issue, last_implement) do
-    case Client.fetch_all_issue_comments(Map.get(issue, :id)) do
-      {:ok, comments} ->
-        latest = latest_tester_report(comments)
+    {:ok, comments} = Client.fetch_all_issue_comments(Map.get(issue, :id))
+    latest = latest_tester_report(comments)
 
-        cond do
-          is_nil(latest) ->
-            :needs_test
-
-          not is_nil(last_implement) and DateTime.compare(latest.created_at, last_implement) != :gt ->
-            :needs_test
-
-          request_changes?(latest.body) ->
-            {:request_changes, "tester REQUEST_CHANGES at #{DateTime.to_iso8601(latest.created_at)}"}
-
-          true ->
-            :approved
-        end
-
-      _ ->
+    cond do
+      is_nil(latest) ->
         :needs_test
+
+      not is_nil(last_implement) and DateTime.compare(latest.created_at, last_implement) != :gt ->
+        :needs_test
+
+      request_changes?(latest.body) ->
+        {:request_changes, "tester REQUEST_CHANGES at #{DateTime.to_iso8601(latest.created_at)}"}
+
+      true ->
+        :approved
     end
   end
 
@@ -2300,7 +2291,6 @@ defmodule SymphonyElixir.Orchestrator do
   # tmux OneShot not becoming ready in time), not genuine "needs a human"
   # blocks. The poller retries active issues, so these recover on their own.
   defp transient_plan_failure?({:plan_assess_failed, {:start_session_failed, _}}), do: true
-  defp transient_plan_failure?({:start_session_failed, _}), do: true
   defp transient_plan_failure?(_), do: false
 
   defp latest_tester_report(comments) do
@@ -2321,8 +2311,6 @@ defmodule SymphonyElixir.Orchestrator do
     not strict_tester_approve?(body)
   end
 
-  defp request_changes?(_), do: false
-
   # Strict approve: `Recommendation: APPROVE` followed by end-of-line or
   # whitespace, with no qualifier like `APPROVE-AFTER-PUSH`. Tolerates markdown
   # bolding anywhere around the label, colon, or value — testers write any of
@@ -2340,8 +2328,6 @@ defmodule SymphonyElixir.Orchestrator do
         body
       )
   end
-
-  defp strict_tester_approve?(_), do: false
 
   defp last_implement_dispatch_finish(%SymphonyElixir.Planning.Plan{id: plan_id}) do
     SymphonyElixir.Planning.dispatches_for_plan(plan_id)
@@ -3448,7 +3434,7 @@ defmodule SymphonyElixir.Orchestrator do
       filter_source: "filter",
       started_at: now,
       agent_backend: Config.agent_backend(),
-      retry_attempt: normalize_retry_attempt(attempt) || 0
+      retry_attempt: normalize_retry_attempt(attempt)
     }
 
     case History.record_dispatch(attrs) do

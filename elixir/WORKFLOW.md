@@ -5,9 +5,21 @@ tracker:
   filter:
     labels:
       include:
-        - symphony-agent
+        # THE RUNNER LABEL, and the grant with it (GEA-9884, amended 2026-09-22).
+        # `auto-symphony` routes an issue to Symphony AND, on its own, confers
+        # `Auto-Merge`: build to mergeable and hand off. An `Auto-Build` or
+        # `Auto-Design` label beside it narrows the run to the PR. The agent pool
+        # never takes an issue carrying this label, and Symphony takes nothing else.
+        # The old `symphony-agent` label routes nothing.
+        - auto-symphony
+  # The machine-only mark a live run wears, applied on claim and removed on every
+  # ending. It mirrors the agent pool's `auto-working`, which the pool's own sweeps
+  # match and this one deliberately does not (GEA-9888). Humans never apply it.
+  working_label: symphony-working
+  # Todo is the dispatch queue and Shaping is parking — nothing dispatches from
+  # Shaping — so `Shaped` is gone and Shaping is not active. In Review keeps a run
+  # alive while its PR is judged.
   active_states:
-    - Shaped
     - Todo
     - In Progress
     - In Review
@@ -20,6 +32,12 @@ tracker:
 
 polling:
   interval_ms: 120000
+
+escalation:
+  # WHERE A RUN PARKS when it hands the issue back to a person. Shaping, not the
+  # `needs-human` label the harness retired on 2026-09-17: nothing dispatches from
+  # Shaping, so moving an issue there is what parking means now (GEA-9888).
+  needs_human_state: Shaping
 
 workspace:
   root: ~/code/symphony-workspaces
@@ -106,6 +124,20 @@ echo "Frontend: http://localhost:$FRONTEND_PORT"
 No description provided.
 {% endif %}
 
+## Your grant
+
+`auto-symphony` is why you are running: it routes this issue to Symphony **and** grants.
+
+- `auto-symphony` alone is `Auto-Merge`: build the work to mergeable and hand it off. The
+  harness judges the PR and merges it. You never merge.
+- `Auto-Build` or `Auto-Design` beside it **narrows** you: stop at the PR.
+- Never widen your own grant, and never add or remove the runner label.
+
+Symphony has already read those labels for you:
+
+- **Grant**: {{ grant.label }}
+- **Finish line**: {{ grant.finish_line }}
+
 ## Workflow
 
 Execute these phases in order. Do not skip phases.
@@ -184,25 +216,25 @@ Post test results — including screenshots — to the Linear issue:
    git rebase origin/main
    ```
    If there are conflicts, resolve them before continuing.
-3. Push the branch and open a **draft** PR (only if one doesn't already exist):
+3. Push the branch and open the PR in the SAME step, ready, never a draft (only if
+   one doesn't already exist):
    ```bash
    git push -u origin {{ issue.branch_name }}
    gh pr view --json number >/dev/null 2>&1 || \
-     gh pr create --draft --title "{{ issue.identifier }}: <title>" --body "<description>\n\nLinear: {{ issue.identifier }}"
+     gh pr create --title "{{ issue.identifier }}: <title>" --body "<description>\n\nLinear: {{ issue.identifier }}"
    ```
-   ALWAYS open it as a draft. Symphony iterates across multiple dispatches, so a
-   ready (non-draft) PR trips the "PR opened -> In Review" automation and pulls
-   CodeRabbit in to review half-finished work. The PR stays a draft until the work
-   is complete and verified.
+   A push without a PR is an unfinished step: whoever judges this work judges a pull
+   request, never a bare branch. Symphony used to hold every PR a draft because a
+   ready PR trips the "PR opened -> In Review" automation and pulls CodeRabbit onto
+   half-finished work; that is what the rest of the agent pool already lives with,
+   and completeness is decided by the grader and the hand-off instead.
 4. Post the PR link as a comment on the Linear issue.
 
 ### Phase 7: Done
 
 After shipping the PR, stop. Do not continue working. Do not look for more work.
-Leave the PR as a **draft** -- do NOT run `gh pr ready` and do NOT move the issue's
-status yourself. Symphony promotes the draft to ready-for-review once the plan is
-graded complete and the tester approves; that ready transition is what moves the
-issue to In Review and invites CodeRabbit.
+Do NOT run `gh pr ready` — the PR is already ready — and do NOT move the issue's
+status yourself. Your finish line above says who merges; it is never you.
 
 ## Environment Notes
 
@@ -225,8 +257,8 @@ If a PR already exists for this issue, run this checklist:
 3. **Code review comments**: Check with `gh pr view <number> --comments` and `gh api repos/{owner}/{repo}/pulls/{number}/reviews`. Triage and address actionable feedback, then push.
 4. **Incomplete testing**: If issue comments indicate testing gaps, go back to Phase 4 (Test).
 5. **All clear**: If CI is green, no conflicts, and reviews are addressed, push and stop.
-   Do NOT decide the issue is "done" or run `gh pr ready` — the grader decides completion
-   and Symphony promotes the draft once the tester approves.
+   Do NOT decide the issue is "done" and do NOT run `gh pr ready` — the grader decides
+   completion, and the PR has been ready since it was opened.
 
 After fixing any issues, re-run Phase 4 (Test) to verify nothing broke, then push.
 

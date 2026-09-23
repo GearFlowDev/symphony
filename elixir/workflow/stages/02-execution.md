@@ -54,7 +54,11 @@ grep -rn '\bthe_changed_name\b' lib/                                            
 
 Any call site that still uses the old contract is an unfinished row — update it (and its test) before pushing. A green suite does not prove you carried the callers; the orchestrator runs the same census and will send the work back if you didn't.
 
-### Step 4: Push
+### Step 4: Push, and open the PR in the same step
+
+**A push without a PR is an unfinished step, not a finished one.** Whoever judges this
+work — a person or the harness — judges a pull request, never a bare branch. So the push
+and the PR are one step and you do not end your turn between them.
 
 After all assigned rows have a passing test and a commit:
 
@@ -68,29 +72,28 @@ After all assigned rows have a passing test and a commit:
    git push -u origin {{ issue.branch_name }}
    ```
    If push fails non-fast-forward, `git push --force-with-lease` after confirming you're not stomping on other workers.
+3. Open the PR if this issue has none, **ready, never a draft**:
+   ```bash
+   gh pr list --head {{ issue.branch_name }} --state open --json url --jq '.[0].url'   # already open?
+   gh pr create --base "${BASE_BRANCH:-main}" --title "{{ issue.identifier }}: <title>" --body "Linear: {{ issue.identifier }}"
+   ```
+   The PR description doesn't need a Contract or audit block — the orchestrator manages that on Linear.
 
-### Step 5: PR
+Symphony used to hold every PR a draft until the plan graded complete, because a ready PR
+trips the "PR opened -> In Review" automation and pulls CodeRabbit onto half-finished work.
+That is the behaviour the rest of the agent pool already lives with, and completeness is
+decided by the grader and the hand-off, not by the draft flag. So the PR opens ready,
+there is no promotion step, and `gh pr ready` is a command you never run.
 
-If no PR exists for this issue, open one as a **draft** targeting `${BASE_BRANCH:-main}`:
-```bash
-gh pr create --draft --base "${BASE_BRANCH:-main}" --title "{{ issue.identifier }}: <title>" --body "Linear: {{ issue.identifier }}"
-```
-The PR description doesn't need a Contract or audit block — the orchestrator manages that on Linear.
-
-ALWAYS open the PR as a draft, and never run `gh pr ready`. Symphony iterates across
-multiple dispatches, so a ready (non-draft) PR trips the "PR opened -> In Review"
-automation and pulls reviewers (CodeRabbit) in on half-finished work. The PR stays a
-draft until the work is complete and verified; the orchestrator promotes it to
-ready-for-review once the plan grades complete and the tester approves.
-
-### Step 6: Stop
+### Step 5: Stop
 
 End your turn. Do not:
 - Post a status comment on Linear (orchestrator handles this).
 - Update a `WORKPAD.md` file (the plan lives in Symphony's database, not the repo).
 - Take screenshots or post test results (the Test phase has a tester sub-agent for that).
 - Re-run anything unless you broke a test.
-- Mark the PR ready for review / run `gh pr ready` (the orchestrator promotes it after tester approval).
+- Run `gh pr ready` — the PR you opened in Step 4 is already ready.
+- Merge the PR, or ask for it to be merged. Your finish line says who merges.
 
 The orchestrator's Grader will inspect your diff and test output, mark each assigned row `done` / `partial` / `missing`, and decide whether to dispatch another worker for the gaps or move to the Test phase.
 

@@ -51,6 +51,45 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @add_label_mutation """
+  mutation SymphonyAddLabel($issueId: String!, $labelId: String!) {
+    issueAddLabel(id: $issueId, labelId: $labelId) {
+      success
+    }
+  }
+  """
+
+  @remove_label_mutation """
+  mutation SymphonyRemoveLabel($issueId: String!, $labelId: String!) {
+    issueRemoveLabel(id: $issueId, labelId: $labelId) {
+      success
+    }
+  }
+  """
+
+  # ONE ROUND TRIP FOR THE ISSUE'S TEAM AND EVERY LABEL THAT WEARS THIS NAME.
+  # Label names collide across teams, and a workspace that has two `symphony-working`
+  # labels must not have another team's become this box's live-run marker: the caller
+  # below prefers the issue's own team, then a workspace-level label with no team.
+  # This is the same resolution the agent pool's surface does for `auto-working`.
+  @label_lookup_query """
+  query SymphonyResolveLabelId($issueId: String!, $name: String!) {
+    issue(id: $issueId) {
+      team {
+        id
+      }
+    }
+    issueLabels(filter: {name: {eqIgnoreCase: $name}}) {
+      nodes {
+        id
+        team {
+          id
+        }
+      }
+    }
+  }
+  """
+
   @viewer_query """
   query SymphonyViewer {
     viewer {
@@ -160,6 +199,61 @@ defmodule SymphonyElixir.Linear.Adapter do
       false -> {:error, :issue_update_failed}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :issue_update_failed}
+    end
+  end
+
+  @doc """
+  Put `label_name` on the issue. Idempotent: Linear's `issueAddLabel` on a label the
+  issue already carries succeeds and changes nothing, so a re-dispatch of a live run
+  does not have to ask first.
+  """
+  @spec add_label(String.t(), String.t()) :: :ok | {:error, term()}
+  def add_label(issue_id, label_name) when is_binary(issue_id) and is_binary(label_name) do
+    mutate_label(@add_label_mutation, "issueAddLabel", issue_id, label_name)
+  end
+
+  @doc """
+  Take `label_name` off the issue. Idempotent in the same way.
+  """
+  @spec remove_label(String.t(), String.t()) :: :ok | {:error, term()}
+  def remove_label(issue_id, label_name) when is_binary(issue_id) and is_binary(label_name) do
+    mutate_label(@remove_label_mutation, "issueRemoveLabel", issue_id, label_name)
+  end
+
+  defp mutate_label(mutation, field, issue_id, label_name) do
+    with {:ok, label_id} <- resolve_label_id(issue_id, label_name),
+         {:ok, response} <-
+           client_module().graphql(mutation, %{issueId: issue_id, labelId: label_id}),
+         true <- get_in(response, ["data", field, "success"]) == true do
+      :ok
+    else
+      false -> {:error, :label_update_failed}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :label_update_failed}
+    end
+  end
+
+  # The issue's own team's label wins; a workspace-level label (no team) is the
+  # fallback. Another team's same-named label is never adopted — see
+  # @label_lookup_query. A name nothing answers to is `:label_not_found`, which the
+  # caller logs rather than raising on: an unmarked board is worse than a stopped run.
+  defp resolve_label_id(issue_id, label_name) do
+    case client_module().graphql(@label_lookup_query, %{issueId: issue_id, name: label_name}) do
+      {:ok, response} ->
+        team_id = get_in(response, ["data", "issue", "team", "id"])
+        nodes = get_in(response, ["data", "issueLabels", "nodes"]) || []
+
+        candidate =
+          Enum.find(nodes, &(is_binary(team_id) and get_in(&1, ["team", "id"]) == team_id)) ||
+            Enum.find(nodes, &is_nil(&1["team"]))
+
+        case candidate do
+          %{"id" => id} when is_binary(id) -> {:ok, id}
+          _ -> {:error, :label_not_found}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

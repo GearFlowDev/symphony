@@ -69,7 +69,7 @@ This is the last phase, so the comment you post now becomes the issue's latest c
 Post a wrap-up comment on the **Linear issue** (NOT GitHub) with exactly these three parts:
 
 1. **Done** — what shipped, in one or two sentences, with the PR link. State CI status and whether review comments were addressed. If simplification changed nothing, say so in passing — don't make it the headline.
-2. **Next** — what remains, and whose move it is. Normally: "human review + merge approval." List any follow-ups you deliberately left out of scope.
+2. **Next** — what remains, and whose move it is. Your finish line above says who that is: under `Auto-Merge` the harness judges the hand-off and merges, and under `Auto-Build` or `Auto-Design` a person reviews and merges. List any follow-ups you deliberately left out of scope.
 3. **Where to look** — the branch name, the 2-3 files at the heart of the change, and a pointer to the evidence comment (screenshots) above if one exists. Reference artifacts; do not restate their contents.
 
 ```bash

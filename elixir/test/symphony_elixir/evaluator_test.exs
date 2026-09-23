@@ -97,4 +97,41 @@ defmodule SymphonyElixir.EvaluatorTest do
       assert length(checks) == 2
     end
   end
+
+  describe "ensure_pr_open/4" do
+    test "no workspace means no PR and no crash" do
+      assert Evaluator.ensure_pr_open(nil, "gea-1-branch", "GEA-1: x", "Linear: GEA-1") == nil
+      assert Evaluator.ensure_pr_open("/nonexistent/path", "gea-1-branch", "GEA-1: x", "b") == nil
+    end
+
+    test "a branch that is not on origin gets no PR" do
+      # An unpushed branch is a run that closed no rows, not a run missing its
+      # PR. Opening one here would publish work nobody graded.
+      dir = Path.join(System.tmp_dir!(), "symphony-evaluator-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+      {_, 0} = System.cmd("git", ["init", "--quiet", dir])
+
+      assert Evaluator.ensure_pr_open(dir, "gea-1-never-pushed", "GEA-1: x", "Linear: GEA-1") == nil
+    end
+
+    test "a PR left as a draft is finished rather than left unmergeable" do
+      # Pinned against the source because this arm needs a real `gh` and a real PR, which
+      # a unit test has neither of. Both strings are commands: deleting either reds this.
+      #
+      # WHY THE ARM EXISTS. Nothing promotes a draft any more — the promotion step went with
+      # the drafts — so a draft left by an older image would sit for ever, and
+      # `gh pr view --json mergeable` reports a draft as MERGEABLE, so nothing downstream
+      # would notice.
+      src = File.read!(Path.expand("../../lib/symphony_elixir/evaluator.ex", __DIR__))
+
+      assert src =~ "--json url,number,state,isDraft", "check_pr no longer asks whether the PR is a draft"
+      assert src =~ "gh pr ready ", "a draft PR is no longer made ready"
+    end
+
+    test "a blank or missing branch name is not a PR to open" do
+      assert Evaluator.ensure_pr_open("/tmp", "", "GEA-1: x", "Linear: GEA-1") == nil
+      assert Evaluator.ensure_pr_open("/tmp", nil, "GEA-1: x", "Linear: GEA-1") == nil
+    end
+  end
 end

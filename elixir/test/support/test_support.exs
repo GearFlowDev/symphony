@@ -98,6 +98,7 @@ defmodule SymphonyElixir.TestSupport do
           tracker_filter: %{"labels" => %{"include" => ["symphony-agent"]}},
           tracker_assignee: nil,
           tracker_claim_assignee: nil,
+          tracker_working_label: nil,
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
@@ -129,6 +130,7 @@ defmodule SymphonyElixir.TestSupport do
           escalation_eval_score_threshold: nil,
           escalation_webhook_url: nil,
           escalation_needs_human_state: nil,
+          hand_off_command: nil,
           prompt: @workflow_prompt
         ],
         overrides
@@ -140,6 +142,7 @@ defmodule SymphonyElixir.TestSupport do
     tracker_filter = Keyword.get(config, :tracker_filter)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_claim_assignee = Keyword.get(config, :tracker_claim_assignee)
+    tracker_working_label = Keyword.get(config, :tracker_working_label)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
@@ -171,6 +174,7 @@ defmodule SymphonyElixir.TestSupport do
     escalation_eval_score_threshold = Keyword.get(config, :escalation_eval_score_threshold)
     escalation_webhook_url = Keyword.get(config, :escalation_webhook_url)
     escalation_needs_human_state = Keyword.get(config, :escalation_needs_human_state)
+    hand_off_command = Keyword.get(config, :hand_off_command)
     prompt = Keyword.get(config, :prompt)
 
     sections =
@@ -183,6 +187,7 @@ defmodule SymphonyElixir.TestSupport do
         filter_yaml(tracker_filter),
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  claim_assignee: #{yaml_value(tracker_claim_assignee)}",
+        "  working_label: #{yaml_value(tracker_working_label)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",
@@ -210,6 +215,7 @@ defmodule SymphonyElixir.TestSupport do
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
         escalation_yaml(escalation_eval_score_threshold, escalation_webhook_url, escalation_needs_human_state),
+        hand_off_yaml(hand_off_command),
         "---",
         prompt
       ]
@@ -269,6 +275,12 @@ defmodule SymphonyElixir.TestSupport do
       "  render_interval_ms: #{yaml_value(render_interval_ms)}"
     ]
     |> Enum.join("\n")
+  end
+
+  defp hand_off_yaml(nil), do: nil
+
+  defp hand_off_yaml(command) do
+    Enum.join(["hand_off:", "  command: #{yaml_value(command)}"], "\n")
   end
 
   defp escalation_yaml(nil, nil, nil), do: nil

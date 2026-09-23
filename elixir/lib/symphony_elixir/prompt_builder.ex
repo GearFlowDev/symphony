@@ -3,7 +3,7 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from Linear issue data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.{Config, Grant, Workflow}
   alias SymphonyElixir.Workflow.StageLoader
 
   @render_opts [strict_variables: true, strict_filters: true]
@@ -19,6 +19,7 @@ defmodule SymphonyElixir.PromptBuilder do
     |> Solid.render!(
       %{
         "attempt" => Keyword.get(opts, :attempt),
+        "grant" => grant_map(issue),
         "issue" => issue |> Map.from_struct() |> to_solid_map(),
         "existing_pr_url" => Keyword.get(opts, :existing_pr_url),
         "existing_pr_branch" => Keyword.get(opts, :existing_pr_branch),
@@ -46,6 +47,7 @@ defmodule SymphonyElixir.PromptBuilder do
 
     template_vars = %{
       "attempt" => Keyword.get(opts, :attempt),
+      "grant" => grant_map(issue),
       "issue" => issue_map,
       "existing_pr_url" => Keyword.get(opts, :existing_pr_url),
       "existing_pr_branch" => Keyword.get(opts, :existing_pr_branch),
@@ -69,6 +71,17 @@ defmodule SymphonyElixir.PromptBuilder do
     [preamble, "---", phase_md]
     |> Enum.join("\n\n")
     |> String.trim()
+  end
+
+  # WHAT THIS RUN IS ALLOWED TO DO, and therefore where it stops, in the stage
+  # prompts' own words. Read from the issue's labels every render, never carried in
+  # metadata: a person who narrows a live issue from `Auto-Merge` to `Auto-Build`
+  # gets the narrower finish line on the next dispatch (GEA-9888).
+  defp grant_map(issue) do
+    issue
+    |> Map.get(:labels)
+    |> Grant.of()
+    |> Grant.to_template_map()
   end
 
   defp render_solid("", _vars), do: ""

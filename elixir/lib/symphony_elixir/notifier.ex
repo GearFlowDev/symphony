@@ -89,6 +89,7 @@ defmodule SymphonyElixir.Notifier do
   # ---------------------------------------------------------------------------
 
   @doc false
+  @spec format_linear_comment(event_type() | atom(), map()) :: String.t()
   def format_linear_comment(:max_continuations_exhausted, details) do
     missing = Map.get(details, :missing_phases, [])
     count = Map.get(details, :continuation_count, 0)

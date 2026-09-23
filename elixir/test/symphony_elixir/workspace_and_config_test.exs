@@ -1023,9 +1023,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         hook_after_create: "exit 9"
       )
 
-      assert {:error, {:workspace_hook_failed, "after_create", 9, _output}} =
-               Workspace.create_for_issue("MT-EXISTING")
+      # `after_create` runs only on a directory this call created, so a failing hook cannot
+      # reach a workspace that was already there: it is reused, and its contents survive.
+      assert {:ok, ^workspace} = Workspace.create_for_issue("MT-EXISTING")
 
+      assert File.read!(Path.join(workspace, "work-in-progress.txt")) == "keep me\n"
+
+      # The same hook on a new directory fails, and removes only what that call created.
+      assert {:error, {:workspace_hook_failed, "after_create", 9, _output}} =
+               Workspace.create_for_issue("MT-NEW")
+
+      refute File.exists?(Path.join(test_root, "MT-NEW"))
       assert File.read!(Path.join(workspace, "work-in-progress.txt")) == "keep me\n"
     after
       File.rm_rf(test_root)

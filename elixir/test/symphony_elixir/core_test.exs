@@ -869,7 +869,13 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Use rich templates for WORKFLOW.md"
     assert prompt =~ "In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "attempt #2"
+
+    # The in-repo workflow ships `workflow/stages/`, so the prompt is assembled from the stage
+    # files and the WORKFLOW.md body (with its "attempt #N" block) is not what renders. A retry
+    # is carried by `_continuation.md` instead, which assemble_prompt/1 leaves out.
+    assert String.starts_with?(prompt, "# Symphony Agent Workflow")
+    refute prompt =~ "{{"
+    refute prompt =~ "{%"
   end
 
   test "prompt builder adds continuation guidance for retries" do

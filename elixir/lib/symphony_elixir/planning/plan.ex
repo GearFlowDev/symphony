@@ -77,5 +77,6 @@ defmodule SymphonyElixir.Planning.Plan do
     plan |> rows() |> Enum.filter(&(&1["state"] in ["missing", "partial"]))
   end
 
+  @spec statuses() :: [String.t()]
   def statuses, do: @statuses
 end

@@ -77,7 +77,7 @@ and re-run. Then post a comment with the embedded screenshots:
 
 ```bash
 curl -s -X POST https://api.linear.app/graphql \
-  -H "Authorization: $LINEAR_API_KEY_AUTOMATION" \
+  -H "Authorization: ${LINEAR_API_KEY_AUTOMATION:-$LINEAR_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"query": "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", "variables": {"id": "{{ issue.id }}", "body": "## Browser Test Results\n\nLogged in and verified core pages load. Screenshots below.\n\n'"$URLS"'"}}'
 ```

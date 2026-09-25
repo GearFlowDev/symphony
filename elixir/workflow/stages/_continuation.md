@@ -40,7 +40,7 @@ Check Linear for any `@agent` comments newer than your last commit:
 
 ```bash
 curl -s -X POST https://api.linear.app/graphql \
-  -H "Authorization: $LINEAR_API_KEY_AUTOMATION" \
+  -H "Authorization: ${LINEAR_API_KEY_AUTOMATION:-$LINEAR_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"query": "query { issue(id: \"{{issue_id}}\") { comments { nodes { body createdAt user { name } } } } }"}' \
   | python3 -c "import sys,json; [print(f'{c[\"user\"][\"name\"]}: {c[\"body\"]}') for c in json.load(sys.stdin)['data']['issue']['comments']['nodes'] if '@agent' in c['body'].lower()]"

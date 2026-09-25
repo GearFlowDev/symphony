@@ -4,7 +4,7 @@ defmodule SymphonyElixir.History do
   """
 
   import Ecto.Query
-  alias SymphonyElixir.History.{Run, RunEvent, TesterVerdict}
+  alias SymphonyElixir.History.{IssuePark, Run, RunEvent, TesterVerdict}
   alias SymphonyElixir.Repo
 
   # ---------------------------------------------------------------------------
@@ -84,13 +84,45 @@ defmodule SymphonyElixir.History do
     |> Repo.one()
   end
 
-  @doc "The most recent tester verdict for an issue, or nil."
+  @doc """
+  The most recent tester verdict of the issue's current release, or nil.
+
+  A release starts when a person moves a parked issue back out of Shaping, so a
+  verdict recorded before the issue's last park belongs to a finished release and
+  never counts. Without this scope, GEA-10455 was released on 2026-09-25, shipped
+  its PR, and was parked again two seconds later on the previous day's BLOCKED
+  verdict, at the same commit (GEA-10531).
+  """
   @spec latest_tester_verdict(String.t()) :: TesterVerdict.t() | nil
   def latest_tester_verdict(issue_identifier) when is_binary(issue_identifier) do
     TesterVerdict
     |> where([v], v.issue_identifier == ^issue_identifier)
+    |> since_last_park(last_parked_at(issue_identifier))
     |> order_by([v], desc: v.inserted_at)
     |> limit(1)
+    |> Repo.one()
+  end
+
+  defp since_last_park(query, nil), do: query
+  defp since_last_park(query, parked_at), do: where(query, [v], v.inserted_at > ^parked_at)
+
+  @doc """
+  Record that Symphony parked an issue for a person. This ends the issue's
+  release: tester verdicts recorded up to now stop gating it.
+  """
+  @spec record_park(String.t(), String.t() | nil) :: {:ok, IssuePark.t()} | {:error, Ecto.Changeset.t()}
+  def record_park(issue_identifier, reason \\ nil) when is_binary(issue_identifier) do
+    %{issue_identifier: issue_identifier, reason: reason}
+    |> IssuePark.create_changeset()
+    |> Repo.insert()
+  end
+
+  @doc "When Symphony last parked the issue, or nil if it never did."
+  @spec last_parked_at(String.t()) :: DateTime.t() | nil
+  def last_parked_at(issue_identifier) when is_binary(issue_identifier) do
+    IssuePark
+    |> where([p], p.issue_identifier == ^issue_identifier)
+    |> select([p], max(p.inserted_at))
     |> Repo.one()
   end
 

@@ -320,6 +320,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         # Move issue to review state if configured (Shaping on the Gearflow boxes).
         move_issue_to_needs_human_state(issue_id, identifier, Config.escalation_needs_human_state())
+        record_park(identifier, message)
 
         # Record escalation in history
         run_id = Map.get(running_entry, :history_run_id)
@@ -437,6 +438,22 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp move_issue_to_needs_human_state(_issue_id, _identifier, _needs_human_state), do: nil
 
+  # A PARK ENDS THE RELEASE (GEA-10531). A person moving the issue back out of
+  # Shaping starts a new one, and a tester verdict from before the park must not
+  # gate it: GEA-10455 re-parked two seconds after its release on the previous
+  # day's BLOCKED verdict. Never fatal: a lost park row costs a stale verdict, and
+  # a raise here would leave the issue half-parked.
+  defp record_park(identifier, reason) when is_binary(identifier) do
+    case History.record_park(identifier, reason) do
+      {:ok, _} -> :ok
+      {:error, error} -> Logger.warning("Could not record the park of #{identifier}: #{inspect(error)}")
+    end
+  rescue
+    error -> Logger.warning("Could not record the park of #{identifier}: #{Exception.message(error)}")
+  end
+
+  defp record_park(_identifier, _reason), do: :ok
+
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
@@ -494,6 +511,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch(%State{} = state) do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues() do
+      state = %{state | blocked: still_blocked(state.blocked, issues, active_state_set())}
+
       dispatched =
         if available_slots(state) > 0 do
           choose_issues(issues, state)
@@ -884,6 +903,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminate_task(_pid, _task_supervisor), do: :ok
+
+  # A PARKED ISSUE LEAVES THE STICKY `blocked` SET (GEA-10531). The set exists so a
+  # blocked issue is not re-blocked every poll while it still sits in an active
+  # state. Once a poll no longer sees it active, it is parked, and a person moving
+  # it back is a new release that must dispatch. Before this, a release inside one
+  # orchestrator lifetime was skipped until a restart or a force dispatch.
+  @doc false
+  @spec still_blocked(MapSet.t(), [term()], MapSet.t()) :: MapSet.t()
+  def still_blocked(blocked, issues, active_states) do
+    active_ids =
+      for %Issue{id: id, state: state_name} <- issues,
+          is_binary(state_name) and active_issue_state?(state_name, active_states),
+          into: MapSet.new(),
+          do: id
+
+    MapSet.intersection(blocked, active_ids)
+  end
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -2282,7 +2318,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp tester_gate_from_linear(issue, last_implement) do
     {:ok, comments} = Client.fetch_all_issue_comments(Map.get(issue, :id))
-    latest = latest_tester_report(comments)
+    latest = latest_tester_report(comments, History.last_parked_at(Map.get(issue, :identifier)))
 
     cond do
       is_nil(latest) ->
@@ -2324,6 +2360,7 @@ defmodule SymphonyElixir.Orchestrator do
       })
 
       move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())
+      record_park(issue.identifier, message)
 
       # A PARKED ISSUE STILL OWES A PR. It gets no more dispatches, so whatever
       # the worker pushed is all there will ever be — and a person (or the
@@ -2357,10 +2394,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp transient_plan_failure?({:plan_assess_failed, {:start_session_failed, _}}), do: true
   defp transient_plan_failure?(_), do: false
 
-  defp latest_tester_report(comments) do
+  # A report posted before the issue's last park belongs to a finished release,
+  # the same rule `History.latest_tester_verdict/1` applies to the DB (GEA-10531).
+  @doc false
+  @spec latest_tester_report([map()], DateTime.t() | nil) :: map() | nil
+  def latest_tester_report(comments, parked_at) do
     comments
     |> Enum.filter(fn c ->
-      is_binary(c.body) and String.contains?(c.body, "## Tester Report") and c.created_at != nil
+      is_binary(c.body) and String.contains?(c.body, "## Tester Report") and c.created_at != nil and
+        (is_nil(parked_at) or DateTime.compare(c.created_at, parked_at) == :gt)
     end)
     |> Enum.max_by(fn c -> DateTime.to_unix(c.created_at) end, fn -> nil end)
   end

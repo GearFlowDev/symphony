@@ -319,8 +319,8 @@ defmodule SymphonyElixir.Orchestrator do
         clear_working_label(issue_id, identifier)
 
         # Move issue to review state if configured (Shaping on the Gearflow boxes).
-        move_issue_to_needs_human_state(issue_id, identifier, Config.escalation_needs_human_state())
-        record_park(identifier, message)
+        if move_issue_to_needs_human_state(issue_id, identifier, Config.escalation_needs_human_state()) == :moved,
+          do: record_park(identifier, message)
 
         # Record escalation in history
         run_id = Map.get(running_entry, :history_run_id)
@@ -430,18 +430,22 @@ defmodule SymphonyElixir.Orchestrator do
     case Tracker.update_issue_state(issue_id, needs_human_state) do
       :ok ->
         Logger.info("Moved issue #{identifier} to state '#{needs_human_state}'")
+        :moved
 
       {:error, reason} ->
         Logger.warning("Failed to move issue #{identifier} to '#{needs_human_state}': #{inspect(reason)}")
+        :not_moved
     end
   end
 
-  defp move_issue_to_needs_human_state(_issue_id, _identifier, _needs_human_state), do: nil
+  defp move_issue_to_needs_human_state(_issue_id, _identifier, _needs_human_state), do: :not_moved
 
-  # A PARK ENDS THE RELEASE (GEA-10531). A person moving the issue back out of
-  # Shaping starts a new one, and a tester verdict from before the park must not
-  # gate it: GEA-10455 re-parked two seconds after its release on the previous
-  # day's BLOCKED verdict. Never fatal: a lost park row costs a stale verdict, and
+  # A PARK ENDS THE RELEASE (GEA-10531). Recorded only when the issue really left
+  # the active states: an issue still active is still in its release, and its
+  # verdict still counts. A person moving it back out of Shaping starts a new
+  # release, and a tester verdict from before the park must not gate it:
+  # GEA-10455 re-parked two seconds after its release on the previous day's
+  # BLOCKED verdict. Never fatal: a lost park row costs a stale verdict, and
   # a raise here would leave the issue half-parked.
   defp record_park(identifier, reason) when is_binary(identifier) do
     case History.record_park(identifier, reason) do
@@ -2359,8 +2363,8 @@ defmodule SymphonyElixir.Orchestrator do
         help_message: message
       })
 
-      move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())
-      record_park(issue.identifier, message)
+      parked? = move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state()) == :moved
+      if parked?, do: record_park(issue.identifier, message)
 
       # A PARKED ISSUE STILL OWES A PR. It gets no more dispatches, so whatever
       # the worker pushed is all there will ever be — and a person (or the
@@ -2371,22 +2375,30 @@ defmodule SymphonyElixir.Orchestrator do
       ensure_pr_for_issue(issue)
       clear_working_label(issue.id, issue.identifier)
 
-      # Sticky: `completed` issues are re-assessed every poll, which for a
-      # blocked issue meant re-blocking — and re-posting the needs-human
-      # comment — every ~2.5 minutes (observed on GEA-4478).
-      state = %{state | blocked: MapSet.put(state.blocked, issue.id)}
+      # Sticky only while the issue stays active: `completed` issues are
+      # re-assessed every poll, which for a blocked issue meant re-blocking — and
+      # re-posting the needs-human comment — every ~2.5 minutes (observed on
+      # GEA-4478). A parked issue needs no mark: it leaves the candidate set, and
+      # the pre-dispatch refresh re-reads its state. Marking it anyway kept a
+      # person's release undispatched until a restart (GEA-10531).
+      state = if parked?, do: state, else: %{state | blocked: MapSet.put(state.blocked, issue.id)}
       complete_issue(state, issue.id)
     end
   end
 
   defp move_blocked_issue_to_needs_human_state(issue, needs_human_state) when is_binary(needs_human_state) do
     case Tracker.update_issue_state(issue.id, needs_human_state) do
-      :ok -> Logger.info("Moved blocked issue #{issue.identifier} to state '#{needs_human_state}'")
-      {:error, reason} -> Logger.warning("Failed to move blocked issue #{issue.identifier}: #{inspect(reason)}")
+      :ok ->
+        Logger.info("Moved blocked issue #{issue.identifier} to state '#{needs_human_state}'")
+        :moved
+
+      {:error, reason} ->
+        Logger.warning("Failed to move blocked issue #{issue.identifier}: #{inspect(reason)}")
+        :not_moved
     end
   end
 
-  defp move_blocked_issue_to_needs_human_state(_issue, _needs_human_state), do: :ok
+  defp move_blocked_issue_to_needs_human_state(_issue, _needs_human_state), do: :not_moved
 
   # Transient plan-generation failures are session-startup blips (the planner's
   # tmux OneShot not becoming ready in time), not genuine "needs a human"

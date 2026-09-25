@@ -98,14 +98,18 @@ defmodule SymphonyElixir.ReleaseBoundaryTest do
     end
   end
 
-  test "both park points record the park" do
+  test "both park points record the park, and only a real park" do
     # Pinned against the source: the two park paths need Linear, a plan store and a
-    # running worker. A park that is not recorded lets the old verdict gate the release.
+    # running worker. A park that is not recorded lets the old verdict gate the release;
+    # one recorded while the issue stays active drops the verdict of a live release; and
+    # a parked issue in the sticky set is not dispatched when a person releases it.
     src = File.read!(Path.expand("../../lib/symphony_elixir/orchestrator.ex", __DIR__))
 
-    assert src =~ "move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())\n      record_park(issue.identifier, message)"
+    assert src =~ "parked? = move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state()) == :moved"
+    assert src =~ "if parked?, do: record_park(issue.identifier, message)"
+    assert src =~ "state = if parked?, do: state, else: %{state | blocked: MapSet.put(state.blocked, issue.id)}"
 
     assert src =~
-             "move_issue_to_needs_human_state(issue_id, identifier, Config.escalation_needs_human_state())\n        record_park(identifier, message)"
+             "if move_issue_to_needs_human_state(issue_id, identifier, Config.escalation_needs_human_state()) == :moved,\n          do: record_park(identifier, message)"
   end
 end

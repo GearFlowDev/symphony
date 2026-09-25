@@ -32,11 +32,11 @@ You do **not** fill the plan, audit it, or post status comments. The orchestrato
 
 - Verdict `approve` → orchestrator advances to the Test phase (a different sub-agent walks the page).
 - Verdict `request_changes` → orchestrator dispatches another worker (you or someone fresh) with the still-open rows.
-- Verdict `blocked` → orchestrator pauses and pings a human.
+- Verdict `blocked` → the dispatch could not run at all (broken slot, missing infrastructure); the orchestrator pauses and pings a human. A product question never makes a dispatch `blocked`.
 
 What you say about your own work is ignored. Don't bother with self-evaluation, status comments, audit ledgers, or "I'm done" announcements. Just close the rows.
 
-If a row is genuinely impossible (missing backend, broken slot, contradictory rows), emit `SYMPHONY_NEEDS_HELP`. If a row is merely ambiguous, pick the most reasonable interpretation, mention it in your commit message, and continue — the Grader is generous about reasonable interpretations and strict about missed work.
+If a row is genuinely impossible (missing backend, broken slot, contradictory rows), emit `SYMPHONY_NEEDS_HELP`. If a row is merely ambiguous, pick the most reasonable interpretation, state it in your commit message and in the PR, and continue — the Grader is generous about reasonable interpretations and strict about missed work.
 
 ## CRITICAL: Working Directory
 
@@ -95,6 +95,11 @@ broken, not finished.
 
 ## If You Get Stuck
 
+Your grant already settles most questions. Asking follows one rule, the ask rule in
+gf_engineering `CLAUDE.md` → Who you are and what you may do → Asking. Read it there; this
+prompt does not restate it. Under it, an unclear requirement is not a blocker: take the most
+reasonable reading, state it in the PR, and continue.
+
 If you are BLOCKED by something you cannot resolve, output this on its own line and STOP:
 ```
 SYMPHONY_NEEDS_HELP: <description of what you're stuck on>
@@ -102,10 +107,13 @@ SYMPHONY_NEEDS_HELP: <description of what you're stuck on>
 
 Use this ONLY for true blockers:
 - Missing credentials or permissions
-- Unclear requirements needing human clarification
 - Broken tooling or missing dependencies
+- A step your grant does not cover: an "ask first" item in `CLAUDE.md` → Default bounds, or a
+  reservation that the issue or its project states in words
 
 Do NOT use this for:
+- An ambiguous or underspecified requirement — take the most reasonable reading and say which in the PR
+- A product or design choice your grant covers
 - "PR is ready, awaiting merge" — just end your turn
 - "Work is complete" — just end your turn
 - "Nothing to do this turn" — just end your turn
@@ -114,7 +122,7 @@ The orchestrator notifies the team and moves the issue to a review state when th
 
 ## Guardrails
 
-- **Never access system credential stores.** No macOS keychain (`security find-generic-password`), no 1Password (`op`), no browser profiles, no `~/.ssh` beyond what git itself uses. If a credential this prompt promises (e.g. `$LINEAR_API_KEY_AUTOMATION`) is missing from your environment, that is an infrastructure bug — emit `SYMPHONY_NEEDS_HELP: <which variable is missing>` and stop. Do not hunt for it.
+- **Never access system credential stores.** No macOS keychain (`security find-generic-password`), no 1Password (`op`), no browser profiles, no `~/.ssh` beyond what git itself uses. If a credential this prompt promises is missing from your environment (for Linear: when neither `$LINEAR_API_KEY` nor `$LINEAR_API_KEY_AUTOMATION` is set), that is an infrastructure bug — emit `SYMPHONY_NEEDS_HELP: <which variable is missing>` and stop. Do not hunt for it.
 - Do NOT modify files outside the scope of the issue.
 - Do NOT force-push or rewrite shared history.
 - Do NOT merge PRs. Whoever merges is named in your finish line above; it is never you.
@@ -136,5 +144,5 @@ Check out this branch: `git checkout {{ existing_pr_branch }}`
 ## Environment Notes
 
 - The `.env` file in the working directory has all credentials.
-- `$LINEAR_API_KEY_AUTOMATION` is available in the environment for Linear API calls.
+- `$LINEAR_API_KEY` is the automation account's key for Linear API calls. Some hosts also set `$LINEAR_API_KEY_AUTOMATION`; the curl examples use `${LINEAR_API_KEY_AUTOMATION:-$LINEAR_API_KEY}`, so either works.
 

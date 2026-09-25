@@ -77,39 +77,78 @@ defmodule SymphonyElixir.ReleaseBoundaryTest do
     end
   end
 
-  describe "Orchestrator.still_blocked/3" do
-    test "an issue the poll no longer sees active leaves the set; an active one stays" do
-      active = MapSet.new(["todo", "in progress"])
-      blocked = MapSet.new(["parked-id", "still-active-id"])
+  describe "Orchestrator.still_blocked/4" do
+    @active MapSet.new(["todo", "in progress"])
 
+    test "a candidate still active keeps its block; one seen parked loses it" do
       issues = [
-        %Issue{id: "still-active-id", identifier: "SYM-1", state: "Todo"},
-        %Issue{id: "other-id", identifier: "SYM-2", state: "In Progress"}
+        %Issue{id: "active-id", identifier: "SYM-1", state: "Todo"},
+        %Issue{id: "parked-id", identifier: "SYM-2", state: "Shaping"}
       ]
 
-      assert Orchestrator.still_blocked(blocked, issues, active) == MapSet.new(["still-active-id"])
+      fetcher = fn _ -> flunk("every blocked issue was seen; nothing to fetch") end
+
+      assert Orchestrator.still_blocked(MapSet.new(["active-id", "parked-id"]), issues, @active, fetcher) ==
+               MapSet.new(["active-id"])
     end
 
-    test "an issue fetched in a parked state leaves the set" do
-      active = MapSet.new(["todo"])
-      issues = [%Issue{id: "parked-id", identifier: "SYM-1", state: "Shaping"}]
+    test "an issue missing from the candidates is read by ID, and loses its block only when inactive" do
+      # The candidate query filters on the routing label: an issue that lost it is
+      # absent but still active, and still in its release.
+      fetcher = fn ids ->
+        assert Enum.sort(ids) == ["label-gone-id", "parked-id"]
 
-      assert Orchestrator.still_blocked(MapSet.new(["parked-id"]), issues, active) == MapSet.new()
+        {:ok,
+         [
+           %Issue{id: "label-gone-id", identifier: "SYM-1", state: "In Progress"},
+           %Issue{id: "parked-id", identifier: "SYM-2", state: "Shaping"}
+         ]}
+      end
+
+      assert Orchestrator.still_blocked(MapSet.new(["label-gone-id", "parked-id"]), [], @active, fetcher) ==
+               MapSet.new(["label-gone-id"])
+    end
+
+    test "a failed read keeps every unseen block" do
+      blocked = MapSet.new(["a", "b"])
+      assert Orchestrator.still_blocked(blocked, [], @active, fn _ -> {:error, :timeout} end) == blocked
     end
   end
 
-  test "both park points record the park, and only a real park" do
-    # Pinned against the source: the two park paths need Linear, a plan store and a
-    # running worker. A park that is not recorded lets the old verdict gate the release;
-    # one recorded while the issue stays active drops the verdict of a live release; and
-    # a parked issue in the sticky set is not dispatched when a person releases it.
+  describe "the park decision" do
+    test "a successful move records the park and leaves the issue out of the sticky set" do
+      {:ok, _} = History.record_tester_verdict("SYM-PARK", "BLOCKED", "43ca70d3")
+      state = Orchestrator.settle_park(%Orchestrator.State{}, %{id: "id-1", identifier: "SYM-PARK"}, "tester BLOCKED", :moved)
+
+      assert %DateTime{} = History.last_parked_at("SYM-PARK")
+      assert History.latest_tester_verdict("SYM-PARK") == nil
+      refute MapSet.member?(state.blocked, "id-1")
+    end
+
+    test "a failed move records no park, keeps the verdict, and marks the issue sticky" do
+      {:ok, _} = History.record_tester_verdict("SYM-PARK", "BLOCKED", "43ca70d3")
+      state = Orchestrator.settle_park(%Orchestrator.State{}, %{id: "id-1", identifier: "SYM-PARK"}, "tester BLOCKED", :not_moved)
+
+      assert History.last_parked_at("SYM-PARK") == nil
+      assert %TesterVerdict{verdict: "BLOCKED"} = History.latest_tester_verdict("SYM-PARK")
+      assert MapSet.member?(state.blocked, "id-1")
+    end
+
+    test "the agent-escalation path records a park only on a successful move" do
+      assert Orchestrator.record_park_if_moved(:not_moved, "SYM-HELP", "needs help") == :not_parked
+      assert History.last_parked_at("SYM-HELP") == nil
+
+      assert Orchestrator.record_park_if_moved(:moved, "SYM-HELP", "needs help") == :parked
+      assert %DateTime{} = History.last_parked_at("SYM-HELP")
+    end
+  end
+
+  test "both park points go through the park decision" do
+    # The paths themselves need Linear, the notifier, gh and a running worker; the
+    # decision they share is tested above. This pins that they still share it.
     src = File.read!(Path.expand("../../lib/symphony_elixir/orchestrator.ex", __DIR__))
 
-    assert src =~ "parked? = move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state()) == :moved"
-    assert src =~ "if parked?, do: record_park(issue.identifier, message)"
-    assert src =~ "state = if parked?, do: state, else: %{state | blocked: MapSet.put(state.blocked, issue.id)}"
-
-    assert src =~
-             "if move_issue_to_needs_human_state(issue_id, identifier, Config.escalation_needs_human_state()) == :moved,\n          do: record_park(identifier, message)"
+    assert src =~ "|> settle_park(issue, message, move_result)"
+    assert src =~ "|> record_park_if_moved(identifier, message)"
   end
 end

@@ -1768,40 +1768,104 @@ defmodule SymphonyElixir.Orchestrator do
         reopen_and_dispatch(issue, metadata, plan, "#{@agent_feedback_marker} — address this: #{agent_feedback_snippet(feedback)}")
 
       :none ->
-        # Actionable ship work comes BEFORE the tester gate: merge conflicts,
-        # red CI, and requested-changes reviews need no browser walk, so a
-        # missing or BLOCKED tester verdict must never wall them off (a tester
-        # blocked on dead infra used to park the issue with CI failures and
-        # CodeRabbit comments left unaddressed). :done still requires both —
-        # the tester gate runs once the PR is externally clean.
-        case external_ship_gate(metadata[:existing_pr_url]) do
-          {:conflicts, reason} ->
-            # Main moved under the PR. Same shape as Resolve Review:
-            # rows stay done, the worker only rebases, resolves, and pushes.
-            Logger.info("PR for #{issue.identifier} is conflicted; dispatching Resolve Conflicts: #{reason}")
-            dispatch_review(issue, metadata, plan, reason, "Resolve Conflicts")
-
-          {:ci, reason} ->
-            # CI is red. Dispatch the dedicated Fix CI phase — its prompt
-            # pulls the actual failing job logs and reproduces locally,
-            # instead of a generic Implement row-closer that only sees the
-            # failing check names and never learns what broke.
-            Logger.info("CI is red for #{issue.identifier}; dispatching Fix CI: #{reason}")
-            reopen_and_dispatch(issue, metadata, plan, reason, "Fix CI")
-
-          {:request_changes, reason} ->
-            # A reviewer (CodeRabbit or human) requested changes. Dispatch the
-            # dedicated Resolve Review phase WITHOUT reopening the plan's rows:
-            # the implementation is done — CR triage only addresses review
-            # threads and re-checks the review gate. Reopening rows here would
-            # send the issue back through Implement/Test and it would never
-            # finish the CR pass.
-            Logger.info("Review requested changes on #{issue.identifier}; dispatching Resolve Review: #{reason}")
-            dispatch_review(issue, metadata, plan, reason)
-
-          :ok ->
-            complete_tester_action(issue, metadata, plan, metadata[:existing_pr_url])
+        case ship_gate(issue, metadata) do
+          {:ok, metadata} -> complete_shipped_plan_action(issue, metadata, plan)
+          {:blocked, _} = blocked -> blocked
         end
+    end
+  end
+
+  # THE WORK MUST BE ON A PR BEFORE ANYTHING JUDGES IT (GEA-10495). With no PR the
+  # ship gates below pass vacuously — no conflicts, no red CI, no review on a PR that
+  # does not exist — and the tester was sent to check a branch that was never pushed.
+  # GEA-10455 ended exactly there: rows graded `done` on a local commit, the tester
+  # BLOCKED, the issue parked. So a complete plan with no PR is pushed and given its PR
+  # here, and a push that fails parks the issue with git's own words instead of reaching
+  # the tester as if Implement had succeeded.
+  defp ship_gate(issue, metadata) do
+    if is_binary(metadata[:existing_pr_url]) do
+      {:ok, metadata}
+    else
+      identifier = Map.get(issue, :identifier)
+
+      case Workspace.slot_lease_for_issue(identifier) do
+        {slot_dir, lease_branch} ->
+          branch = first_present([lease_branch, Map.get(issue, :branch_name)])
+          ship_branch(issue, metadata, slot_dir, branch)
+
+        _ ->
+          ship_verdict({:error, "no slot is leased to #{identifier}, so its commits cannot be pushed"}, nil)
+      end
+    end
+  end
+
+  # ONLY A BRANCH THAT NEVER HAD A PR. A merged PR's branch is gone from origin, and
+  # pushing it back would open a second PR on work already on main; a closed PR is a
+  # person's call. Both, and a `gh` that cannot answer, keep the behaviour this gate
+  # replaced — the next poll asks again.
+  defp ship_branch(issue, metadata, slot_dir, branch) do
+    identifier = Map.get(issue, :identifier)
+
+    case Evaluator.branch_pr_state(slot_dir, branch) do
+      {:ok, nil} ->
+        push = Evaluator.ensure_pushed(slot_dir, branch)
+        pr_url = if match?({:error, _}, push), do: nil, else: ensure_pr_for_issue(issue)
+        if is_binary(pr_url), do: Logger.info("#{identifier} is shipped at #{pr_url} before its gates run")
+
+        case ship_verdict(push, pr_url) do
+          {:ok, url} -> {:ok, Map.merge(metadata, %{existing_pr_url: url, existing_pr_branch: branch})}
+          {:blocked, _} = blocked -> blocked
+        end
+
+      other ->
+        Logger.info("#{identifier}'s branch #{inspect(branch)} is not shipped by the gate: #{inspect(other)}")
+        {:ok, metadata}
+    end
+  end
+
+  @doc false
+  @spec ship_verdict(:ok | {:ok, :pushed} | {:error, String.t()}, String.t() | nil) ::
+          {:ok, String.t()} | {:blocked, {:push_failed | :no_pr, String.t()}}
+  def ship_verdict({:error, reason}, _pr_url), do: {:blocked, {:push_failed, reason}}
+  def ship_verdict(_pushed, pr_url) when is_binary(pr_url), do: {:ok, pr_url}
+
+  def ship_verdict(_pushed, _pr_url),
+    do: {:blocked, {:no_pr, "the branch is on origin but no PR could be opened for it — `gh pr create` failed or found no repo"}}
+
+  defp complete_shipped_plan_action(issue, metadata, plan) do
+    # Actionable ship work comes BEFORE the tester gate: merge conflicts,
+    # red CI, and requested-changes reviews need no browser walk, so a
+    # missing or BLOCKED tester verdict must never wall them off (a tester
+    # blocked on dead infra used to park the issue with CI failures and
+    # CodeRabbit comments left unaddressed). :done still requires both —
+    # the tester gate runs once the PR is externally clean.
+    case external_ship_gate(metadata[:existing_pr_url]) do
+      {:conflicts, reason} ->
+        # Main moved under the PR. Same shape as Resolve Review:
+        # rows stay done, the worker only rebases, resolves, and pushes.
+        Logger.info("PR for #{issue.identifier} is conflicted; dispatching Resolve Conflicts: #{reason}")
+        dispatch_review(issue, metadata, plan, reason, "Resolve Conflicts")
+
+      {:ci, reason} ->
+        # CI is red. Dispatch the dedicated Fix CI phase — its prompt
+        # pulls the actual failing job logs and reproduces locally,
+        # instead of a generic Implement row-closer that only sees the
+        # failing check names and never learns what broke.
+        Logger.info("CI is red for #{issue.identifier}; dispatching Fix CI: #{reason}")
+        reopen_and_dispatch(issue, metadata, plan, reason, "Fix CI")
+
+      {:request_changes, reason} ->
+        # A reviewer (CodeRabbit or human) requested changes. Dispatch the
+        # dedicated Resolve Review phase WITHOUT reopening the plan's rows:
+        # the implementation is done — CR triage only addresses review
+        # threads and re-checks the review gate. Reopening rows here would
+        # send the issue back through Implement/Test and it would never
+        # finish the CR pass.
+        Logger.info("Review requested changes on #{issue.identifier}; dispatching Resolve Review: #{reason}")
+        dispatch_review(issue, metadata, plan, reason)
+
+      :ok ->
+        complete_tester_action(issue, metadata, plan, metadata[:existing_pr_url])
     end
   end
 

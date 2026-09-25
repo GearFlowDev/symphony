@@ -31,7 +31,8 @@ direnv exec . mix check
 direnv exec . mix test
 git fetch origin "${BASE_BRANCH:-main}"
 git rebase "origin/${BASE_BRANCH:-main}"
-git push --force-with-lease origin "$(git branch --show-current)"
+remote=$(git ls-remote origin "refs/heads/$(git branch --show-current)" | cut -f1)
+git push --no-verify --force-with-lease="refs/heads/$(git branch --show-current):$remote" origin "$(git branch --show-current)"
 ```
 
 ## Step 3: @agent feedback

@@ -67,11 +67,26 @@ After all assigned rows have a passing test and a commit:
    git fetch origin "${BASE_BRANCH:-main}"
    git rebase "origin/${BASE_BRANCH:-main}"
    ```
-2. Push:
+2. Push, with `--no-verify`:
    ```bash
-   git push -u origin {{ issue.branch_name }}
+   git push --no-verify -u origin {{ issue.branch_name }}
    ```
-   If push fails non-fast-forward, `git push --force-with-lease` after confirming you're not stomping on other workers.
+   `--no-verify` is deliberate (GEA-10495). A product slot's pre-push hook runs `mix`
+   outside direnv, so a bare `git push` dies with `mix: not found`, and GEA-10455's run
+   ended with its commit never pushed. You ran `mix check` in Step 2; CI is the gate for
+   the pushed branch.
+
+   If the push fails non-fast-forward, confirm you are not overwriting another worker, then
+   force it against the head origin holds now. The slot fetches `main` only, so a bare
+   `--force-with-lease` has no remote-tracking ref to compare and is rejected as stale:
+   ```bash
+   remote=$(git ls-remote origin refs/heads/{{ issue.branch_name }} | cut -f1)
+   git push --no-verify --force-with-lease="refs/heads/{{ issue.branch_name }}:$remote" origin {{ issue.branch_name }}
+   ```
+   **If the push still fails, do not end your turn with the commit unpushed.** Emit
+   `SYMPHONY_NEEDS_HELP` with git's error text. The orchestrator also pushes graded rows
+   itself before the Test phase and parks the issue when that push fails, but your error
+   text is the first thing a person needs.
 3. Open the PR if this issue has none, **ready, never a draft**:
    ```bash
    gh pr list --head {{ issue.branch_name }} --state open --json url --jq '.[0].url'   # already open?

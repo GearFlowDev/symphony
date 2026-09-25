@@ -30,7 +30,8 @@ the rebase completes.
 
 ```bash
 direnv exec . mix test <files touched by the conflicts>
-git push --force-with-lease
+remote=$(git ls-remote origin "refs/heads/$(git branch --show-current)" | cut -f1)
+git push --no-verify --force-with-lease="refs/heads/$(git branch --show-current):$remote" origin "$(git branch --show-current)"
 ```
 
 Confirm the PR is mergeable again:

@@ -63,7 +63,9 @@ defmodule SymphonyElixir.StatusOutputTest do
       # TERM is set to a real terminal name in both runs: on its own it must not
       # buy a board.
       elixir = System.find_executable("elixir")
-      ebin = Path.dirname(:code.which(StatusOutput))
+      # `:code.which/1` answers `:cover_compiled` under `mix test --cover`; the
+      # app's ebin directory holds the same module on disk in both runs.
+      ebin = Application.app_dir(:symphony_elixir, "ebin")
       code = "IO.puts(SymphonyElixir.StatusOutput.mode())"
 
       unless elixir do

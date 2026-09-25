@@ -7,11 +7,12 @@
 # says whether the PR compiles and passes, and it needs one that answers in a minute.
 #
 # WHY THESE THREE AND NOT `make all`. `make-all.yml` beside this file is upstream's, it came
-# with the fork, and it is wider: `mix lint` (credo --strict plus a `@spec` check), `mix test
-# --cover` against a 100% threshold, and `mix dialyzer`. Whether the org keeps that bar is a
-# decision nobody has made, and it is not this file's to make. GEA-9891 named the three checks
-# a worker's PR has to pass, and they are the three below. `make all` stays where it is; this
-# is the fast gate in front of it, and the one that names WHICH of the three broke.
+# with the fork, and it is wider: `mix lint` (credo --strict plus a `@spec` check), `mix test`,
+# and `mix dialyzer`. The coverage bar is 90% (GEA-10327, the machine owner's ruling of
+# 2026-09-25), but `make all` does not run `mix test --cover` until the fork's own modules
+# reach it (GEA-10527). GEA-9891 named the three checks a worker's PR has to pass, and they
+# are the three below. `make all` stays where it is; this is the fast gate in front of it, and
+# the one that names WHICH of the three broke.
 #
 # ---- A RED `ci` IS YOURS, NOT `main`'S ----------------------------------------------------
 #

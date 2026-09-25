@@ -33,13 +33,12 @@ dialyzer:
 	$(MIX) deps.get
 	$(MIX) dialyzer --format short
 
-# `coverage` returns to `ci` once the fork's own modules reach the 90% bar (GEA-10527).
 ci:
 	$(MAKE) setup
 	$(MAKE) build
 	$(MAKE) fmt-check
 	$(MAKE) lint
-	$(MAKE) test
+	$(MAKE) coverage
 	$(MAKE) dialyzer
 
 all: ci

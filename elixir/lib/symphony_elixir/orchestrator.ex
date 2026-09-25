@@ -319,7 +319,9 @@ defmodule SymphonyElixir.Orchestrator do
         clear_working_label(issue_id, identifier)
 
         # Move issue to review state if configured (Shaping on the Gearflow boxes).
-        move_issue_to_needs_human_state(issue_id, identifier, Config.escalation_needs_human_state())
+        issue_id
+        |> move_issue_to_needs_human_state(identifier, Config.escalation_needs_human_state())
+        |> record_park_if_moved(identifier, message)
 
         # Record escalation in history
         run_id = Map.get(running_entry, :history_run_id)
@@ -429,13 +431,79 @@ defmodule SymphonyElixir.Orchestrator do
     case Tracker.update_issue_state(issue_id, needs_human_state) do
       :ok ->
         Logger.info("Moved issue #{identifier} to state '#{needs_human_state}'")
+        :moved
 
       {:error, reason} ->
         Logger.warning("Failed to move issue #{identifier} to '#{needs_human_state}': #{inspect(reason)}")
+        :not_moved
     end
   end
 
-  defp move_issue_to_needs_human_state(_issue_id, _identifier, _needs_human_state), do: nil
+  defp move_issue_to_needs_human_state(_issue_id, _identifier, _needs_human_state), do: :not_moved
+
+  # Sticky only while the issue stays active: `completed` issues are re-assessed
+  # every poll, which for a blocked issue meant re-blocking — and re-posting the
+  # needs-human comment — every ~2.5 minutes (observed on GEA-4478). A parked issue
+  # needs no mark: it leaves the candidate set, and the pre-dispatch refresh
+  # re-reads its state. Marking it anyway kept a person's release undispatched
+  # until a restart (GEA-10531).
+  @doc false
+  @spec settle_park(term(), map(), String.t() | nil, :moved | :not_moved) :: term()
+  def settle_park(%State{} = state, issue, message, move_result) do
+    case record_park_if_moved(move_result, issue.identifier, message) do
+      :parked -> state
+      :not_parked -> %{state | blocked: MapSet.put(state.blocked, issue.id)}
+    end
+  end
+
+  # A PARK ENDS THE RELEASE (GEA-10531). Recorded only when the issue really left
+  # the active states: an issue still active is still in its release, and its
+  # verdict still counts. A person moving it back out of Shaping starts a new
+  # release, and a tester verdict from before the park must not gate it:
+  # GEA-10455 re-parked two seconds after its release on the previous day's
+  # BLOCKED verdict. Never fatal: a lost park row costs a stale verdict, and
+  # a raise here would leave the issue half-parked.
+  # `:parked` only once the boundary is durable. The insert is retried once; if
+  # it still fails, the caller treats the issue as not parked. A local SQLite
+  # insert that fails twice means the DB is failing, and then the verdict reads
+  # fail too and `tester_gate/3` rescues to `:needs_test`, so no stale verdict
+  # can gate the release either.
+  @doc false
+  @spec record_park_if_moved(:moved | :not_moved, String.t() | nil, String.t() | nil) :: :parked | :not_parked
+  def record_park_if_moved(move_result, identifier, reason),
+    do: record_park_if_moved(move_result, identifier, reason, &History.record_park/2)
+
+  @doc false
+  @type park_recorder :: (String.t(), String.t() | nil -> term())
+  @spec record_park_if_moved(:moved | :not_moved, String.t() | nil, String.t() | nil, park_recorder()) ::
+          :parked | :not_parked
+  def record_park_if_moved(:moved, identifier, reason, recorder) when is_binary(identifier) do
+    if record_park(identifier, reason, recorder, 2) == :ok, do: :parked, else: :not_parked
+  end
+
+  def record_park_if_moved(_move_result, _identifier, _reason, _recorder), do: :not_parked
+
+  defp record_park(identifier, reason, recorder, attempts) do
+    result =
+      try do
+        recorder.(identifier, reason)
+      rescue
+        error -> {:error, Exception.message(error)}
+      end
+
+    case result do
+      {:ok, _} ->
+        :ok
+
+      error when attempts > 1 ->
+        Logger.warning("Could not record the park of #{identifier}, retrying: #{inspect(error)}")
+        record_park(identifier, reason, recorder, attempts - 1)
+
+      error ->
+        Logger.error("Could not record the park of #{identifier}: #{inspect(error)}")
+        :error
+    end
+  end
 
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
@@ -494,6 +562,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch(%State{} = state) do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues() do
+      blocked = still_blocked(state.blocked, issues, active_state_set(), &Tracker.fetch_issue_states_by_ids/1)
+      state = %{state | blocked: blocked}
+
       dispatched =
         if available_slots(state) > 0 do
           choose_issues(issues, state)
@@ -884,6 +955,41 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminate_task(_pid, _task_supervisor), do: :ok
+
+  # A PARKED ISSUE LEAVES THE STICKY `blocked` SET (GEA-10531). The set exists so a
+  # blocked issue is not re-blocked every poll while it still sits in an active
+  # state. Once its state is confirmed inactive, it is parked, and a person moving
+  # it back is a new release that must dispatch. Before this, a release inside one
+  # orchestrator lifetime was skipped until a restart or a force dispatch.
+  #
+  # Absence from the candidates is not inactivity: the candidate query also
+  # filters on the routing label, so an issue that lost the label is still in its
+  # release. Blocked issues the poll did not see are read by ID, and any read
+  # failure keeps the block.
+  @doc false
+  @spec still_blocked(MapSet.t(), [term()], MapSet.t(), (list(String.t()) -> {:ok, [term()]} | {:error, term()})) ::
+          MapSet.t()
+  def still_blocked(blocked, issues, active_states, issue_fetcher) do
+    seen_ids = MapSet.new(for %Issue{id: id} <- issues, do: id)
+    unseen = MapSet.difference(blocked, seen_ids)
+    kept = MapSet.intersection(blocked, active_issue_ids(issues, active_states))
+
+    if MapSet.size(unseen) == 0 do
+      kept
+    else
+      case issue_fetcher.(MapSet.to_list(unseen)) do
+        {:ok, refreshed} -> MapSet.union(kept, MapSet.intersection(unseen, active_issue_ids(refreshed, active_states)))
+        _ -> MapSet.union(kept, unseen)
+      end
+    end
+  end
+
+  defp active_issue_ids(issues, active_states) do
+    for %Issue{id: id, state: state_name} <- issues,
+        is_binary(state_name) and active_issue_state?(state_name, active_states),
+        into: MapSet.new(),
+        do: id
+  end
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -2282,7 +2388,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp tester_gate_from_linear(issue, last_implement) do
     {:ok, comments} = Client.fetch_all_issue_comments(Map.get(issue, :id))
-    latest = latest_tester_report(comments)
+    latest = latest_tester_report(comments, History.last_parked_at(Map.get(issue, :identifier)))
 
     cond do
       is_nil(latest) ->
@@ -2323,7 +2429,7 @@ defmodule SymphonyElixir.Orchestrator do
         help_message: message
       })
 
-      move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())
+      move_result = move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())
 
       # A PARKED ISSUE STILL OWES A PR. It gets no more dispatches, so whatever
       # the worker pushed is all there will ever be — and a person (or the
@@ -2334,22 +2440,25 @@ defmodule SymphonyElixir.Orchestrator do
       ensure_pr_for_issue(issue)
       clear_working_label(issue.id, issue.identifier)
 
-      # Sticky: `completed` issues are re-assessed every poll, which for a
-      # blocked issue meant re-blocking — and re-posting the needs-human
-      # comment — every ~2.5 minutes (observed on GEA-4478).
-      state = %{state | blocked: MapSet.put(state.blocked, issue.id)}
-      complete_issue(state, issue.id)
+      state
+      |> settle_park(issue, message, move_result)
+      |> complete_issue(issue.id)
     end
   end
 
   defp move_blocked_issue_to_needs_human_state(issue, needs_human_state) when is_binary(needs_human_state) do
     case Tracker.update_issue_state(issue.id, needs_human_state) do
-      :ok -> Logger.info("Moved blocked issue #{issue.identifier} to state '#{needs_human_state}'")
-      {:error, reason} -> Logger.warning("Failed to move blocked issue #{issue.identifier}: #{inspect(reason)}")
+      :ok ->
+        Logger.info("Moved blocked issue #{issue.identifier} to state '#{needs_human_state}'")
+        :moved
+
+      {:error, reason} ->
+        Logger.warning("Failed to move blocked issue #{issue.identifier}: #{inspect(reason)}")
+        :not_moved
     end
   end
 
-  defp move_blocked_issue_to_needs_human_state(_issue, _needs_human_state), do: :ok
+  defp move_blocked_issue_to_needs_human_state(_issue, _needs_human_state), do: :not_moved
 
   # Transient plan-generation failures are session-startup blips (the planner's
   # tmux OneShot not becoming ready in time), not genuine "needs a human"
@@ -2357,10 +2466,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp transient_plan_failure?({:plan_assess_failed, {:start_session_failed, _}}), do: true
   defp transient_plan_failure?(_), do: false
 
-  defp latest_tester_report(comments) do
+  # A report posted before the issue's last park belongs to a finished release,
+  # the same rule `History.latest_tester_verdict/1` applies to the DB (GEA-10531).
+  @doc false
+  @spec latest_tester_report([map()], DateTime.t() | nil) :: map() | nil
+  def latest_tester_report(comments, parked_at) do
     comments
     |> Enum.filter(fn c ->
-      is_binary(c.body) and String.contains?(c.body, "## Tester Report") and c.created_at != nil
+      is_binary(c.body) and String.contains?(c.body, "## Tester Report") and c.created_at != nil and
+        (is_nil(parked_at) or DateTime.compare(c.created_at, parked_at) == :gt)
     end)
     |> Enum.max_by(fn c -> DateTime.to_unix(c.created_at) end, fn -> nil end)
   end

@@ -44,7 +44,7 @@ Do not delete or skip a failing test to make it pass.
 
 ```bash
 direnv exec . mix test && direnv exec . mix check
-git add -A && git commit -m "{{ issue.identifier }}: fix CI" && git push
+git add -A && git commit -m "{{ issue.identifier }}: fix CI" && git push --no-verify
 ```
 
 ### Step 5: Stop

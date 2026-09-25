@@ -9,6 +9,15 @@ mergeable again. Do not add features or refactor unrelated code.
 In your working directory:
 
 ```bash
+b="$(git branch --show-current)"
+# origin's tip BEFORE you rewrite anything, fetched with its objects (the slot fetches
+# main only). No branch on origin, or no answer, leaves it empty: the lease then refuses
+# to overwrite anything.
+seen=""
+if git fetch origin "refs/heads/$b" 2>/dev/null; then
+  seen=$(git rev-parse FETCH_HEAD)
+  git merge-base --is-ancestor "$seen" HEAD || git rebase "$seen"   # take in commits you lack
+fi
 BASE="${BASE_BRANCH:-main}"
 git fetch origin "$BASE"
 git rebase "origin/$BASE"
@@ -30,8 +39,11 @@ the rebase completes.
 
 ```bash
 direnv exec . mix test <files touched by the conflicts>
-git push --force-with-lease
+git push --no-verify --force-with-lease="refs/heads/$b:$seen" origin "$b"
 ```
+
+`$seen` is origin's tip from Step 1, read before the rebase. A rejection means origin moved
+since then: repeat Step 1 and push again. Never re-read the tip just to make the push pass.
 
 Confirm the PR is mergeable again:
 

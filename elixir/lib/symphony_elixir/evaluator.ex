@@ -192,6 +192,107 @@ defmodule SymphonyElixir.Evaluator do
 
   def ensure_pr_open(_workspace_path, _branch, _title, _body), do: nil
 
+  @doc """
+  Puts the issue branch's commits on origin, so a PR can point at them.
+
+  Call it only for GRADED work: the orchestrator calls it once the plan is complete, and
+  the rows it pushes are the rows the grader marked `done`. That is what separates it from
+  `ensure_pr_open/4`, which refuses an unpushed branch because nobody graded it.
+
+  WHY THE ORCHESTRATOR PUSHES AT ALL (GEA-10495). The Implement stage tells the worker to
+  push and open the PR, and GEA-10455's worker committed, never pushed, and the grader
+  still marked every row `done` from the slot's local diff. The Test phase then ran against
+  no PR, blocked, and the run parked. A step the orchestrator depends on cannot rest on the
+  worker alone.
+
+  `--no-verify`, ON PURPOSE. A product slot's pre-push hook runs `mix` outside direnv, so
+  on the Symphony box it dies with `mix: not found`, and under direnv it runs the whole
+  `mix check` for minutes. CI is the gate for a pushed branch; this call only moves
+  graded commits to where CI and a reviewer can see them.
+
+  Never a force push. When origin holds a different head, this succeeds only if origin
+  already contains the local head (a person pushed on top); a diverged branch is an
+  error for a person to read.
+
+  Returns `:ok` when origin already holds the local head, `{:ok, :pushed}` after a push,
+  and `{:error, reason}` with git's own words otherwise.
+  """
+  @spec ensure_pushed(String.t() | nil, String.t() | nil) :: :ok | {:ok, :pushed} | {:error, String.t()}
+  def ensure_pushed(workspace_path, branch) when is_binary(workspace_path) and is_binary(branch) and branch != "" do
+    ws = resolve_workspace_path(workspace_path)
+    ref = safe_arg(branch)
+
+    with {:ok, local} <- local_head(ws, ref) do
+      if remote_head(ws, ref) == local, do: :ok, else: push_branch(ws, ref, local)
+    end
+  end
+
+  def ensure_pushed(_workspace_path, _branch), do: {:error, "no slot or no branch to push"}
+
+  @doc """
+  The state of the newest PR ever opened from `branch`, in any state: `{:ok, nil}` when
+  the branch never had one, `{:ok, "OPEN" | "CLOSED" | "MERGED"}` otherwise.
+
+  `ensure_pushed/2` is for a branch that never had a PR. A merged PR's branch is deleted
+  on origin, so pushing its local copy back would open a second PR on work already on
+  main; a closed PR is a person's decision. Neither is this module's to reverse.
+  """
+  @spec branch_pr_state(String.t() | nil, String.t() | nil) :: {:ok, String.t() | nil} | {:error, term()}
+  def branch_pr_state(workspace_path, branch) when is_binary(workspace_path) and is_binary(branch) and branch != "" do
+    ws = resolve_workspace_path(workspace_path)
+
+    with {:ok, output} <- run_in_workspace(ws, "gh pr list --head #{safe_arg(branch)} --state all --json state --limit 1"),
+         {:ok, prs} when is_list(prs) <- Jason.decode(output) do
+      {:ok, prs |> List.first(%{}) |> Map.get("state")}
+    else
+      {:ok, other} -> {:error, {:unexpected, other}}
+      error -> error
+    end
+  end
+
+  def branch_pr_state(_workspace_path, _branch), do: {:error, :no_workspace_or_branch}
+
+  defp local_head(ws, ref) do
+    case run_in_workspace(ws, "git rev-parse --verify --quiet refs/heads/#{ref}") do
+      {:ok, output} -> {:ok, String.trim(output)}
+      {:error, _} -> {:error, "branch #{ref} does not exist in #{inspect(ws)}"}
+    end
+  end
+
+  # nil when origin has no such branch, or when origin cannot be read: either way the
+  # push below is the step that says what is wrong.
+  defp remote_head(ws, ref) do
+    case run_in_workspace(ws, "git ls-remote --heads origin refs/heads/#{ref}") do
+      {:ok, output} -> output |> String.split() |> List.first()
+      {:error, _} -> nil
+    end
+  end
+
+  defp push_branch(ws, ref, local) do
+    case run_in_workspace(ws, "git push --no-verify origin refs/heads/#{ref}:refs/heads/#{ref}") do
+      {:ok, _} ->
+        Logger.info("Evaluator: pushed #{ref} at #{String.slice(local, 0, 12)}")
+        {:ok, :pushed}
+
+      {:error, reason} ->
+        if origin_contains?(ws, ref, local), do: :ok, else: {:error, "git push of #{ref} failed: #{push_error(reason)}"}
+    end
+  end
+
+  # The slot's fetch refspec carries main only, so the branch is fetched into FETCH_HEAD.
+  defp origin_contains?(ws, ref, local) do
+    match?({:ok, _}, run_in_workspace(ws, "git fetch --quiet origin refs/heads/#{ref}")) and
+      match?({:ok, _}, run_in_workspace(ws, "git merge-base --is-ancestor #{local} FETCH_HEAD"))
+  end
+
+  # The tail, because git and a hook print their verdict last.
+  defp push_error(reason) when is_binary(reason) do
+    text = String.trim(reason)
+    String.slice(text, max(String.length(text) - 600, 0), 600)
+  end
+
+  defp push_error(reason), do: inspect(reason)
+
   # A PR needs a pushed branch to point at. An unpushed branch is a run that closed
   # no rows, not a run missing its PR, and `gh pr create` on one would push work
   # nobody graded.

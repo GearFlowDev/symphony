@@ -59,7 +59,7 @@ After any changes: `direnv exec . mix test && direnv exec . mix check`
 
 If you made changes:
 ```bash
-git add -A && git commit -m "{{ issue.identifier }}: simplify and address review feedback" && git push
+git add -A && git commit -m "{{ issue.identifier }}: simplify and address review feedback" && git push --no-verify
 ```
 
 ### Close out the Linear issue

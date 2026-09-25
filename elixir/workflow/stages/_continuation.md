@@ -29,9 +29,18 @@ After all assigned rows have green tests and commits:
 ```bash
 direnv exec . mix check
 direnv exec . mix test
+b="$(git branch --show-current)"
+# origin's tip BEFORE you rewrite anything, fetched with its objects (the slot fetches
+# main only). No branch on origin, or no answer, leaves it empty: the lease then refuses
+# to overwrite anything.
+seen=""
+if git fetch origin "refs/heads/$b" 2>/dev/null; then
+  seen=$(git rev-parse FETCH_HEAD)
+  git merge-base --is-ancestor "$seen" HEAD || git rebase "$seen"   # take in commits you lack
+fi
 git fetch origin "${BASE_BRANCH:-main}"
 git rebase "origin/${BASE_BRANCH:-main}"
-git push --force-with-lease origin "$(git branch --show-current)"
+git push --no-verify --force-with-lease="refs/heads/$b:$seen" origin "$b"
 ```
 
 ## Step 3: @agent feedback

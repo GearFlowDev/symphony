@@ -62,16 +62,42 @@ and the PR are one step and you do not end your turn between them.
 
 After all assigned rows have a passing test and a commit:
 
-1. Rebase onto the latest base:
+1. Record origin's tip of the issue branch, take in any commits it has that the slot lacks,
+   then rebase onto the latest base:
    ```bash
+   b="$(git branch --show-current)"
+   # origin's tip BEFORE you rewrite anything, fetched with its objects (the slot fetches
+   # main only). No branch on origin, or no answer, leaves it empty: the lease then refuses
+   # to overwrite anything.
+   seen=""
+   if git fetch origin "refs/heads/$b" 2>/dev/null; then
+     seen=$(git rev-parse FETCH_HEAD)
+     git merge-base --is-ancestor "$seen" HEAD || git rebase "$seen"   # take in commits you lack
+   fi
    git fetch origin "${BASE_BRANCH:-main}"
    git rebase "origin/${BASE_BRANCH:-main}"
    ```
-2. Push:
+2. Push, with `--no-verify`:
    ```bash
-   git push -u origin {{ issue.branch_name }}
+   git push --no-verify -u origin {{ issue.branch_name }}
    ```
-   If push fails non-fast-forward, `git push --force-with-lease` after confirming you're not stomping on other workers.
+   `--no-verify` is deliberate (GEA-10495). A product slot's pre-push hook runs `mix`
+   outside direnv, so a bare `git push` dies with `mix: not found`, and GEA-10455's run
+   ended with its commit never pushed. You ran `mix check` in Step 2; CI is the gate for
+   the pushed branch.
+
+   If the push fails non-fast-forward (the rebase rewrote commits origin already has), force
+   it against the tip you recorded in step 1. The slot fetches `main` only, so a bare
+   `--force-with-lease` has no remote-tracking ref to compare and is rejected as stale; and a
+   tip read now, after the rebase, would accept whatever another worker pushed meanwhile:
+   ```bash
+   git push --no-verify --force-with-lease="refs/heads/$b:$seen" origin "$b"
+   ```
+   A rejection here means origin moved after step 1. Repeat step 1, then push again.
+   **If the push still fails, do not end your turn with the commit unpushed.** Emit
+   `SYMPHONY_NEEDS_HELP` with git's error text. The orchestrator also pushes graded rows
+   itself before the Test phase and parks the issue when that push fails, but your error
+   text is the first thing a person needs.
 3. Open the PR if this issue has none, **ready, never a draft**:
    ```bash
    gh pr list --head {{ issue.branch_name }} --state open --json url --jq '.[0].url'   # already open?

@@ -134,4 +134,110 @@ defmodule SymphonyElixir.EvaluatorTest do
       assert Evaluator.ensure_pr_open("/tmp", nil, "GEA-1: x", "Linear: GEA-1") == nil
     end
   end
+
+  describe "ensure_pushed/2" do
+    # GEA-10495: GEA-10455's worker committed and never pushed, the grader marked every row
+    # done from the slot's local diff, and the tester was sent to a PR that did not exist.
+    # The orchestrator now pushes graded rows itself. These run real git against a bare
+    # origin, with a pre-push hook that always fails: a product slot's hook dies with
+    # `mix: not found` on the Symphony box, and the push must not depend on it.
+
+    @git_env [
+      {"GIT_AUTHOR_NAME", "t"},
+      {"GIT_AUTHOR_EMAIL", "t@example.com"},
+      {"GIT_COMMITTER_NAME", "t"},
+      {"GIT_COMMITTER_EMAIL", "t@example.com"}
+    ]
+
+    setup do
+      root = Path.join(System.tmp_dir!(), "symphony-push-#{System.unique_integer([:positive])}")
+      origin = Path.join(root, "origin.git")
+      slot = Path.join(root, "slot")
+      File.mkdir_p!(root)
+      on_exit(fn -> File.rm_rf(root) end)
+
+      git!(root, ["init", "--quiet", "--bare", "--initial-branch=main", origin])
+      git!(root, ["clone", "--quiet", origin, slot])
+      git!(slot, ["checkout", "--quiet", "-b", "main"])
+      commit!(slot, "base")
+      git!(slot, ["push", "--quiet", "origin", "main"])
+      # The slot's shape on the box: origin's main only, so no remote-tracking ref exists
+      # for the issue branch.
+      git!(slot, ["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"])
+      git!(slot, ["checkout", "--quiet", "-b", "gea-1-work"])
+      commit!(slot, "R1")
+
+      hook = Path.join([slot, ".git", "hooks", "pre-push"])
+      File.write!(hook, "#!/bin/sh\necho 'mix: not found' >&2\nexit 127\n")
+      File.chmod!(hook, 0o755)
+
+      %{root: root, origin: origin, slot: slot}
+    end
+
+    test "an unpushed branch is pushed past a failing pre-push hook", %{origin: origin, slot: slot} do
+      head = git!(slot, ["rev-parse", "HEAD"])
+
+      assert Evaluator.ensure_pushed(slot, "gea-1-work") == {:ok, :pushed}
+      assert git!(origin, ["rev-parse", "refs/heads/gea-1-work"]) == head
+    end
+
+    test "a branch origin already holds is left alone", %{slot: slot} do
+      git!(slot, ["push", "--quiet", "--no-verify", "origin", "gea-1-work"])
+
+      assert Evaluator.ensure_pushed(slot, "gea-1-work") == :ok
+    end
+
+    test "origin ahead of the slot is not an error: it already holds the work", %{root: root, origin: origin, slot: slot} do
+      git!(slot, ["push", "--quiet", "--no-verify", "origin", "gea-1-work"])
+      other = Path.join(root, "other")
+      git!(root, ["clone", "--quiet", "--branch", "gea-1-work", origin, other])
+      commit!(other, "a person's fix on top")
+      git!(other, ["push", "--quiet", "origin", "gea-1-work"])
+
+      assert Evaluator.ensure_pushed(slot, "gea-1-work") == :ok
+    end
+
+    test "a diverged branch is an error carrying git's words, never a force push", %{root: root, origin: origin, slot: slot} do
+      git!(slot, ["push", "--quiet", "--no-verify", "origin", "gea-1-work"])
+      other = Path.join(root, "other")
+      git!(root, ["clone", "--quiet", "--branch", "gea-1-work", origin, other])
+      commit!(other, "theirs")
+      git!(other, ["push", "--quiet", "origin", "gea-1-work"])
+      theirs = git!(origin, ["rev-parse", "refs/heads/gea-1-work"])
+      commit!(slot, "ours")
+
+      assert {:error, reason} = Evaluator.ensure_pushed(slot, "gea-1-work")
+      assert reason =~ "git push of gea-1-work failed"
+      assert reason =~ "rejected"
+      assert git!(origin, ["rev-parse", "refs/heads/gea-1-work"]) == theirs
+    end
+
+    test "a branch the slot does not have is an error, not a push", %{origin: origin, slot: slot} do
+      assert {:error, reason} = Evaluator.ensure_pushed(slot, "gea-2-never-made")
+      assert reason =~ "does not exist"
+      assert {_, 128} = System.cmd("git", ["rev-parse", "--verify", "refs/heads/gea-2-never-made"], cd: origin, stderr_to_stdout: true)
+    end
+
+    test "no slot or no branch is an error and no crash" do
+      assert {:error, _} = Evaluator.ensure_pushed(nil, "gea-1-work")
+      assert {:error, _} = Evaluator.ensure_pushed("/tmp", "")
+      assert {:error, _} = Evaluator.ensure_pushed("/tmp", nil)
+    end
+
+    defp git!(dir, args) do
+      {out, 0} = System.cmd("git", args, cd: dir, env: @git_env, stderr_to_stdout: true)
+      String.trim(out)
+    end
+
+    defp commit!(dir, message) do
+      git!(dir, ["commit", "--quiet", "--allow-empty", "-m", message])
+    end
+  end
+
+  describe "branch_pr_state/2" do
+    test "no slot or no branch is an error and no crash" do
+      assert {:error, _} = Evaluator.branch_pr_state(nil, "gea-1-work")
+      assert {:error, _} = Evaluator.branch_pr_state("/tmp", "")
+    end
+  end
 end

@@ -29,10 +29,15 @@ After all assigned rows have green tests and commits:
 ```bash
 direnv exec . mix check
 direnv exec . mix test
+b="$(git branch --show-current)"
+seen=$(git ls-remote origin "refs/heads/$b" | cut -f1)   # origin's tip BEFORE you rewrite anything
+if [ -n "$seen" ]; then
+  git fetch origin "refs/heads/$b"                        # the slot fetches main only
+  git merge-base --is-ancestor "$seen" HEAD || git rebase "$seen"   # take in commits you lack
+fi
 git fetch origin "${BASE_BRANCH:-main}"
 git rebase "origin/${BASE_BRANCH:-main}"
-remote=$(git ls-remote origin "refs/heads/$(git branch --show-current)" | cut -f1)
-git push --no-verify --force-with-lease="refs/heads/$(git branch --show-current):$remote" origin "$(git branch --show-current)"
+git push --no-verify --force-with-lease="refs/heads/$b:$seen" origin "$b"
 ```
 
 ## Step 3: @agent feedback

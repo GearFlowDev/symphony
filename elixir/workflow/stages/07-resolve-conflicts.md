@@ -9,6 +9,12 @@ mergeable again. Do not add features or refactor unrelated code.
 In your working directory:
 
 ```bash
+b="$(git branch --show-current)"
+seen=$(git ls-remote origin "refs/heads/$b" | cut -f1)   # origin's tip BEFORE you rewrite anything
+if [ -n "$seen" ]; then
+  git fetch origin "refs/heads/$b"                        # the slot fetches main only
+  git merge-base --is-ancestor "$seen" HEAD || git rebase "$seen"   # take in commits you lack
+fi
 BASE="${BASE_BRANCH:-main}"
 git fetch origin "$BASE"
 git rebase "origin/$BASE"
@@ -30,9 +36,11 @@ the rebase completes.
 
 ```bash
 direnv exec . mix test <files touched by the conflicts>
-remote=$(git ls-remote origin "refs/heads/$(git branch --show-current)" | cut -f1)
-git push --no-verify --force-with-lease="refs/heads/$(git branch --show-current):$remote" origin "$(git branch --show-current)"
+git push --no-verify --force-with-lease="refs/heads/$b:$seen" origin "$b"
 ```
+
+`$seen` is origin's tip from Step 1, read before the rebase. A rejection means origin moved
+since then: repeat Step 1 and push again. Never re-read the tip just to make the push pass.
 
 Confirm the PR is mergeable again:
 

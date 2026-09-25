@@ -122,7 +122,7 @@ The orchestrator notifies the team and moves the issue to a review state when th
 
 ## Guardrails
 
-- **Never access system credential stores.** No macOS keychain (`security find-generic-password`), no 1Password (`op`), no browser profiles, no `~/.ssh` beyond what git itself uses. If a credential this prompt promises (e.g. `$LINEAR_API_KEY`) is missing from your environment, that is an infrastructure bug — emit `SYMPHONY_NEEDS_HELP: <which variable is missing>` and stop. Do not hunt for it.
+- **Never access system credential stores.** No macOS keychain (`security find-generic-password`), no 1Password (`op`), no browser profiles, no `~/.ssh` beyond what git itself uses. If a credential this prompt promises is missing from your environment (for Linear: when neither `$LINEAR_API_KEY` nor `$LINEAR_API_KEY_AUTOMATION` is set), that is an infrastructure bug — emit `SYMPHONY_NEEDS_HELP: <which variable is missing>` and stop. Do not hunt for it.
 - Do NOT modify files outside the scope of the issue.
 - Do NOT force-push or rewrite shared history.
 - Do NOT merge PRs. Whoever merges is named in your finish line above; it is never you.

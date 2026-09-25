@@ -41,11 +41,18 @@ defmodule SymphonyElixir.StagePromptAskRuleTest do
   end
 
   test "no stage authorizes Linear with a key the box does not set" do
-    # The agent box sets LINEAR_API_KEY only. A header that names
-    # LINEAR_API_KEY_AUTOMATION alone sends an empty key there.
+    # The agent box sets LINEAR_API_KEY only; other hosts may set only
+    # LINEAR_API_KEY_AUTOMATION. A header that names either key alone sends an
+    # empty key on one of them.
     for path <- Path.wildcard(Path.join(@stages_dir, "*.md")) do
-      refute File.read!(path) =~ ~r/Authorization: \$LINEAR_API_KEY_AUTOMATION\b/,
-             "#{Path.basename(path)} still authorizes with $LINEAR_API_KEY_AUTOMATION alone"
+      content = File.read!(path)
+      name = Path.basename(path)
+
+      refute content =~ ~r/Authorization: \$LINEAR_API_KEY_AUTOMATION\b/,
+             "#{name} still authorizes with $LINEAR_API_KEY_AUTOMATION alone"
+
+      refute content =~ ~r/Authorization: \$LINEAR_API_KEY\b/,
+             "#{name} authorizes with $LINEAR_API_KEY alone"
     end
   end
 end

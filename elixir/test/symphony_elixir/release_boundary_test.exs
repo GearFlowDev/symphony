@@ -141,6 +141,22 @@ defmodule SymphonyElixir.ReleaseBoundaryTest do
       assert Orchestrator.record_park_if_moved(:moved, "SYM-HELP", "needs help") == :parked
       assert %DateTime{} = History.last_parked_at("SYM-HELP")
     end
+
+    test "a park insert that fails twice is not a park; one that fails once is retried" do
+      failing = fn _identifier, _reason -> {:error, :disk_full} end
+      assert Orchestrator.record_park_if_moved(:moved, "SYM-HELP", "x", failing) == :not_parked
+
+      {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+      flaky = fn identifier, reason ->
+        if Agent.get_and_update(calls, &{&1, &1 + 1}) == 0,
+          do: raise("database is locked"),
+          else: History.record_park(identifier, reason)
+      end
+
+      assert Orchestrator.record_park_if_moved(:moved, "SYM-HELP", "x", flaky) == :parked
+      assert %DateTime{} = History.last_parked_at("SYM-HELP")
+    end
   end
 
   test "both park points go through the park decision" do

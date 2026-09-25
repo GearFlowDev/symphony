@@ -463,25 +463,47 @@ defmodule SymphonyElixir.Orchestrator do
   # GEA-10455 re-parked two seconds after its release on the previous day's
   # BLOCKED verdict. Never fatal: a lost park row costs a stale verdict, and
   # a raise here would leave the issue half-parked.
+  # `:parked` only once the boundary is durable. The insert is retried once; if
+  # it still fails, the caller treats the issue as not parked. A local SQLite
+  # insert that fails twice means the DB is failing, and then the verdict reads
+  # fail too and `tester_gate/3` rescues to `:needs_test`, so no stale verdict
+  # can gate the release either.
   @doc false
   @spec record_park_if_moved(:moved | :not_moved, String.t() | nil, String.t() | nil) :: :parked | :not_parked
-  def record_park_if_moved(:moved, identifier, reason) do
-    record_park(identifier, reason)
-    :parked
+  def record_park_if_moved(move_result, identifier, reason),
+    do: record_park_if_moved(move_result, identifier, reason, &History.record_park/2)
+
+  @doc false
+  @type park_recorder :: (String.t(), String.t() | nil -> term())
+  @spec record_park_if_moved(:moved | :not_moved, String.t() | nil, String.t() | nil, park_recorder()) ::
+          :parked | :not_parked
+  def record_park_if_moved(:moved, identifier, reason, recorder) when is_binary(identifier) do
+    if record_park(identifier, reason, recorder, 2) == :ok, do: :parked, else: :not_parked
   end
 
-  def record_park_if_moved(_move_result, _identifier, _reason), do: :not_parked
+  def record_park_if_moved(_move_result, _identifier, _reason, _recorder), do: :not_parked
 
-  defp record_park(identifier, reason) when is_binary(identifier) do
-    case History.record_park(identifier, reason) do
-      {:ok, _} -> :ok
-      {:error, error} -> Logger.warning("Could not record the park of #{identifier}: #{inspect(error)}")
+  defp record_park(identifier, reason, recorder, attempts) do
+    result =
+      try do
+        recorder.(identifier, reason)
+      rescue
+        error -> {:error, Exception.message(error)}
+      end
+
+    case result do
+      {:ok, _} ->
+        :ok
+
+      error when attempts > 1 ->
+        Logger.warning("Could not record the park of #{identifier}, retrying: #{inspect(error)}")
+        record_park(identifier, reason, recorder, attempts - 1)
+
+      error ->
+        Logger.error("Could not record the park of #{identifier}: #{inspect(error)}")
+        :error
     end
-  rescue
-    error -> Logger.warning("Could not record the park of #{identifier}: #{Exception.message(error)}")
   end
-
-  defp record_park(_identifier, _reason), do: :ok
 
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)

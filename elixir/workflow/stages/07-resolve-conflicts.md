@@ -10,9 +10,12 @@ In your working directory:
 
 ```bash
 b="$(git branch --show-current)"
-seen=$(git ls-remote origin "refs/heads/$b" | cut -f1)   # origin's tip BEFORE you rewrite anything
-if [ -n "$seen" ]; then
-  git fetch origin "refs/heads/$b"                        # the slot fetches main only
+# origin's tip BEFORE you rewrite anything, fetched with its objects (the slot fetches
+# main only). No branch on origin, or no answer, leaves it empty: the lease then refuses
+# to overwrite anything.
+seen=""
+if git fetch origin "refs/heads/$b" 2>/dev/null; then
+  seen=$(git rev-parse FETCH_HEAD)
   git merge-base --is-ancestor "$seen" HEAD || git rebase "$seen"   # take in commits you lack
 fi
 BASE="${BASE_BRANCH:-main}"

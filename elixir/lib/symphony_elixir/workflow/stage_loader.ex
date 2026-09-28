@@ -68,10 +68,14 @@ defmodule SymphonyElixir.Workflow.StageLoader do
   @doc """
   Renders a continuation prompt from `_continuation.md` template.
   Falls back to nil if no template exists.
+
+  THE ISSUE'S IDENTIFIER IS SUBSTITUTED TOO. The template names it in its commit
+  message and in its `bin/linear comments` step; left raw, the agent ran
+  `bin/linear comments {{` and the step failed (GEA-10619 judge, 2026-09-28).
   """
-  @spec assemble_continuation(%{String.t() => String.t()}, pos_integer(), pos_integer(), [map()]) ::
+  @spec assemble_continuation(%{String.t() => String.t()}, pos_integer(), pos_integer(), [map()], String.t() | nil) ::
           String.t() | nil
-  def assemble_continuation(stages, turn_number, max_turns, comments) do
+  def assemble_continuation(stages, turn_number, max_turns, comments, identifier \\ nil) do
     case Map.get(stages, "_continuation.md") do
       nil ->
         nil
@@ -81,8 +85,15 @@ defmodule SymphonyElixir.Workflow.StageLoader do
         |> String.replace("{{turn_number}}", to_string(turn_number))
         |> String.replace("{{max_turns}}", to_string(max_turns))
         |> String.replace("{{comments_section}}", format_comments(comments))
+        |> replace_identifier(identifier)
     end
   end
+
+  defp replace_identifier(text, identifier) when is_binary(identifier) and identifier != "" do
+    String.replace(text, ["{{ issue.identifier }}", "{{issue.identifier}}"], identifier)
+  end
+
+  defp replace_identifier(text, _identifier), do: text
 
   defp format_comments([]), do: ""
 

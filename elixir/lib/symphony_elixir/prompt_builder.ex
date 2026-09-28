@@ -147,7 +147,7 @@ defmodule SymphonyElixir.PromptBuilder do
     if File.dir?(stages_dir) do
       stages = StageLoader.load_stages(stages_dir)
 
-      case StageLoader.assemble_continuation(stages, turn_number, max_turns, comments) do
+      case StageLoader.assemble_continuation(stages, turn_number, max_turns, comments, Map.get(issue, :identifier)) do
         nil -> default_continuation_prompt(issue, turn_number, max_turns, comments)
         prompt -> prompt
       end

@@ -178,8 +178,25 @@ defmodule SymphonyElixir.ReplanAfterReleaseTest do
     end
 
     test "a thread past the page cap is an error, not a silent cut" do
-      request_fun = fn _payload, _headers -> page(["more"], "next") end
+      request_fun = fn payload, _headers -> page(["more"], "c#{(payload["variables"].after || "0") <> "1"}") end
       assert {:error, :too_many_comment_pages} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
+    end
+  end
+
+  describe "Client.read_all_issue_comments/2 on a bad page" do
+    defp bad_page(page_info) do
+      nodes = [%{"body" => "x", "createdAt" => "2026-09-28T10:00:00Z", "user" => %{"name" => "Owner"}}]
+      {:ok, %{status: 200, body: %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes, "pageInfo" => page_info}}}}}}
+    end
+
+    test "a repeated end cursor is an error at once" do
+      request_fun = fn _payload, _headers -> bad_page(%{"hasNextPage" => true, "endCursor" => "same"}) end
+      assert {:error, :linear_repeated_end_cursor} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
+    end
+
+    test "a next page with no cursor is an error, not a silent cut" do
+      request_fun = fn _payload, _headers -> bad_page(%{"hasNextPage" => true, "endCursor" => nil}) end
+      assert {:error, :linear_missing_end_cursor} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
     end
   end
 

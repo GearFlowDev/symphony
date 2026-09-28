@@ -331,12 +331,13 @@ defmodule SymphonyElixir.Linear.Client do
       {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes} = page}}}} when is_list(nodes) ->
         acc = acc ++ Enum.map(nodes, &comment_from_node/1)
 
-        case page["pageInfo"] do
-          %{"hasNextPage" => true, "endCursor" => cursor} when is_binary(cursor) ->
-            read_comment_pages(issue_id, cursor, acc, pages_left - 1, opts)
+        page_info = page["pageInfo"] || %{}
 
-          _ ->
-            {:ok, acc}
+        case next_page_cursor(%{has_next_page: page_info["hasNextPage"], end_cursor: page_info["endCursor"]}) do
+          {:ok, ^after_cursor} -> {:error, :linear_repeated_end_cursor}
+          {:ok, cursor} -> read_comment_pages(issue_id, cursor, acc, pages_left - 1, opts)
+          :done -> {:ok, acc}
+          {:error, _} = err -> err
         end
 
       {:ok, body} ->

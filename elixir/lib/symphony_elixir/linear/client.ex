@@ -113,6 +113,30 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @all_comments_query """
+  query SymphonyLinearAllComments($issueId: String!, $first: Int!, $after: String) {
+    issue(id: $issueId) {
+      comments(first: $first, after: $after, orderBy: createdAt) {
+        nodes {
+          id
+          body
+          createdAt
+          user {
+            name
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+  """
+
+  @comments_page_size 100
+  @comments_max_pages 20
+
   @viewer_query """
   query SymphonyLinearViewer {
     viewer {
@@ -266,14 +290,18 @@ defmodule SymphonyElixir.Linear.Client do
   @doc """
   Fetch ALL comments on an issue (no @agent filter). Used by the evaluator
   to check for evidence and plan comments posted by the agent itself.
-  A Linear failure logs and reads as no comments; use
-  `read_all_issue_comments/1` when an empty thread and a failed read differ.
+  It reads the first 50 comments, and a Linear failure logs and reads as no
+  comments; use `read_all_issue_comments/2` when the whole thread matters and
+  an empty thread and a failed read differ.
   """
   @spec fetch_all_issue_comments(String.t()) :: {:ok, list(map())}
   def fetch_all_issue_comments(issue_id) when is_binary(issue_id) do
-    case read_all_issue_comments(issue_id) do
-      {:ok, comments} ->
-        {:ok, comments}
+    case graphql(@comments_query, %{issueId: issue_id, first: 50}) do
+      {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}}} ->
+        {:ok, Enum.map(nodes, &comment_from_node/1)}
+
+      {:ok, _body} ->
+        {:ok, []}
 
       {:error, reason} ->
         Logger.warning("Failed to fetch all comments for issue #{issue_id}: #{inspect(reason)}")
@@ -282,24 +310,34 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   @doc """
-  Fetch ALL comments on an issue, and keep a Linear failure as an error. A
-  re-plan after a park needs this: a failed read must not pass for a thread
-  with no answer (GEA-10664).
+  Fetch every comment on an issue, page by page, and keep a Linear failure as
+  an error. A re-plan after a park needs this: a failed or cut read must not
+  pass for a thread with no answer (GEA-10664). `opts` go to `graphql/3`.
   """
-  @spec read_all_issue_comments(String.t()) :: {:ok, list(map())} | {:error, term()}
-  def read_all_issue_comments(issue_id) when is_binary(issue_id) do
-    case graphql(@comments_query, %{issueId: issue_id, first: 50}) do
-      {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}}} ->
-        comments =
-          Enum.map(nodes, fn node ->
-            %{
-              body: node["body"] || "",
-              author: get_in(node, ["user", "name"]) || "Unknown",
-              created_at: parse_datetime(node["createdAt"])
-            }
-          end)
+  @spec read_all_issue_comments(String.t(), keyword()) :: {:ok, list(map())} | {:error, term()}
+  def read_all_issue_comments(issue_id, opts \\ []) when is_binary(issue_id) do
+    read_comment_pages(issue_id, nil, [], @comments_max_pages, opts)
+  end
 
-        {:ok, comments}
+  # Page to the end of the thread: a person's answer can be the newest of
+  # many comments. A thread longer than the page cap is an error, never a
+  # silent cut.
+  defp read_comment_pages(_issue_id, _after, _acc, 0, _opts), do: {:error, :too_many_comment_pages}
+
+  defp read_comment_pages(issue_id, after_cursor, acc, pages_left, opts) do
+    variables = %{issueId: issue_id, first: @comments_page_size, after: after_cursor}
+
+    case graphql(@all_comments_query, variables, opts) do
+      {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes} = page}}}} when is_list(nodes) ->
+        acc = acc ++ Enum.map(nodes, &comment_from_node/1)
+
+        case page["pageInfo"] do
+          %{"hasNextPage" => true, "endCursor" => cursor} when is_binary(cursor) ->
+            read_comment_pages(issue_id, cursor, acc, pages_left - 1, opts)
+
+          _ ->
+            {:ok, acc}
+        end
 
       {:ok, body} ->
         {:error, {:unexpected_comments_response, body}}
@@ -307,6 +345,14 @@ defmodule SymphonyElixir.Linear.Client do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp comment_from_node(node) do
+    %{
+      body: node["body"] || "",
+      author: get_in(node, ["user", "name"]) || "Unknown",
+      created_at: parse_datetime(node["createdAt"])
+    }
   end
 
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}

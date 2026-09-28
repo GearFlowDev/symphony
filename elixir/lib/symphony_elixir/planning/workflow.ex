@@ -98,7 +98,11 @@ defmodule SymphonyElixir.Planning.Workflow do
 
     # A failed read defers the re-plan: a plan made without the person's
     # answer would stamp a newer generated_at and never be re-made.
-    case issue |> issue_id() |> fetch_comments.() do
+    # A plan is stored with the issue's Linear id, so an issue map without one
+    # still reads, and re-saves, the right thread.
+    issue = if issue_id(issue), do: issue, else: Map.put(issue, :id, plan.issue_id)
+
+    case fetch_comments.(issue_id(issue)) do
       {:ok, comments} ->
         planner_opts =
           opts
@@ -114,10 +118,17 @@ defmodule SymphonyElixir.Planning.Workflow do
     end
   end
 
-  defp issue_id(issue), do: Map.get(issue, :id) || Map.get(issue, "id")
+  defp issue_id(issue) do
+    case Map.get(issue, :id) || Map.get(issue, "id") do
+      id when is_binary(id) and id != "" -> id
+      _ -> nil
+    end
+  end
 
-  defp fetch_comments(issue_id) when is_binary(issue_id), do: Client.read_all_issue_comments(issue_id)
-  defp fetch_comments(_issue_id), do: {:ok, []}
+  # With no Linear id there is no thread to read, and an empty list would pass
+  # for a thread with no answer.
+  defp fetch_comments(issue_id) when is_binary(issue_id) and issue_id != "", do: Client.read_all_issue_comments(issue_id)
+  defp fetch_comments(_issue_id), do: {:error, :no_issue_id}
 
   defp posted_after?(%{created_at: %DateTime{} = at}, parked_at), do: DateTime.compare(at, parked_at) == :gt
   defp posted_after?(_comment, _parked_at), do: false

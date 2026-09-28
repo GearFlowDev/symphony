@@ -116,6 +116,16 @@ defmodule SymphonyElixir.ReplanAfterReleaseTest do
     assert Planning.get_plan_by_issue("SYM-RP").metadata == stored.metadata
   end
 
+  test "an issue map without an id reads the thread of the stored plan's issue" do
+    stored_plan(DateTime.add(DateTime.utc_now(), -3600, :second))
+    {:ok, park} = History.record_park("SYM-RP", "R3 needs a human ruling")
+
+    opts = [request_fun: replan_request(self()), comments_fun: comments_fun(park.inserted_at)]
+
+    assert {:ok, {:has_open_rows, plan, _open}} = PlanningWorkflow.assess(Map.delete(issue(), :id), opts)
+    assert Enum.map(Plan.rows(plan), & &1["id"]) == ["R1", "R2"]
+  end
+
   test "a plan made after the last park is kept" do
     {:ok, _park} = History.record_park("SYM-RP", "earlier park")
     stored_plan(DateTime.add(DateTime.utc_now(), 60, :second))
@@ -135,6 +145,42 @@ defmodule SymphonyElixir.ReplanAfterReleaseTest do
     assert {:ok, {:has_open_rows, plan, _open}} = PlanningWorkflow.assess(issue(), opts)
     assert length(Plan.rows(plan)) == 3
     refute_received {:planner_prompt, _}
+  end
+
+  describe "Client.read_all_issue_comments/2" do
+    defp page(bodies, next_cursor) do
+      nodes = Enum.map(bodies, &%{"body" => &1, "createdAt" => "2026-09-28T10:00:00Z", "user" => %{"name" => "Owner"}})
+      page_info = %{"hasNextPage" => not is_nil(next_cursor), "endCursor" => next_cursor}
+      {:ok, %{status: 200, body: %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes, "pageInfo" => page_info}}}}}}
+    end
+
+    test "reads every page, so an answer past the first page is kept" do
+      request_fun = fn payload, _headers ->
+        case payload["variables"].after do
+          nil -> page(["old 1", "old 2"], "c1")
+          "c1" -> page(["the answer"], nil)
+        end
+      end
+
+      assert {:ok, comments} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
+      assert Enum.map(comments, & &1.body) == ["old 1", "old 2", "the answer"]
+    end
+
+    test "a failed page is an error, not a shorter thread" do
+      request_fun = fn payload, _headers ->
+        case payload["variables"].after do
+          nil -> page(["old 1"], "c1")
+          "c1" -> {:ok, %{status: 500, body: %{}}}
+        end
+      end
+
+      assert {:error, {:linear_api_status, 500}} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
+    end
+
+    test "a thread past the page cap is an error, not a silent cut" do
+      request_fun = fn _payload, _headers -> page(["more"], "next") end
+      assert {:error, :too_many_comment_pages} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
+    end
   end
 
   describe "Planner.keep_done_rows/2" do

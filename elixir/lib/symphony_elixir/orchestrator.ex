@@ -2463,8 +2463,14 @@ defmodule SymphonyElixir.Orchestrator do
   # Transient plan-generation failures are session-startup blips (the planner's
   # tmux OneShot not becoming ready in time), not genuine "needs a human"
   # blocks. The poller retries active issues, so these recover on their own.
-  defp transient_plan_failure?({:plan_assess_failed, {:start_session_failed, _}}), do: true
-  defp transient_plan_failure?(_), do: false
+  # A bare `:not_found` is the same blip one step later: `TmuxCLI.await_jsonl/2`
+  # gave up before a slow cold start wrote its transcript, and a healthy issue
+  # parked in Shaping (GEA-10456, GEA-10595).
+  @doc false
+  @spec transient_plan_failure?(term()) :: boolean()
+  def transient_plan_failure?({:plan_assess_failed, {:start_session_failed, _}}), do: true
+  def transient_plan_failure?({:plan_assess_failed, :not_found}), do: true
+  def transient_plan_failure?(_), do: false
 
   # A report posted before the issue's last park belongs to a finished release,
   # the same rule `History.latest_tester_verdict/1` applies to the DB (GEA-10531).

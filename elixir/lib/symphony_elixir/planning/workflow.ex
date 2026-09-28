@@ -113,11 +113,11 @@ defmodule SymphonyElixir.Planning.Workflow do
 
   defp issue_id(issue), do: Map.get(issue, :id) || Map.get(issue, "id")
 
+  # The client logs a Linear failure and returns {:ok, []}, so a failed read
+  # re-plans from the body alone.
   defp fetch_comments(issue_id) when is_binary(issue_id) do
-    case Client.fetch_all_issue_comments(issue_id) do
-      {:ok, comments} -> comments
-      _ -> []
-    end
+    {:ok, comments} = Client.fetch_all_issue_comments(issue_id)
+    comments
   end
 
   defp fetch_comments(_issue_id), do: []

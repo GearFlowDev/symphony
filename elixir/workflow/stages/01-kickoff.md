@@ -44,8 +44,11 @@ Write the plan to a file, then post it:
 
 ```bash
 LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
-"$LINEAR" comments {{ issue.identifier }} | grep -q '## Requirements' && echo "plan exists — skip"
-"$LINEAR" comment {{ issue.identifier }} --body-file /tmp/plan-{{ issue.identifier }}.md
+if "$LINEAR" comments {{ issue.identifier }} | grep -q '## Requirements'; then
+  echo "plan exists — skip"
+else
+  "$LINEAR" comment {{ issue.identifier }} --body-file /tmp/plan-{{ issue.identifier }}.md
+fi
 ```
 
 ### Done

@@ -34,13 +34,15 @@ ls -la priv/static/assets/app.js
 source .symphony_slot
 curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null \
   || { direnv exec . mix phx.server > .phx.log 2>&1 & }
-for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && echo "backend up" && break; sleep 2; done
+up=""
+for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && up=1 && break; sleep 2; done
+[ -n "$up" ] && echo "backend up" || { echo "backend DOWN after 120 s — see .phx.log"; tail -n 30 .phx.log; }
 
 # Playwright is on the system via npx — verify (will install Chromium on first call)
 npx --yes playwright --version
 ```
 
-If `app.js` is < ~250KB, the bundle is a stub — rebuild and retry. If preflight fails, post a `## Tester Report` with `Recommendation: BLOCKED` and stop.
+If `app.js` is < ~250KB, the bundle is a stub — rebuild and retry. If preflight fails — a stub bundle after a rebuild, or `backend DOWN` — post a `## Tester Report` with `Recommendation: BLOCKED` and stop.
 
 ### Step 3: How to drive a real browser (use this — do NOT report "no Playwright tooling")
 
@@ -50,10 +52,12 @@ You are running inside Symphony's harness with an empty MCP server config — th
 
 The pattern: write a one-shot Node script per page that opens the LiveView route on `PHOENIX_PORT`, takes screenshots at desktop (1280) and tablet (768) widths, and prints any console errors. Then turn the PNGs into embed lines with `${SYMPHONY_SCRIPTS}linear-embed-images.sh` and paste them into your Tester Report.
 
-Example you can adapt — save as `/tmp/walk-<page>.mjs` and run `node /tmp/walk-<page>.mjs`:
+Example you can adapt — save as `/tmp/walk-<page>.cjs`. Playwright is installed globally, so run it with `NODE_PATH="$(npm root -g)"`: a script under `/tmp` cannot resolve the package otherwise, and an ES module ignores `NODE_PATH`, so the script is CommonJS.
 
 ```javascript
-import { chromium } from 'playwright';
+const { chromium } = require('playwright');
+
+(async () => {
 
 // 127.0.0.1, not localhost: slot servers bind IPv4 and `localhost` can resolve to ::1.
 const APP = `http://127.0.0.1:${process.env.PHOENIX_PORT}`;
@@ -77,13 +81,14 @@ for (const [width, label] of [[1280, 'desktop'], [768, 'tablet']]) {
 
 await browser.close();
 console.log(JSON.stringify({ errors }, null, 2));
+})();
 ```
 
 Then for each page:
 
 ```bash
 set -a; source .symphony_slot; set +a   # exports PHOENIX_PORT to the script
-WALK_EMAIL="${GF_EMAIL_HANDLE:-$(whoami)}+dispatcher@gearflow.com" node /tmp/walk-<page>.mjs <route>
+WALK_EMAIL="${GF_EMAIL_HANDLE:-$(whoami)}+dispatcher@gearflow.com" NODE_PATH="$(npm root -g)" node /tmp/walk-<page>.cjs <route>
 # Upload the screenshots you just captured and get ready-to-paste markdown.
 # Pass the ACTUAL files you saved — any names, any number. The helper uploads
 # each to Linear and prints one `![name](assetUrl)` line per file. It reports

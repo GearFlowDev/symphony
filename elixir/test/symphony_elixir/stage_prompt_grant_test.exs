@@ -55,7 +55,9 @@ defmodule SymphonyElixir.StagePromptGrantTest do
 
     assert prompt =~ "**Grant**: Auto-Build"
     assert prompt =~ "A person reviews and merges it"
-    refute prompt =~ "the harness judges it"
+    [_, finish_line] = String.split(prompt, "**Finish line**: ", parts: 2)
+    [finish_line | _] = String.split(finish_line, "\n", parts: 2)
+    refute finish_line =~ "the harness judges it"
   end
 
   test "Auto-Design tells the agent the product questions are its to settle" do

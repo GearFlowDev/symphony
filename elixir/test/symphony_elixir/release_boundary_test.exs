@@ -165,6 +165,6 @@ defmodule SymphonyElixir.ReleaseBoundaryTest do
     src = File.read!(Path.expand("../../lib/symphony_elixir/orchestrator.ex", __DIR__))
 
     assert src =~ "|> settle_park(issue, message, move_result)"
-    assert src =~ "|> record_park_if_moved(identifier, message)"
+    assert src =~ "record_park_if_moved(move_result, identifier, message)"
   end
 end

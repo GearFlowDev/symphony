@@ -308,6 +308,10 @@ defmodule SymphonyElixir.Orchestrator do
 
         Logger.warning("Agent needs help: issue_id=#{issue_id} identifier=#{identifier} session_id=#{session_id}; message=#{message}")
 
+        # Move issue to review state if configured (Shaping on the Gearflow boxes).
+        # FIRST, so the card below says "parked" only when the move landed.
+        move_result = move_issue_to_needs_human_state(issue_id, identifier, Config.escalation_needs_human_state())
+
         # Notify via Linear comment and webhook
         Notifier.notify(:needs_human, %{
           issue_id: issue_id,
@@ -315,16 +319,13 @@ defmodule SymphonyElixir.Orchestrator do
           title: running_entry |> Map.get(:issue) |> issue_title(),
           help_message: message,
           source: :agent,
-          parked_state: Config.escalation_needs_human_state()
+          parked_state: parked_state(move_result)
         })
 
         # The run is over, whatever a person does next.
         clear_working_label(issue_id, identifier)
 
-        # Move issue to review state if configured (Shaping on the Gearflow boxes).
-        issue_id
-        |> move_issue_to_needs_human_state(identifier, Config.escalation_needs_human_state())
-        |> record_park_if_moved(identifier, message)
+        record_park_if_moved(move_result, identifier, message)
 
         # Record escalation in history
         run_id = Map.get(running_entry, :history_run_id)
@@ -398,6 +399,10 @@ defmodule SymphonyElixir.Orchestrator do
       error: "agent exited: #{inspect(reason)}"
     })
   end
+
+  # The state the card may name: the configured park state, and only once the move landed.
+  defp parked_state(:moved), do: Config.escalation_needs_human_state()
+  defp parked_state(_move_result), do: nil
 
   defp issue_title(%{title: title}) when is_binary(title), do: title
   defp issue_title(_issue), do: nil
@@ -2429,16 +2434,17 @@ defmodule SymphonyElixir.Orchestrator do
 
       message = "Symphony could not produce or advance a plan: #{inspect(reason)}"
 
+      # Move FIRST, so the card says "parked" only when the move landed.
+      move_result = move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())
+
       Notifier.notify(:needs_human, %{
         issue_id: issue.id,
         identifier: issue.identifier,
         title: issue_title(issue),
         help_message: message,
         source: :orchestrator,
-        parked_state: Config.escalation_needs_human_state()
+        parked_state: parked_state(move_result)
       })
-
-      move_result = move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())
 
       # A PARKED ISSUE STILL OWES A PR. It gets no more dispatches, so whatever
       # the worker pushed is all there will ever be — and a person (or the

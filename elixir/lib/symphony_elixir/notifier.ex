@@ -106,7 +106,7 @@ defmodule SymphonyElixir.Notifier do
     with {:ok, %{id: project_id} = project} when is_binary(project_id) <- safely(fn -> project_fn.(issue_id) end),
          :ok <- safely(fn -> project_comment_fn.(project_id, body) end) do
       Logger.info("Notifier: posted the needs_human ask for #{who} on project #{project[:name] || project_id}")
-      post_linear_comment(:needs_human_pointer, Map.put(details, :project, project), issue_id, comment_fn)
+      post_pointer(details, project, issue_id, comment_fn)
     else
       {:ok, nil} ->
         post_linear_comment(:needs_human, details, issue_id, comment_fn)
@@ -114,6 +114,22 @@ defmodule SymphonyElixir.Notifier do
       other ->
         Logger.warning("Notifier: could not post the needs_human ask for #{who} on its project (#{inspect(other)}); posting it on the issue")
         post_linear_comment(:needs_human, details, issue_id, comment_fn)
+    end
+  end
+
+  # A FAILED POINTER IS LOGGED, NOT RETRIED. The ask itself is posted, and posting the
+  # card again on the issue would put one ask in two places — the thing the ask rule
+  # forbids. The warning names where the ask is.
+  defp post_pointer(details, project, issue_id, comment_fn) do
+    who = details[:identifier] || issue_id
+    pointer = format_linear_comment(:needs_human_pointer, Map.put(details, :project, project))
+
+    case safely(fn -> comment_fn.(issue_id, pointer) end) do
+      :ok ->
+        Logger.info("Notifier: posted the needs_human pointer on #{who}")
+
+      other ->
+        Logger.warning("Notifier: the needs_human ask for #{who} is on project #{project[:name] || project[:id]}, but the pointer on the issue failed: #{inspect(other)}")
     end
   end
 

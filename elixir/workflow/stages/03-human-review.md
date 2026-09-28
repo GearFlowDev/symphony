@@ -16,8 +16,12 @@ The app is Phoenix LiveView on `PHOENIX_PORT`; there is no frontend server. The 
 ```bash
 curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null \
   || { direnv exec . mix phx.server > .phx.log 2>&1 & }
-for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && echo "backend up" && break; sleep 2; done
+up=""
+for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && up=1 && break; sleep 2; done
+[ -n "$up" ] && echo "backend up" || { echo "backend DOWN after 120 s — see .phx.log"; tail -n 30 .phx.log; }
 ```
+
+If the backend is DOWN, post a comment that says so, with the tail of `.phx.log`, and stop. Do not post screenshots of an error page.
 
 ### Step 2: Browser testing
 

@@ -2480,11 +2480,13 @@ defmodule SymphonyElixir.Orchestrator do
   # blocks. The poller retries active issues, so these recover on their own.
   # A bare `:not_found` is the same blip one step later: `TmuxCLI.await_jsonl/2`
   # gave up before a slow cold start wrote its transcript, and a healthy issue
-  # parked in Shaping (GEA-10456, GEA-10595).
+  # parked in Shaping (GEA-10456, GEA-10595). A Linear read that failed while a
+  # released issue re-plans is a blip too: the next poll reads again (GEA-10664).
   @doc false
   @spec transient_plan_failure?(term()) :: boolean()
   def transient_plan_failure?({:plan_assess_failed, {:start_session_failed, _}}), do: true
   def transient_plan_failure?({:plan_assess_failed, :not_found}), do: true
+  def transient_plan_failure?({:plan_assess_failed, {:comments_unavailable, _}}), do: true
   def transient_plan_failure?(_), do: false
 
   # A report posted before the issue's last park belongs to a finished release,

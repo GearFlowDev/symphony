@@ -266,9 +266,28 @@ defmodule SymphonyElixir.Linear.Client do
   @doc """
   Fetch ALL comments on an issue (no @agent filter). Used by the evaluator
   to check for evidence and plan comments posted by the agent itself.
+  A Linear failure logs and reads as no comments; use
+  `read_all_issue_comments/1` when an empty thread and a failed read differ.
   """
   @spec fetch_all_issue_comments(String.t()) :: {:ok, list(map())}
   def fetch_all_issue_comments(issue_id) when is_binary(issue_id) do
+    case read_all_issue_comments(issue_id) do
+      {:ok, comments} ->
+        {:ok, comments}
+
+      {:error, reason} ->
+        Logger.warning("Failed to fetch all comments for issue #{issue_id}: #{inspect(reason)}")
+        {:ok, []}
+    end
+  end
+
+  @doc """
+  Fetch ALL comments on an issue, and keep a Linear failure as an error. A
+  re-plan after a park needs this: a failed read must not pass for a thread
+  with no answer (GEA-10664).
+  """
+  @spec read_all_issue_comments(String.t()) :: {:ok, list(map())} | {:error, term()}
+  def read_all_issue_comments(issue_id) when is_binary(issue_id) do
     case graphql(@comments_query, %{issueId: issue_id, first: 50}) do
       {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}}} ->
         comments =
@@ -282,12 +301,11 @@ defmodule SymphonyElixir.Linear.Client do
 
         {:ok, comments}
 
-      {:ok, _body} ->
-        {:ok, []}
+      {:ok, body} ->
+        {:error, {:unexpected_comments_response, body}}
 
       {:error, reason} ->
-        Logger.warning("Failed to fetch all comments for issue #{issue_id}: #{inspect(reason)}")
-        {:ok, []}
+        {:error, reason}
     end
   end
 

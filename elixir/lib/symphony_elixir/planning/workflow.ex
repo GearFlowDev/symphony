@@ -96,31 +96,28 @@ defmodule SymphonyElixir.Planning.Workflow do
     Logger.info("Re-planning #{plan.issue_identifier}: released after a park at #{DateTime.to_iso8601(parked_at)}")
     fetch_comments = Keyword.get(opts, :comments_fun, &fetch_comments/1)
 
-    comments =
-      issue
-      |> issue_id()
-      |> fetch_comments.()
-      |> Enum.filter(&posted_after?(&1, parked_at))
+    # A failed read defers the re-plan: a plan made without the person's
+    # answer would stamp a newer generated_at and never be re-made.
+    case issue |> issue_id() |> fetch_comments.() do
+      {:ok, comments} ->
+        planner_opts =
+          opts
+          |> Keyword.put(:prior_plan, plan)
+          |> Keyword.put(:comments_since_park, Enum.filter(comments, &posted_after?(&1, parked_at)))
+          |> Keyword.put(:metadata, Map.put(plan.metadata || %{}, "replanned_after_park", DateTime.to_iso8601(parked_at)))
 
-    planner_opts =
-      opts
-      |> Keyword.put(:prior_plan, plan)
-      |> Keyword.put(:comments_since_park, comments)
-      |> Keyword.put(:metadata, Map.put(plan.metadata || %{}, "replanned_after_park", DateTime.to_iso8601(parked_at)))
+        Planner.plan(issue, planner_opts)
 
-    Planner.plan(issue, planner_opts)
+      {:error, reason} ->
+        Logger.warning("Re-plan of #{plan.issue_identifier} deferred: comments unreadable: #{inspect(reason)}")
+        {:error, {:comments_unavailable, reason}}
+    end
   end
 
   defp issue_id(issue), do: Map.get(issue, :id) || Map.get(issue, "id")
 
-  # The client logs a Linear failure and returns {:ok, []}, so a failed read
-  # re-plans from the body alone.
-  defp fetch_comments(issue_id) when is_binary(issue_id) do
-    {:ok, comments} = Client.fetch_all_issue_comments(issue_id)
-    comments
-  end
-
-  defp fetch_comments(_issue_id), do: []
+  defp fetch_comments(issue_id) when is_binary(issue_id), do: Client.read_all_issue_comments(issue_id)
+  defp fetch_comments(_issue_id), do: {:ok, []}
 
   defp posted_after?(%{created_at: %DateTime{} = at}, parked_at), do: DateTime.compare(at, parked_at) == :gt
   defp posted_after?(_comment, _parked_at), do: false

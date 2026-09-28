@@ -8,6 +8,8 @@ defmodule SymphonyElixir.StagePromptAskRuleTest do
 
   use ExUnit.Case, async: true
 
+  alias SymphonyElixir.Workflow.StageLoader
+
   @stages_dir Path.expand("../../workflow/stages", __DIR__)
 
   defp stage(name), do: File.read!(Path.join(@stages_dir, name))
@@ -55,6 +57,24 @@ defmodule SymphonyElixir.StagePromptAskRuleTest do
     end
 
     assert stage("_continuation.md") =~ ~s("$LINEAR" comments {{ issue.identifier }})
+  end
+
+  test "the continuation prompt reaches the agent with the issue's identifier filled in (GEA-10619)" do
+    stages = %{"_continuation.md" => stage("_continuation.md")}
+    prompt = StageLoader.assemble_continuation(stages, 2, 20, [], "GEA-7")
+
+    assert prompt =~ ~s("$LINEAR" comments GEA-7 --since)
+    assert prompt =~ "`GEA-7: <row-id> <summary>`"
+    refute prompt =~ "{{"
+  end
+
+  test "an identifier that is not Linear-shaped never reaches the shell command" do
+    stages = %{"_continuation.md" => stage("_continuation.md")}
+
+    for bad <- ["GEA-7; rm -rf /", "GEA-7 $(id)", "gea-7", ""] do
+      prompt = StageLoader.assemble_continuation(stages, 2, 20, [], bad)
+      assert prompt =~ ~s("$LINEAR" comments {{ issue.identifier }} --since)
+    end
   end
 
   test "no stage describes the deleted React app, its frontend server or its ?lv= flags (GEA-10619)" do

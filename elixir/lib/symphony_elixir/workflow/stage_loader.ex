@@ -89,8 +89,15 @@ defmodule SymphonyElixir.Workflow.StageLoader do
     end
   end
 
-  defp replace_identifier(text, identifier) when is_binary(identifier) and identifier != "" do
-    String.replace(text, ["{{ issue.identifier }}", "{{issue.identifier}}"], identifier)
+  # ONLY A LINEAR-SHAPED IDENTIFIER GOES IN. The template puts it into a shell command
+  # the agent runs, so anything that is not `TEAM-123` stays a raw placeholder: the
+  # step then fails loudly instead of running altered arguments (CodeRabbit, PR #15).
+  defp replace_identifier(text, identifier) when is_binary(identifier) do
+    if Regex.match?(~r/\A[A-Z][A-Z0-9]*-[0-9]+\z/, identifier) do
+      String.replace(text, ["{{ issue.identifier }}", "{{issue.identifier}}"], identifier)
+    else
+      text
+    end
   end
 
   defp replace_identifier(text, _identifier), do: text

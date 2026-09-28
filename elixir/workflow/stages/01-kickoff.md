@@ -20,9 +20,9 @@ Use the **Agent tool with `subagent_type: "Explore"`** for broader searches so y
 
 ### Post your implementation plan to Linear
 
-First, check if a plan has already been posted by fetching the issue comments and looking for "## Requirements". If a plan already exists, skip this step — do NOT post a duplicate.
+First, check if a plan has already been posted: read the issue comments (`"$LINEAR" comments {{ issue.identifier }}`, below) and look for "## Requirements". If a plan already exists, skip this step — do NOT post a duplicate.
 
-If no plan exists, post a comment on the Linear issue using curl. The plan must be specific enough that a **different agent** (who has not read the codebase) can implement it.
+If no plan exists, post a comment on the Linear issue through `bin/linear`, never `curl`. The plan must be specific enough that a **different agent** (who has not read the codebase) can implement it.
 
 The comment must include:
 
@@ -40,11 +40,12 @@ The comment must include:
 
 3. **Open questions and the defaults this run takes** — for each point the issue leaves open, the most reasonable reading and the default you build to. These are not blockers (see If You Get Stuck).
 
+Write the plan to a file, then post it:
+
 ```bash
-curl -s -X POST https://api.linear.app/graphql \
-  -H "Authorization: ${LINEAR_API_KEY_AUTOMATION:-$LINEAR_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", "variables": {"id": "{{ issue.id }}", "body": "YOUR_COMMENT_HERE"}}'
+LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
+"$LINEAR" comments {{ issue.identifier }} | grep -q '## Requirements' && echo "plan exists — skip"
+"$LINEAR" comment {{ issue.identifier }} --body-file /tmp/plan-{{ issue.identifier }}.md
 ```
 
 ### Done

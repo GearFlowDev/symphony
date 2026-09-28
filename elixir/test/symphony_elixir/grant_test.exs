@@ -75,7 +75,18 @@ defmodule SymphonyElixir.GrantTest do
     assert Grant.finish_line(:design) =~ "A person reviews and merges it"
     assert Grant.finish_line(:design) =~ "Product questions"
     refute Grant.finish_line(:build) =~ "Product questions on the way are yours"
-    assert Grant.finish_line(:merge) =~ "the harness judges the hand-off and merges"
+    assert Grant.finish_line(:merge) =~ "the harness judges it"
+  end
+
+  test "the Auto-Merge finish line promises the judgment, never the merge (GEA-10619)" do
+    # Who merges after the hand-off depends on the issue's project (GEA-10264). Off an
+    # `auto-project` board nothing merges, so a line that says the harness merges is false
+    # there, and the agent tells a person nothing is left to do.
+    line = Grant.finish_line(:merge)
+
+    assert line =~ "`bin/linear handoff`"
+    assert line =~ "You never merge it"
+    refute line =~ ~r/harness[^.]*merges/i
   end
 
   test "the template map carries the label, the finish line and whether it hands off" do

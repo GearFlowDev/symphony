@@ -29,10 +29,12 @@ Match the verification to the row's deliverable:
 direnv exec . mix assets.build
 ls -la priv/static/assets/app.js
 
-# Backend up
+# Backend up. It is NOT started for you: start it when it is down, and stop it after the walk.
+# Phoenix serves every page on PHOENIX_PORT; there is no frontend server.
 source .symphony_slot
-curl -sf "http://localhost:$PHOENIX_PORT/" >/dev/null && echo "backend up"
-curl -sf "http://localhost:$FRONTEND_PORT/" >/dev/null && echo "frontend up"
+curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null \
+  || { direnv exec . mix phx.server > .phx.log 2>&1 & }
+for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && echo "backend up" && break; sleep 2; done
 
 # Playwright is on the system via npx — verify (will install Chromium on first call)
 npx --yes playwright --version
@@ -42,31 +44,35 @@ If `app.js` is < ~250KB, the bundle is a stub — rebuild and retry. If prefligh
 
 ### Step 3: How to drive a real browser (use this — do NOT report "no Playwright tooling")
 
+The `screenshot` skill in the gf_engineering workspace is the full method (`$GEARFLOW_WORKSPACE/.claude/skills/screenshot/SKILL.md`). The short form follows.
+
 You are running inside Symphony's harness with an empty MCP server config — there is no Playwright MCP. **That does not mean Playwright is unavailable.** It is installed on the system. Drive it directly from Bash via `npx playwright`.
 
-The pattern: write a one-shot Node script per page that opens both the React and LV URLs, takes screenshots at desktop (1280) and tablet (768) widths, and prints any console errors. Then upload the PNGs to Linear via `${SYMPHONY_SCRIPTS}linear-upload-image.sh` and embed the asset URLs in your Tester Report.
+The pattern: write a one-shot Node script per page that opens the LiveView route on `PHOENIX_PORT`, takes screenshots at desktop (1280) and tablet (768) widths, and prints any console errors. Then turn the PNGs into embed lines with `${SYMPHONY_SCRIPTS}linear-embed-images.sh` and paste them into your Tester Report.
 
 Example you can adapt — save as `/tmp/walk-<page>.mjs` and run `node /tmp/walk-<page>.mjs`:
 
 ```javascript
 import { chromium } from 'playwright';
 
-const FRONTEND = `http://localhost:${process.env.FRONTEND_PORT}`;
+// 127.0.0.1, not localhost: slot servers bind IPv4 and `localhost` can resolve to ::1.
+const APP = `http://127.0.0.1:${process.env.PHOENIX_PORT}`;
 const PAGE = process.argv[2] || '/issues';
-const COOKIE = process.env.SESSION_COOKIE; // log in once, save to env
+const EMAIL = process.env.WALK_EMAIL; // a seeded user, e.g. "${GF_EMAIL_HANDLE:-$(whoami)}+dispatcher@gearflow.com"
 
 const errors = [];
 const browser = await chromium.launch();
 
 for (const [width, label] of [[1280, 'desktop'], [768, 'tablet']]) {
-  for (const [flagState, urlSuffix] of [['react', '?lv=off'], ['lv', '?lv=on']]) {
-    const ctx = await browser.newContext({ viewport: { width, height: 900 }, storageState: { cookies: [{name:'_session', value: COOKIE, domain:'localhost', path:'/'}], origins: [] } });
-    const page = await ctx.newPage();
-    page.on('console', msg => { if (msg.type() === 'error') errors.push(`${flagState} ${label} ${PAGE}: ${msg.text()}`); });
-    await page.goto(`${FRONTEND}${PAGE}${urlSuffix}`, { waitUntil: 'networkidle' });
-    await page.screenshot({ path: `/tmp/walk-${PAGE.replaceAll('/','_')}-${flagState}-${label}.png`, fullPage: true });
-    await ctx.close();
-  }
+  const ctx = await browser.newContext({ viewport: { width, height: 900 } });
+  const page = await ctx.newPage();
+  page.on('console', msg => { if (msg.type() === 'error') errors.push(`${label} ${PAGE}: ${msg.text()}`); });
+  // Log in with the dev-only auto-login: it sets the session cookie, no login page.
+  // (The Full Platform's login page sends a one-time code, so a script cannot use it.)
+  await page.goto(`${APP}/xray/${encodeURIComponent(EMAIL)}`, { waitUntil: 'networkidle' });
+  await page.goto(`${APP}${PAGE}`, { waitUntil: 'networkidle' });
+  await page.screenshot({ path: `/tmp/walk-${PAGE.replaceAll('/','_')}-${label}.png`, fullPage: true });
+  await ctx.close();
 }
 
 await browser.close();
@@ -76,7 +82,8 @@ console.log(JSON.stringify({ errors }, null, 2));
 Then for each page:
 
 ```bash
-node /tmp/walk-<page>.mjs <route>
+set -a; source .symphony_slot; set +a   # exports PHOENIX_PORT to the script
+WALK_EMAIL="${GF_EMAIL_HANDLE:-$(whoami)}+dispatcher@gearflow.com" node /tmp/walk-<page>.mjs <route>
 # Upload the screenshots you just captured and get ready-to-paste markdown.
 # Pass the ACTUAL files you saved — any names, any number. The helper uploads
 # each to Linear and prints one `![name](assetUrl)` line per file. It reports
@@ -98,16 +105,16 @@ For each row in the Contract:
 1. Run the Playwright script for the route covering this row.
 2. **Two-record rule.** Walk it on at least two representative records (empty + populated, two card variants, or one of each role-gated record). Add a second route invocation with a different record id.
 3. **Click everything** the row covers — buttons, dropdowns, dialogs, drag targets, keyboard shortcuts. Extend the script with `page.click()` / `page.keyboard.press()` calls. The point is to surface event handlers that crash on second-render.
-4. **Only when the work is a React-parity migration**: the script above already loads both URLs side-by-side. Diff the resulting screenshots character-by-character on copy, icon name, badge variant, dropdown option format. For work that isn't parity-bound, verify against the issue's own requirements instead — there is no React reference to diff against.
+4. **Verify against the issue's own requirements.** There is no React app to diff against: it was deleted on 2026-07-06 (GEA-4136). When the issue names a reference (a design, a sibling page, a storybook component), diff your screenshots against that reference on copy, icon name, badge variant and dropdown option format.
 5. **Console must be clean.** The script's `errors` output is your evidence. New errors are blockers; pre-existing warnings are allowed only if listed in the Contract's "Known issues" section.
 6. Mark the row in your scratchpad:
    - `✅ verified` — implemented and behaves like the spec
    - `⚠ partial` — implemented but with drift; describe the drift specifically
    - `❌ missing or broken` — not implemented, or implemented but crashes / misbehaves
 
-### Step 4b: Shell & integration parity (overlay / cross-cutting components)
+### Step 4b: Shell & integration (overlay / cross-cutting components)
 
-If the work migrates an overlay/sheet/modal, or a component reachable from more than one page, walking the content rows is NOT enough — the parity gaps live in how the component behaves as a *shell* and integrates with the rest of the app, none of which shows up as a per-row "does the card render". Against the reference (React), verify and screenshot:
+If the work adds or changes an overlay/sheet/modal, or a component reachable from more than one page, walking the content rows is NOT enough — the gaps live in how the component behaves as a *shell* and integrates with the rest of the app, none of which shows up as a per-row "does the card render". Against the reference the issue names (a design, or the sibling components that already do this), verify and screenshot:
 
 - **Dismiss & interaction.** Open it, then: click a blank area outside it (does it close like the reference?), click a nav link or button *outside* it (does the link navigate, or get eaten by an overlay?), press Escape, and use the back/close control. Match the reference's backdrop exactly — a dimmed scrim, or deliberately none with the underlying list still visible and interactive.
 - **Every breakpoint.** At mobile and desktop widths, confirm the layout matches the reference (e.g. full-screen vs. fixed-width sidebar) at the *same* breakpoint the reference uses — don't accept `sm` where the reference flips at `md`.
@@ -115,9 +122,9 @@ If the work migrates an overlay/sheet/modal, or a component reachable from more 
 
 Drift here (wrong backdrop, wrong breakpoint, a missing entry point, the wrong dismiss destination) is `⚠ partial` or `❌`, exactly like content drift.
 
-### Step 4c: Flippability sweep (flag-on, component + siblings)
+### Step 4c: Sibling-route sweep (component + siblings)
 
-A flag is only flippable if turning it on doesn't break its neighbors. With every relevant `lv_*` flag ON, load the component's own route AND every sibling section route that shares its layout or data helpers. Assert each returns HTTP 200 with a clean console — no 500, `KeyError`, or `Ecto.Query.CastError`. This is cheap and catches the classic flip failures: a `/:section/inbox` path cast as a record id, or a shared helper that returns an incomplete struct once the flag enables a new template branch. Any crash is `❌` and forces `REQUEST_CHANGES` (or `BLOCKED` if the route won't load at all), regardless of how clean the content rows looked.
+A change is only safe if it doesn't break its neighbors. Load the component's own route AND every sibling section route that shares its layout or data helpers. Assert each returns HTTP 200 with a clean console — no 500, `KeyError`, or `Ecto.Query.CastError`. This is cheap and catches the classic failures: a `/:section/inbox` path cast as a record id, or a shared helper that returns an incomplete struct once a new template branch reads it. Any crash is `❌` and forces `REQUEST_CHANGES` (or `BLOCKED` if the route won't load at all), regardless of how clean the content rows looked.
 
 ### Step 4d: Structural completeness sweep (every PR, not just UI)
 
@@ -142,14 +149,12 @@ Report what you swept and what you found. Treat a confirmed stale caller / un-up
 
 **The Tester Report goes to the Linear issue and NOWHERE else.** The orchestrator
 parses it from Linear comments — a report posted to the GitHub PR is invisible to
-it, so the issue loops forever. Post it with the Linear GraphQL `commentCreate`
-mutation against `{{ issue.id }}`:
+it, so the issue loops forever. Write the report to a file and post it through
+`bin/linear`, never `curl`:
 
 ```bash
-curl -s -X POST https://api.linear.app/graphql \
-  -H "Authorization: ${LINEAR_API_KEY_AUTOMATION:-$LINEAR_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", "variables": {"id": "{{ issue.id }}", "body": "YOUR_TESTER_REPORT"}}'
+LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
+"$LINEAR" comment {{ issue.identifier }} --body-file /tmp/tester-report-{{ issue.identifier }}.md
 ```
 
 **NEVER** post the report to GitHub — no `gh pr comment`, no `gh pr review`, no
@@ -165,8 +170,8 @@ Report format:
 - Roles tested: <list, e.g. "dispatcher, requester">
 - Console: <clean | new errors: <list>>
 - Asset bundle: <fresh ~XXX KB | stub>
-- Shell parity (overlay/cross-cutting only): <n/a | verified: dismiss+breakpoints+entry-points | drift: <list>>
-- Flippability sweep: <n/a | routes loaded clean: <list> | crashes: <list>>
+- Shell (overlay/cross-cutting only): <n/a | verified: dismiss+breakpoints+entry-points | drift: <list>>
+- Sibling-route sweep: <n/a | routes loaded clean: <list> | crashes: <list>>
 - Structural completeness sweep: <changed contracts checked: <list of symbols/tables> | callers/writers all carried | stale: <file:line list>>
 
 ### Verified rows
@@ -176,7 +181,7 @@ Report format:
 
 ### Drift / partial
 
-- ⚠ Row N — <specific drift, e.g. "LV button label says 'Update' but React says 'Save'">
+- ⚠ Row N — <specific drift, e.g. "the button label says 'Update' but the issue says 'Save'">
 
 ### Missing / broken
 
@@ -184,8 +189,8 @@ Report format:
 
 ### Screenshots
 
-<paste the `![name](url)` lines printed by linear-embed-images.sh — side-by-side
-React-vs-LV for every state and dialog you walked. Never leave an empty `![]()`.>
+<paste the `![name](url)` lines printed by linear-embed-images.sh — every state
+and dialog you walked, at both widths. Never leave an empty `![]()`.>
 
 **Recommendation: APPROVE** | **REQUEST_CHANGES** | **BLOCKED**
 ```
@@ -199,7 +204,7 @@ like "no drift, standing recommendation holds" or "see prior report" and do NOT
 reference a previous verdict instead of stating one — the orchestrator can't
 parse that, reads it as REQUEST_CHANGES, and loops the issue forever. Choose:
 
-- **APPROVE** — every Contract row is `✅ verified`, console is clean, no drift, the structural completeness sweep is clean (no stale caller / un-updated writer / dead module), and (for an overlay/cross-cutting component) shell parity is verified and the flippability sweep is clean. The orchestrator marks Test done and dispatches Share Evidence.
+- **APPROVE** — every Contract row is `✅ verified`, console is clean, no drift, the structural completeness sweep is clean (no stale caller / un-updated writer / dead module), and (for an overlay/cross-cutting component) the shell is verified and the sibling-route sweep is clean. The orchestrator marks Test done and dispatches Share Evidence.
 - **REQUEST_CHANGES** — at least one row is `⚠` or `❌`. The orchestrator re-dispatches Implement to address the gaps.
 - **BLOCKED** — the page can't be tested at all (preflight failed, page won't load, slot is broken). Include a description of the blocker.
 

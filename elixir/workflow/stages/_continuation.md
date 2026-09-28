@@ -45,14 +45,11 @@ git push --no-verify --force-with-lease="refs/heads/$b:$seen" origin "$b"
 
 ## Step 3: @agent feedback
 
-Check Linear for any `@agent` comments newer than your last commit:
+Check Linear for any `@agent` comments newer than your last commit, through `bin/linear` (never `curl`):
 
 ```bash
-curl -s -X POST https://api.linear.app/graphql \
-  -H "Authorization: ${LINEAR_API_KEY_AUTOMATION:-$LINEAR_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "query { issue(id: \"{{issue_id}}\") { comments { nodes { body createdAt user { name } } } } }"}' \
-  | python3 -c "import sys,json; [print(f'{c[\"user\"][\"name\"]}: {c[\"body\"]}') for c in json.load(sys.stdin)['data']['issue']['comments']['nodes'] if '@agent' in c['body'].lower()]"
+LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
+"$LINEAR" comments {{ issue.identifier }} --since "$(git log -1 --format=%cI)" | grep -i -B2 -A20 '@agent'
 ```
 
 `@agent` instructions take priority over the row queue — implement them in this dispatch.

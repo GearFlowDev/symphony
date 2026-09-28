@@ -27,6 +27,29 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  # AN ASK GOES ON THE PROJECT'S THREAD when the issue has a project (the ask rule,
+  # gf_engineering CLAUDE.md → Asking; GEA-10619). The fork's issue query does not
+  # carry the project, so the one caller that needs it reads it here.
+  @issue_project_query """
+  query SymphonyIssueProject($issueId: String!) {
+    issue(id: $issueId) {
+      project {
+        id
+        name
+        url
+      }
+    }
+  }
+  """
+
+  @create_project_comment_mutation """
+  mutation SymphonyCreateProjectComment($projectId: String!, $body: String!) {
+    commentCreate(input: {projectId: $projectId, body: $body}) {
+      success
+    }
+  }
+  """
+
   @update_comment_mutation """
   mutation SymphonyUpdateComment($id: String!, $body: String!) {
     commentUpdate(id: $id, input: {body: $body}) {
@@ -149,6 +172,36 @@ defmodule SymphonyElixir.Linear.Adapter do
          true <- get_in(response, ["data", "commentCreate", "success"]) == true,
          id when is_binary(id) <- get_in(response, ["data", "commentCreate", "comment", "id"]) do
       {:ok, id}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :comment_create_failed}
+    end
+  end
+
+  @spec fetch_issue_project(String.t()) ::
+          {:ok, %{id: String.t(), name: String.t() | nil, url: String.t() | nil} | nil} | {:error, term()}
+  def fetch_issue_project(issue_id) when is_binary(issue_id) do
+    case client_module().graphql(@issue_project_query, %{issueId: issue_id}) do
+      {:ok, %{"data" => %{"issue" => %{} = issue}}} -> project_of(issue["project"])
+      {:ok, _response} -> {:error, :issue_project_lookup_failed}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp project_of(nil), do: {:ok, nil}
+
+  defp project_of(%{"id" => id} = project) when is_binary(id),
+    do: {:ok, %{id: id, name: project["name"], url: project["url"]}}
+
+  defp project_of(_project), do: {:error, :issue_project_lookup_failed}
+
+  @spec create_project_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  def create_project_comment(project_id, body) when is_binary(project_id) and is_binary(body) do
+    variables = %{projectId: project_id, body: body}
+
+    with {:ok, response} <- client_module().graphql(@create_project_comment_mutation, variables),
+         true <- get_in(response, ["data", "commentCreate", "success"]) == true do
+      :ok
     else
       {:error, reason} -> {:error, reason}
       _ -> {:error, :comment_create_failed}

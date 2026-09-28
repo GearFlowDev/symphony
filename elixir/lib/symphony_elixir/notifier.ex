@@ -4,6 +4,13 @@ defmodule SymphonyElixir.Notifier do
 
   Posts a structured Linear comment (always) and optionally sends a webhook POST.
   All work runs asynchronously via Task.Supervisor — failures are logged, never raised.
+
+  A PARK IS AN ASK, and an ask has one shape and one home (gf_engineering
+  `CLAUDE.md` → Asking; GEA-10619). `:needs_human` posts a decision card — goal,
+  status, problem, recommendation, then the ask with its default and its door — on
+  the issue's PROJECT thread when the issue has a project, and on the issue when it
+  has none. The issue then gets one line that links to the project and says how to
+  resume, because the next run reads the issue's comments and not the project's.
   """
 
   require Logger
@@ -22,6 +29,8 @@ defmodule SymphonyElixir.Notifier do
 
   Options (for testing):
     - `:comment_fn` — override for `Tracker.create_comment/2`
+    - `:project_fn` — override for `Tracker.fetch_issue_project/1`
+    - `:project_comment_fn` — override for `Tracker.create_project_comment/2`
     - `:webhook_fn` — override for `&send_webhook/2`
   """
   @spec notify(event_type(), map(), keyword()) :: :ok
@@ -51,10 +60,15 @@ defmodule SymphonyElixir.Notifier do
     webhook_fn = Keyword.get(opts, :webhook_fn, &send_webhook/2)
 
     # Post Linear comment (skip for operational events)
-    if is_binary(issue_id) and event_type not in @webhook_only_events do
-      post_linear_comment(event_type, details, issue_id, comment_fn)
-    else
-      Logger.info("Notifier: #{event_type} for #{details[:identifier] || issue_id} (webhook only)")
+    cond do
+      is_binary(issue_id) and event_type == :needs_human ->
+        post_ask_card(details, issue_id, comment_fn, opts)
+
+      is_binary(issue_id) and event_type not in @webhook_only_events ->
+        post_linear_comment(event_type, details, issue_id, comment_fn)
+
+      true ->
+        Logger.info("Notifier: #{event_type} for #{details[:identifier] || issue_id} (webhook only)")
     end
 
     # Send webhook
@@ -78,6 +92,35 @@ defmodule SymphonyElixir.Notifier do
       {:error, reason} ->
         Logger.warning("Notifier: failed to post comment for #{event_type}: #{inspect(reason)}")
     end
+  end
+
+  # THE CARD GOES ON THE PROJECT THREAD, ONCE. A failed project read or a failed
+  # project post falls back to the issue: an ask posted in the wrong place is a
+  # smaller failure than an ask posted nowhere.
+  defp post_ask_card(details, issue_id, comment_fn, opts) do
+    project_fn = Keyword.get(opts, :project_fn, &Tracker.fetch_issue_project/1)
+    project_comment_fn = Keyword.get(opts, :project_comment_fn, &Tracker.create_project_comment/2)
+    body = format_linear_comment(:needs_human, details)
+    who = details[:identifier] || issue_id
+
+    with {:ok, %{id: project_id} = project} when is_binary(project_id) <- safely(fn -> project_fn.(issue_id) end),
+         :ok <- safely(fn -> project_comment_fn.(project_id, body) end) do
+      Logger.info("Notifier: posted the needs_human ask for #{who} on project #{project[:name] || project_id}")
+      post_linear_comment(:needs_human_pointer, Map.put(details, :project, project), issue_id, comment_fn)
+    else
+      {:ok, nil} ->
+        post_linear_comment(:needs_human, details, issue_id, comment_fn)
+
+      other ->
+        Logger.warning("Notifier: could not post the needs_human ask for #{who} on its project (#{inspect(other)}); posting it on the issue")
+        post_linear_comment(:needs_human, details, issue_id, comment_fn)
+    end
+  end
+
+  defp safely(fun) do
+    fun.()
+  rescue
+    error -> {:error, Exception.message(error)}
   end
 
   defp send_webhook_notification(event_type, details, webhook_url, webhook_fn) do
@@ -157,23 +200,112 @@ defmodule SymphonyElixir.Notifier do
     |> String.trim()
   end
 
+  # THE DECISION CARD (gf_engineering `.claude/skills/decision-brief/SKILL.md` § The
+  # card): goal, status, problem, recommendation, then the ask with its default and its
+  # door, in that order. Symphony cannot act on silence — a parked issue never dispatches
+  # — so the default is "none" and the door is one-way: the issue waits for a person.
   def format_linear_comment(:needs_human, details) do
-    message = Map.get(details, :help_message, "No details provided")
+    card = ask_card(details)
+    who = Map.get(details, :identifier) || "this issue"
+    today = Date.to_iso8601(Date.utc_today())
+
+    {status, default} =
+      case Map.get(details, :parked_state) do
+        state when is_binary(state) and state != "" ->
+          {"Symphony stopped the run on #{today} and parked #{who} in #{state}. No run starts from #{state}.", "#{who} stays in #{state} until a person moves it."}
+
+        _ ->
+          {"Symphony stopped the run on #{today}.", "#{who} waits for a person."}
+      end
 
     """
-    ## Symphony: Agent Needs Help
+    ## Ask: #{card.question}
 
-    The agent has requested human assistance:
+    **Goal.** Build #{issue_ref(details)} to a pull request under its grant.
 
-    > #{message}
+    **Status.** #{status}
 
-    Please review and provide guidance.
+    **Problem.** #{card.problem}
+
+    **Recommendation.** #{card.recommendation}
+
+    **Ask.** #{card.question} Default: none. #{default} Door: one-way.
+
+    To resume, write the answer or the fix on #{who} itself, then move #{who} to Todo. The next run reads #{who}'s comments, not a project thread, and it continues in the same slot.
+    """
+    |> String.trim()
+  end
+
+  def format_linear_comment(:needs_human_pointer, details) do
+    project = Map.get(details, :project) || %{}
+    name = project[:name] || "its project"
+    where = if is_binary(project[:url]), do: "[#{name}](#{project[:url]})", else: name
+    who = Map.get(details, :identifier) || "This issue"
+
+    """
+    **Symphony stopped #{who}. The ask is on the project thread of #{where}.**
+
+    To resume, write the answer or the fix here, then move #{who} to Todo. The next run reads this issue's comments, not the project thread.
     """
     |> String.trim()
   end
 
   def format_linear_comment(event_type, _details) do
     "## Symphony: #{event_type}\n\nUnexpected event."
+  end
+
+  # The agent writes `SYMPHONY_NEEDS_HELP: <blocker> Ask: <question> Recommend: <what
+  # and why>` (the preamble's shape). An orchestrator park carries only its reason, and
+  # an agent may still write the bare form; both get a card, with the recommendation
+  # marked as Symphony's own.
+  defp ask_card(details) do
+    message = details |> Map.get(:help_message, "") |> to_string() |> String.trim()
+    {rest, recommend} = split_marker(message, "Recommend:")
+    {blocker, ask} = split_marker(rest, "Ask:")
+    who = issue_ref(details)
+
+    case Map.get(details, :source, :orchestrator) do
+      :agent ->
+        %{
+          question: ask || "Clear the blocker below and resume #{who}, or cancel it?",
+          problem: "The agent stopped on a blocker it cannot clear under its grant: #{present(blocker)}",
+          recommendation: recommend || "(Symphony's, the agent gave none.) Clear the blocker the agent names, then resume. Cancel the issue if the blocker means the work is no longer needed."
+        }
+
+      _orchestrator ->
+        %{
+          question: "Fix the cause below and resume #{who}, or cancel it?",
+          problem: "Symphony cannot advance the run: #{present(message)}",
+          recommendation:
+            "(Symphony's.) Read the plan rows and the latest grader and tester verdicts on the issue, and fix the cause or amend the issue body where they disagree, then resume. Cancel the issue if its scope no longer holds."
+        }
+    end
+  end
+
+  defp split_marker(text, marker) do
+    case String.split(text, marker, parts: 2) do
+      [before, after_marker] -> {String.trim(before), blank_to_nil(after_marker)}
+      [whole] -> {whole, nil}
+    end
+  end
+
+  defp blank_to_nil(text) do
+    case String.trim(text) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp present(""), do: "no details were given."
+  defp present(text), do: text
+
+  defp issue_ref(details) do
+    identifier = Map.get(details, :identifier) || "this issue"
+
+    case Map.get(details, :title) do
+      title when is_binary(title) and title != "" -> ~s(#{identifier} "#{title}")
+      _ -> identifier
+    end
   end
 
   # ---------------------------------------------------------------------------

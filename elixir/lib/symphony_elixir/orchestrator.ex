@@ -312,7 +312,10 @@ defmodule SymphonyElixir.Orchestrator do
         Notifier.notify(:needs_human, %{
           issue_id: issue_id,
           identifier: identifier,
-          help_message: message
+          title: running_entry |> Map.get(:issue) |> issue_title(),
+          help_message: message,
+          source: :agent,
+          parked_state: Config.escalation_needs_human_state()
         })
 
         # The run is over, whatever a person does next.
@@ -395,6 +398,9 @@ defmodule SymphonyElixir.Orchestrator do
       error: "agent exited: #{inspect(reason)}"
     })
   end
+
+  defp issue_title(%{title: title}) when is_binary(title), do: title
+  defp issue_title(_issue), do: nil
 
   # Detect SYMPHONY_NEEDS_HELP marker
   defp flag_needs_help(running_entry, issue_id, raw_event, already_flagged) do
@@ -2426,7 +2432,10 @@ defmodule SymphonyElixir.Orchestrator do
       Notifier.notify(:needs_human, %{
         issue_id: issue.id,
         identifier: issue.identifier,
-        help_message: message
+        title: issue_title(issue),
+        help_message: message,
+        source: :orchestrator,
+        parked_state: Config.escalation_needs_human_state()
       })
 
       move_result = move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())

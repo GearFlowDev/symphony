@@ -40,6 +40,51 @@ defmodule SymphonyElixir.StagePromptAskRuleTest do
     assert kickoff =~ "the default you build to"
   end
 
+  test "no stage posts to Linear with curl; every Linear call goes through bin/linear (GEA-10619)" do
+    for path <- Path.wildcard(Path.join(@stages_dir, "*.md")) do
+      content = File.read!(path)
+      name = Path.basename(path)
+
+      refute content =~ "api.linear.app", "#{name} still calls the Linear API with curl"
+      refute content =~ "LINEAR_API_KEY_AUTOMATION", "#{name} still names a key the box does not set"
+    end
+
+    for name <- ["01-kickoff.md", "03-test.md", "03-human-review.md", "04-simplify.md"] do
+      assert stage(name) =~ ~s("$LINEAR" comment {{ issue.identifier }} --body-file),
+             "#{name} does not post through bin/linear"
+    end
+
+    assert stage("_continuation.md") =~ ~s("$LINEAR" comments {{ issue.identifier }})
+  end
+
+  test "no stage describes the deleted React app, its frontend server or its ?lv= flags (GEA-10619)" do
+    for path <- Path.wildcard(Path.join(@stages_dir, "*.md")) do
+      content = File.read!(path)
+      name = Path.basename(path)
+
+      refute content =~ "$FRONTEND_PORT", "#{name} still reaches for a frontend server"
+      refute content =~ "FRONTEND_PORT}", "#{name} still reaches for a frontend server"
+      refute content =~ ~r/\?lv=(on|off)/, "#{name} still walks the deleted ?lv= flags"
+      refute content =~ "lv_*", "#{name} still sweeps the deleted lv_* flags"
+      refute content =~ "React and LV", "#{name} still walks the React app"
+      refute content =~ ~r/already running/i, "#{name} still says the backend is already running"
+    end
+
+    assert stage("_preamble.md") =~ "The backend is NOT started for you."
+  end
+
+  test "the preamble does not cancel the workspace rules it then cites (GEA-10619)" do
+    preamble = stage("_preamble.md")
+
+    refute preamble =~ "managing Linear issue lifecycle"
+    assert preamble =~ "These parts do apply to you:** the ask rule"
+  end
+
+  test "the preamble asks a needs-help line for the question and a recommendation (GEA-10619)" do
+    assert stage("_preamble.md") =~ "SYMPHONY_NEEDS_HELP: <the blocker, in one sentence> Ask: <"
+    assert stage("_preamble.md") =~ "Recommend: <"
+  end
+
   test "no stage authorizes Linear with a key the box does not set" do
     # The agent box sets LINEAR_API_KEY only; other hosts may set only
     # LINEAR_API_KEY_AUTOMATION. A header that names either key alone sends an

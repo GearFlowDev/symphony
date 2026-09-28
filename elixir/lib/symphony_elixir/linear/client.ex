@@ -327,24 +327,28 @@ defmodule SymphonyElixir.Linear.Client do
   defp read_comment_pages(issue_id, after_cursor, acc, pages_left, opts) do
     variables = %{issueId: issue_id, first: @comments_page_size, after: after_cursor}
 
-    case graphql(@all_comments_query, variables, opts) do
-      {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes} = page}}}} when is_list(nodes) ->
-        acc = acc ++ Enum.map(nodes, &comment_from_node/1)
+    with {:ok, body} <- graphql(@all_comments_query, variables, opts),
+         {:ok, nodes, page_info} <- comment_page(body) do
+      acc = acc ++ Enum.map(nodes, &comment_from_node/1)
 
-        case comment_page_cursor(page["pageInfo"]) do
-          {:ok, ^after_cursor} -> {:error, :linear_repeated_end_cursor}
-          {:ok, cursor} -> read_comment_pages(issue_id, cursor, acc, pages_left - 1, opts)
-          :done -> {:ok, acc}
-          {:error, _} = err -> err
-        end
-
-      {:ok, body} ->
-        {:error, {:unexpected_comments_response, body}}
-
-      {:error, reason} ->
-        {:error, reason}
+      case comment_page_cursor(page_info) do
+        {:ok, ^after_cursor} -> {:error, :linear_repeated_end_cursor}
+        {:ok, cursor} -> read_comment_pages(issue_id, cursor, acc, pages_left - 1, opts)
+        :done -> {:ok, acc}
+        {:error, _} = err -> err
+      end
     end
   end
+
+  # A 200 response can carry GraphQL errors beside partial data; either one
+  # fails the read.
+  defp comment_page(%{"errors" => errors}) when is_list(errors) and errors != [],
+    do: {:error, {:linear_graphql_errors, errors}}
+
+  defp comment_page(%{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes} = page}}}) when is_list(nodes),
+    do: {:ok, nodes, page["pageInfo"]}
+
+  defp comment_page(body), do: {:error, {:unexpected_comments_response, body}}
 
   # A 200 response can carry partial data: without a boolean hasNextPage the
   # read cannot tell a whole thread from a cut one.

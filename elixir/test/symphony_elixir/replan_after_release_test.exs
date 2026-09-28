@@ -203,6 +203,15 @@ defmodule SymphonyElixir.ReplanAfterReleaseTest do
       assert {:error, :linear_missing_page_info} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
     end
 
+    test "a page that carries GraphQL errors is an error, even with data" do
+      {:ok, %{body: body} = response} = bad_page(%{"hasNextPage" => false, "endCursor" => nil})
+      errors = [%{"message" => "partial"}]
+      request_fun = fn _payload, _headers -> {:ok, %{response | body: Map.put(body, "errors", errors)}} end
+
+      assert {:error, {:linear_graphql_errors, ^errors}} =
+               Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
+    end
+
     test "a next page with no cursor is an error, not a silent cut" do
       request_fun = fn _payload, _headers -> bad_page(%{"hasNextPage" => true, "endCursor" => nil}) end
       assert {:error, :linear_missing_end_cursor} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)

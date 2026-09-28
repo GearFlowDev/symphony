@@ -2,12 +2,13 @@ defmodule SymphonyElixir.Planning.Planner do
   @moduledoc """
   Generates a structured plan for a Linear issue.
 
-  The Planner runs once per issue (or re-runs when the issue body materially
-  changes). Given:
+  The Planner runs once per issue, and again when a person releases the issue
+  from a park (`Planning.Workflow.assess/2`, GEA-10664). Given:
 
     * the issue body
     * any in-repo process docs the issue references
     * the current branch diff against the base branch (if a WIP branch exists)
+    * on a re-plan, the prior plan and the comments posted since the park
 
   it produces a plan with rows that workers can close one-by-one. Each row
   has a stable id, file-path hints, test hints, dependencies, and an initial
@@ -20,6 +21,7 @@ defmodule SymphonyElixir.Planning.Planner do
   alias SymphonyElixir.Claude.OneShot
   alias SymphonyElixir.Config
   alias SymphonyElixir.Planning
+  alias SymphonyElixir.Planning.Plan
 
   @plan_system_prompt """
   You are the planning component of an autonomous engineering orchestrator.
@@ -127,16 +129,24 @@ defmodule SymphonyElixir.Planning.Planner do
         * `:audit_summary` — optional string summarizing the WIP branch's
           existing diff against the base, to seed `partial` / `done` states
         * `:prior_plan` — optional `Plan.t()` whose row IDs the new plan
-          should preserve where rows still apply
+          should preserve where rows still apply. A prior row that was `done`
+          stays `done` when the new plan keeps its ID; a prior row the new
+          plan leaves out is dropped.
+        * `:comments_since_park` — the issue's comments posted after Symphony
+          last parked it. A person's answer to the parked question is here,
+          and it overrides the prior plan (GEA-10664).
+        * `:request_fun` — `(system_prompt, user_prompt -> {:ok, map} | {:error, term})`;
+          replaces the Claude call, for tests.
 
   Returns the persisted `Plan.t()` on success.
   """
-  @spec plan(map(), keyword()) :: {:ok, SymphonyElixir.Planning.Plan.t()} | {:error, term()}
+  @spec plan(map(), keyword()) :: {:ok, Plan.t()} | {:error, term()}
   def plan(issue, opts \\ []) do
     user_prompt = build_user_prompt(issue, opts)
 
     with {:ok, plan_json} <- request_plan(user_prompt, opts),
          :ok <- validate_shape(plan_json),
+         plan_json = keep_done_rows(plan_json, Keyword.get(opts, :prior_plan)),
          {:ok, plan} <-
            Planning.upsert_plan(%{
              issue_id: Map.get(issue, :id) || Map.get(issue, "id"),
@@ -160,6 +170,13 @@ defmodule SymphonyElixir.Planning.Planner do
   # most likely the model isn't available on this account/CLI — retry once on
   # the default model (opus).
   defp request_plan(user_prompt, opts) do
+    case Keyword.get(opts, :request_fun) do
+      request_fun when is_function(request_fun, 2) -> request_fun.(@plan_system_prompt, user_prompt)
+      _ -> request_plan_from_claude(user_prompt, opts)
+    end
+  end
+
+  defp request_plan_from_claude(user_prompt, opts) do
     plan_model = Config.claude_plan_model()
 
     case OneShot.request_json(@plan_system_prompt, user_prompt, Keyword.put(opts, :model, plan_model)) do
@@ -192,7 +209,8 @@ defmodule SymphonyElixir.Planning.Planner do
       "## Linear issue\n\n- ID: #{identifier}\n- Title: #{title}\n- Labels: #{Enum.join(labels, ", ")}\n\n### Body\n\n#{body}",
       process_docs_section(process_docs),
       audit_section(audit_summary),
-      prior_plan_section(prior_plan)
+      prior_plan_section(prior_plan),
+      comments_since_park_section(Keyword.get(opts, :comments_since_park, []))
     ]
 
     sections |> Enum.reject(&(&1 in [nil, ""])) |> Enum.join("\n\n---\n\n")
@@ -218,12 +236,61 @@ defmodule SymphonyElixir.Planning.Planner do
 
   defp prior_plan_section(nil), do: nil
 
-  defp prior_plan_section(%SymphonyElixir.Planning.Plan{plan_json: %{"rows" => rows}}) when is_list(rows) do
+  defp prior_plan_section(%Plan{plan_json: %{"rows" => rows}}) when is_list(rows) do
     encoded = Jason.encode!(rows, pretty: true)
     "## Prior plan rows (preserve IDs where possible)\n\n```json\n#{encoded}\n```"
   end
 
   defp prior_plan_section(_), do: nil
+
+  defp comments_since_park_section([]), do: nil
+
+  defp comments_since_park_section(comments) when is_list(comments) do
+    rendered =
+      Enum.map_join(comments, "\n\n", fn comment ->
+        at = if match?(%DateTime{}, comment[:created_at]), do: DateTime.to_iso8601(comment.created_at), else: "?"
+        "### #{comment[:author] || "Unknown"} at #{at}\n\n#{comment[:body] || ""}"
+      end)
+
+    """
+    ## Comments since the issue was parked (these override the prior plan)
+
+    Symphony parked this issue with a question, and a person released it. Their
+    answer is in these comments and in the issue body above. Re-plan from the
+    body and these comments: drop every prior row they rule out, add any row they
+    ask for, and keep the ID of every prior row that still applies. Do not ask
+    again a question these comments answer.
+
+    #{rendered}
+    """
+  end
+
+  defp comments_since_park_section(_), do: nil
+
+  @doc """
+  Carry the prior plan's `done` rows into a re-plan: a new row with the ID of a
+  prior `done` row stays `done`. A prior row the new plan leaves out is dropped.
+  """
+  @spec keep_done_rows(map(), Plan.t() | nil) :: map()
+  def keep_done_rows(%{"rows" => rows} = plan_json, %Plan{} = prior_plan) do
+    done_by_id =
+      prior_plan
+      |> Plan.rows()
+      |> Enum.filter(&(&1["state"] == "done"))
+      |> Map.new(&{&1["id"], &1})
+
+    kept =
+      Enum.map(rows, fn row ->
+        case Map.get(done_by_id, row["id"]) do
+          nil -> row
+          done -> Map.merge(row, %{"state" => "done", "rationale" => done["rationale"] || row["rationale"]})
+        end
+      end)
+
+    Map.put(plan_json, "rows", kept)
+  end
+
+  def keep_done_rows(plan_json, _prior_plan), do: plan_json
 
   defp validate_shape(%{"rows" => rows}) when is_list(rows) do
     if Enum.all?(rows, &valid_row?/1) do

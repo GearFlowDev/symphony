@@ -264,8 +264,9 @@ defmodule SymphonyElixir.Claude.StreamParser do
       String.contains?(command, "playwright") ->
         "Test"
 
-      # Bash with curl to Linear API = sharing evidence
-      command_matches?(command, ["curl", "linear.app"]) ->
+      # A Linear post = sharing evidence. The stage prompts post through the harness
+      # CLI, `bin/linear comment` (GEA-10619); a bare `curl` is a health check, not a post.
+      command_matches?(command, ["linear.app", "bin/linear comment", ~s("$LINEAR" comment)]) ->
         "Share Evidence"
 
       true ->

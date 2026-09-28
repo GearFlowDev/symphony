@@ -94,6 +94,14 @@ defmodule SymphonyElixir.Claude.StreamParserTest do
       assert StreamParser.extract_phase(event) == "Ship"
     end
 
+    test "infers Share Evidence from a bin/linear comment, not from a curl health check" do
+      post = ~s(LINEAR="/data/workspace/local-dev/gf_harness_surfaces/bin/linear"\n"$LINEAR" comment GEA-1 --body-file /tmp/r.md)
+      assert StreamParser.extract_phase(assistant_tool_event("Bash", %{"command" => post})) == "Share Evidence"
+
+      probe = ~s(curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && echo "backend up")
+      assert StreamParser.extract_phase(assistant_tool_event("Bash", %{"command" => probe})) == nil
+    end
+
     test "returns nil for non-assistant events" do
       event = %{"message" => %{"content" => []}} |> Map.put(:event_type, :tool_result)
       assert StreamParser.extract_phase(event) == nil

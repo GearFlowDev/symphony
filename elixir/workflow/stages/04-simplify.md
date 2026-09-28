@@ -69,14 +69,14 @@ This is the last phase, so the comment you post now becomes the issue's latest c
 Post a wrap-up comment on the **Linear issue** (NOT GitHub) with exactly these three parts:
 
 1. **Done** — what shipped, in one or two sentences, with the PR link. State CI status and whether review comments were addressed. If simplification changed nothing, say so in passing — don't make it the headline.
-2. **Next** — what remains, and whose move it is. Your finish line above says who that is: under `Auto-Merge` the harness judges the hand-off and merges, and under `Auto-Build` or `Auto-Design` a person reviews and merges. List any follow-ups you deliberately left out of scope.
+2. **Next** — what remains, and whose move it is. Your finish line above says who that is. Under `Auto-Build` or `Auto-Design`, a person reviews and merges. Under `Auto-Merge`, Symphony hands the PR off with `bin/linear handoff` and the harness judges it; do not promise a merge, because whether the PR merges after that is the harness's rule, not yours. List any follow-ups you deliberately left out of scope.
 3. **Where to look** — the branch name, the 2-3 files at the heart of the change, and a pointer to the evidence comment (screenshots) above if one exists. Reference artifacts; do not restate their contents.
 
+Write it to a file and post it through `bin/linear`, never `curl`:
+
 ```bash
-curl -s -X POST https://api.linear.app/graphql \
-  -H "Authorization: ${LINEAR_API_KEY_AUTOMATION:-$LINEAR_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", "variables": {"id": "{{ issue.id }}", "body": "YOUR_WRAPUP_HERE"}}'
+LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
+"$LINEAR" comment {{ issue.identifier }} --body-file /tmp/wrapup-{{ issue.identifier }}.md
 ```
 
 ### Done

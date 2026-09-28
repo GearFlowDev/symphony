@@ -119,7 +119,7 @@ End your turn. Do not:
 - Take screenshots or post test results (the Test phase has a tester sub-agent for that).
 - Re-run anything unless you broke a test.
 - Run `gh pr ready` — the PR you opened in Step 4 is already ready.
-- Merge the PR, or ask for it to be merged. Your finish line says who merges.
+- Merge the PR, or ask for it to be merged. Your finish line says what happens to the PR next.
 
 The orchestrator's Grader will inspect your diff and test output, mark each assigned row `done` / `partial` / `missing`, and decide whether to dispatch another worker for the gaps or move to the Test phase.
 

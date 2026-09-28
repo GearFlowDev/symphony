@@ -7,13 +7,25 @@ Your job: log in to the app, verify it works in a real browser, take screenshots
 ### Step 1: Get your workspace info
 
 ```bash
-source .symphony_slot
-cd $DIRECTORY
+set -a; source .symphony_slot; set +a   # exports PHOENIX_PORT for the node script
+cd "$DIRECTORY"
 ```
+
+The app is Phoenix LiveView on `PHOENIX_PORT`; there is no frontend server. The backend is NOT started for you: start it when it is down, and stop it when you are done.
+
+```bash
+curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null \
+  || { direnv exec . mix phx.server > .phx.log 2>&1 & }
+up=""
+for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && up=1 && break; sleep 2; done
+[ -n "$up" ] && echo "backend up" || { echo "backend DOWN after 120 s — see .phx.log"; tail -n 30 .phx.log; }
+```
+
+If the backend is DOWN, post a comment that says so, with the tail of `.phx.log`, and stop. Do not post screenshots of an error page.
 
 ### Step 2: Browser testing
 
-Test the app in a real browser.
+Test the app in a real browser. The `screenshot` skill in the gf_engineering workspace is the full method (`$GEARFLOW_WORKSPACE/.claude/skills/screenshot/SKILL.md`).
 
 #### Browser tooling
 
@@ -24,8 +36,11 @@ const { chromium } = require('playwright');
 (async () => {
   const browser = await chromium.launch();
   const page = await browser.newPage();
-  await page.goto(`http://localhost:${process.env.FRONTEND_PORT}`);
-  // ... log in, navigate, then:
+  // 127.0.0.1, not localhost: slot servers bind IPv4 and `localhost` can resolve to ::1.
+  const app = `http://127.0.0.1:${process.env.PHOENIX_PORT}`;
+  // Dev-only auto-login: it sets the session cookie, no login page.
+  await page.goto(`${app}/xray/${encodeURIComponent(process.env.WALK_EMAIL)}`);
+  // ... navigate, then:
   await page.screenshot({ path: '/tmp/evidence-page.png', fullPage: true });
   await browser.close();
 })();
@@ -33,10 +48,8 @@ const { chromium } = require('playwright');
 
 #### Login
 
-1. Navigate to `http://localhost:$FRONTEND_PORT`
-2. Log in with the dispatcher test account:
-   - Email: `${GF_EMAIL_HANDLE:-$(whoami)}+dispatcher@gearflow.com`
-   - Password: `Test1234!`
+1. Log in with the dev-only auto-login: `http://127.0.0.1:$PHOENIX_PORT/xray/<email>`. It sets the session cookie. The login page sends a one-time code, so a script cannot use it.
+2. Use the dispatcher test account: `WALK_EMAIL="${GF_EMAIL_HANDLE:-$(whoami)}+dispatcher@gearflow.com"`.
 3. Wait for the dashboard to load
 
 #### Smoke test — navigate core pages
@@ -73,13 +86,14 @@ URLS=$("${SYMPHONY_SCRIPTS}linear-embed-images.sh" /tmp/evidence-*.png)   # <- u
 ```
 
 If `$URLS` is empty the upload failed — do NOT post empty `![]()`; fix the paths
-and re-run. Then post a comment with the embedded screenshots:
+and re-run. Then post a comment with the embedded screenshots through
+`bin/linear`, never `curl`:
 
 ```bash
-curl -s -X POST https://api.linear.app/graphql \
-  -H "Authorization: ${LINEAR_API_KEY_AUTOMATION:-$LINEAR_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", "variables": {"id": "{{ issue.id }}", "body": "## Browser Test Results\n\nLogged in and verified core pages load. Screenshots below.\n\n'"$URLS"'"}}'
+printf '## Browser Test Results\n\nLogged in and verified core pages load. Screenshots below.\n\n%s\n' "$URLS" \
+  > /tmp/evidence-{{ issue.identifier }}.md
+LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
+"$LINEAR" comment {{ issue.identifier }} --body-file /tmp/evidence-{{ issue.identifier }}.md
 ```
 
 ### Done

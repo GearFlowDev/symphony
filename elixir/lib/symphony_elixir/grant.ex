@@ -26,8 +26,11 @@ defmodule SymphonyElixir.Grant do
 
   TO SYMPHONY, `Auto-Merge` DOES NOT MEAN MERGE. Symphony never merges its own
   work (GEA-9884, re-scoped 2026-09-21). It builds to mergeable, opens the PR and
-  hands off; the harness judges the hand-off and merges. `Auto-User` is treated as
-  `Auto-Merge` in this build — the assignee's wider authority is out of scope.
+  hands off with `bin/linear handoff`; the harness judges the hand-off. Whether the
+  harness then merges is the harness's rule, not this module's: it depends on the
+  issue's project (GEA-10264, GEA-10250), so the finish line promises the judgment
+  and never the merge (GEA-10619). `Auto-User` is treated as `Auto-Merge` in this
+  build — the assignee's wider authority is out of scope.
   """
 
   @type t :: :build | :design | :merge | :user
@@ -99,7 +102,7 @@ defmodule SymphonyElixir.Grant do
   @spec finish_line(t()) :: String.t()
   def finish_line(:build) do
     "a ready pull request with its proof posted on the issue. A person reviews and merges it. " <>
-      "You do not merge, and you do not answer product questions — ask them on the issue instead."
+      "You do not merge, and you do not answer product questions — ask them under the ask rule instead."
   end
 
   def finish_line(:design) do
@@ -107,9 +110,14 @@ defmodule SymphonyElixir.Grant do
       "Product questions on the way are yours to settle: decide, build it that way, and say why on the issue."
   end
 
+  # THE MERGE IS NOT PROMISED HERE. Who merges after the hand-off depends on the
+  # issue's project and on the harness's merge driver, which this fork cannot see.
+  # A promise of "the harness merges" was false off an `auto-project` board
+  # (GEA-10264), and an agent that believes it tells a person nothing is left to do.
   def finish_line(:merge) do
-    "a ready pull request that is mergeable, handed off to the harness. " <>
-      "You never merge it yourself: the harness judges the hand-off and merges."
+    "a ready pull request that is mergeable. When the run ends, Symphony hands it off to " <>
+      "the harness with `bin/linear handoff`, and the harness judges it. " <>
+      "You never merge it, and you never run the hand-off yourself."
   end
 
   def finish_line(:user), do: finish_line(:merge)

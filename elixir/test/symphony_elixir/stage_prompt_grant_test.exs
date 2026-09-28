@@ -33,8 +33,21 @@ defmodule SymphonyElixir.StagePromptGrantTest do
     prompt = render(["auto-symphony"])
 
     assert prompt =~ "**Grant**: Auto-Merge"
-    assert prompt =~ "the harness judges the hand-off and merges"
+    assert prompt =~ "the harness judges it"
     assert prompt =~ "You never merge"
+  end
+
+  test "no shipped prompt promises that the harness merges (GEA-10619)" do
+    # Who merges after the hand-off depends on the issue's project (GEA-10264); off an
+    # `auto-project` board nothing does. A prompt that promises the merge is false there.
+    for labels <- [["auto-symphony"], ["auto-symphony", "Auto-User"]] do
+      refute render(labels) =~ ~r/harness (judges the hand-off and )?merges/i
+    end
+
+    for path <- Path.wildcard(Path.join(@stages_dir, "*.md")) do
+      refute File.read!(path) =~ ~r/harness[^.\n]*and merges/i,
+             "#{Path.basename(path)} still promises that the harness merges"
+    end
   end
 
   test "an Auto-Build label beside the runner label narrows what the prompt promises" do
@@ -42,7 +55,9 @@ defmodule SymphonyElixir.StagePromptGrantTest do
 
     assert prompt =~ "**Grant**: Auto-Build"
     assert prompt =~ "A person reviews and merges it"
-    refute prompt =~ "the harness judges the hand-off and merges"
+    [_, finish_line] = String.split(prompt, "**Finish line**: ", parts: 2)
+    [finish_line | _] = String.split(finish_line, "\n", parts: 2)
+    refute finish_line =~ "the harness judges it"
   end
 
   test "Auto-Design tells the agent the product questions are its to settle" do

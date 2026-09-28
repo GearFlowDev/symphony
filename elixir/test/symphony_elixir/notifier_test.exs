@@ -59,8 +59,50 @@ defmodule SymphonyElixir.NotifierTest do
           help_message: "I cannot find the database migration for this table"
         })
 
-      assert comment =~ "Needs Help"
+      assert comment =~ "## Ask:"
       assert comment =~ "cannot find the database migration"
+    end
+
+    test "needs_human is a decision card: goal, status, problem, recommendation, ask, in that order (GEA-10619)" do
+      comment =
+        Notifier.format_linear_comment(:needs_human, %{
+          identifier: "GEA-1",
+          title: "Sort import events",
+          source: :agent,
+          parked_state: "Shaping",
+          help_message: "The Stripe test key is missing from the slot. Ask: Add the key to the box, or drop the payment rows? Recommend: Add the key; the rows are the point of the issue."
+        })
+
+      positions =
+        for field <- ["**Goal.**", "**Status.**", "**Problem.**", "**Recommendation.**", "**Ask.**"] do
+          {at, _} = :binary.match(comment, field)
+          at
+        end
+
+      assert positions == Enum.sort(positions)
+      assert comment =~ ~s(## Ask: Add the key to the box, or drop the payment rows?)
+      assert comment =~ ~s(GEA-1 "Sort import events")
+      assert comment =~ "The Stripe test key is missing from the slot."
+      assert comment =~ "**Recommendation.** Add the key; the rows are the point of the issue."
+      assert comment =~ "parked GEA-1 in Shaping"
+      assert comment =~ "Default: none. GEA-1 stays in Shaping until a person moves it. Door: one-way."
+      refute comment =~ "provide guidance"
+    end
+
+    test "a bare agent message and an orchestrator park still get a full card, marked as Symphony's recommendation" do
+      agent = Notifier.format_linear_comment(:needs_human, %{identifier: "GEA-1", source: :agent, help_message: "no Linear key"})
+      assert agent =~ "**Recommendation.** (Symphony's, the agent gave none.)"
+      assert agent =~ "no Linear key"
+
+      park =
+        Notifier.format_linear_comment(:needs_human, %{
+          identifier: "GEA-2",
+          help_message: "the dispatch cycle has returned to the same state 3× (limit 3)"
+        })
+
+      assert park =~ "**Problem.** Symphony cannot advance the run: the dispatch cycle"
+      assert park =~ "**Recommendation.** (Symphony's.)"
+      assert park =~ "Door: one-way."
     end
   end
 
@@ -137,11 +179,12 @@ defmodule SymphonyElixir.NotifierTest do
           help_message: "stuck on auth"
         },
         comment_fn: comment_fn,
-        webhook_fn: webhook_fn
+        webhook_fn: webhook_fn,
+        project_fn: fn _ -> {:ok, nil} end
       )
 
       assert_received {:comment, "issue-789", body}
-      assert body =~ "Needs Help"
+      assert body =~ "## Ask:"
     end
 
     test "skips comment when issue_id is nil" do
@@ -161,6 +204,53 @@ defmodule SymphonyElixir.NotifierTest do
       refute_received :comment_called
     end
 
+    test "needs_human posts the card on the project thread and one pointer on the issue (GEA-10619)" do
+      test_pid = self()
+      comment_fn = fn id, body -> send(test_pid, {:comment, id, body}) && :ok end
+      project_fn = fn "issue-1" -> {:ok, %{id: "proj-1", name: "Harness board", url: "https://linear.app/p/harness"}} end
+      project_comment_fn = fn id, body -> send(test_pid, {:project_comment, id, body}) && :ok end
+
+      Notifier.notify_sync(
+        :needs_human,
+        %{issue_id: "issue-1", identifier: "GEA-1", source: :agent, help_message: "stuck"},
+        comment_fn: comment_fn,
+        project_fn: project_fn,
+        project_comment_fn: project_comment_fn
+      )
+
+      assert_received {:project_comment, "proj-1", card}
+      assert card =~ "## Ask:"
+      assert_received {:comment, "issue-1", pointer}
+      assert pointer =~ "[Harness board](https://linear.app/p/harness)"
+      refute pointer =~ "## Ask:"
+      refute_received {:comment, _, _}
+    end
+
+    test "needs_human posts the card on the issue when it has no project, or the project post fails" do
+      test_pid = self()
+      comment_fn = fn id, body -> send(test_pid, {:comment, id, body}) && :ok end
+      project_comment_fn = fn id, body -> send(test_pid, {:project_comment, id, body}) && :ok end
+
+      for {project_fn, pc_fn} <- [
+            {fn _ -> {:ok, nil} end, project_comment_fn},
+            {fn _ -> {:error, :timeout} end, project_comment_fn},
+            {fn _ -> raise "boom" end, project_comment_fn},
+            {fn _ -> {:ok, %{id: "proj-1", name: "B", url: nil}} end, fn _, _ -> {:error, :rate_limited} end}
+          ] do
+        Notifier.notify_sync(
+          :needs_human,
+          %{issue_id: "issue-2", identifier: "GEA-2", help_message: "stuck"},
+          comment_fn: comment_fn,
+          project_fn: project_fn,
+          project_comment_fn: pc_fn
+        )
+
+        assert_received {:comment, "issue-2", card}
+        assert card =~ "## Ask:"
+        refute_received {:project_comment, _, _}
+      end
+    end
+
     test "handles comment_fn errors without crashing" do
       comment_fn = fn _id, _body -> {:error, :api_down} end
 
@@ -168,7 +258,8 @@ defmodule SymphonyElixir.NotifierTest do
       Notifier.notify_sync(
         :needs_human,
         %{issue_id: "issue-123", help_message: "stuck"},
-        comment_fn: comment_fn
+        comment_fn: comment_fn,
+        project_fn: fn _ -> {:ok, nil} end
       )
     end
 
@@ -179,7 +270,8 @@ defmodule SymphonyElixir.NotifierTest do
       Notifier.notify_sync(
         :needs_human,
         %{issue_id: "issue-123", help_message: "stuck"},
-        comment_fn: comment_fn
+        comment_fn: comment_fn,
+        project_fn: fn _ -> {:ok, nil} end
       )
     end
   end

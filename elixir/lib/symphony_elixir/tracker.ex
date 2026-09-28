@@ -11,6 +11,8 @@ defmodule SymphonyElixir.Tracker do
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback create_comment_with_id(String.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
   @callback update_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  @callback fetch_issue_project(String.t()) :: {:ok, map() | nil} | {:error, term()}
+  @callback create_project_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   @callback claim_issue(String.t(), String.t()) :: :ok | {:error, term()}
   @callback add_label(String.t(), String.t()) :: :ok | {:error, term()}
@@ -44,6 +46,17 @@ defmodule SymphonyElixir.Tracker do
   @spec update_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def update_comment(comment_id, body) do
     adapter().update_comment(comment_id, body)
+  end
+
+  @doc "The issue's project as `%{id, name, url}`, or nil when it has none."
+  @spec fetch_issue_project(String.t()) :: {:ok, map() | nil} | {:error, term()}
+  def fetch_issue_project(issue_id) do
+    adapter().fetch_issue_project(issue_id)
+  end
+
+  @spec create_project_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  def create_project_comment(project_id, body) do
+    adapter().create_project_comment(project_id, body)
   end
 
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}

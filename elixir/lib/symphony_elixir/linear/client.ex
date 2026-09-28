@@ -331,9 +331,7 @@ defmodule SymphonyElixir.Linear.Client do
       {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes} = page}}}} when is_list(nodes) ->
         acc = acc ++ Enum.map(nodes, &comment_from_node/1)
 
-        page_info = page["pageInfo"] || %{}
-
-        case next_page_cursor(%{has_next_page: page_info["hasNextPage"], end_cursor: page_info["endCursor"]}) do
+        case comment_page_cursor(page["pageInfo"]) do
           {:ok, ^after_cursor} -> {:error, :linear_repeated_end_cursor}
           {:ok, cursor} -> read_comment_pages(issue_id, cursor, acc, pages_left - 1, opts)
           :done -> {:ok, acc}
@@ -347,6 +345,13 @@ defmodule SymphonyElixir.Linear.Client do
         {:error, reason}
     end
   end
+
+  # A 200 response can carry partial data: without a boolean hasNextPage the
+  # read cannot tell a whole thread from a cut one.
+  defp comment_page_cursor(%{"hasNextPage" => has_next_page} = page_info) when is_boolean(has_next_page),
+    do: next_page_cursor(%{has_next_page: has_next_page, end_cursor: page_info["endCursor"]})
+
+  defp comment_page_cursor(_page_info), do: {:error, :linear_missing_page_info}
 
   defp comment_from_node(node) do
     %{

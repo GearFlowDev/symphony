@@ -194,6 +194,15 @@ defmodule SymphonyElixir.ReplanAfterReleaseTest do
       assert {:error, :linear_repeated_end_cursor} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
     end
 
+    test "a page with no pageInfo is an error, not a whole thread" do
+      nodes = [%{"body" => "x", "createdAt" => "2026-09-28T10:00:00Z", "user" => %{"name" => "Owner"}}]
+      request_fun = fn _payload, _headers -> {:ok, %{status: 200, body: %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}}}} end
+      assert {:error, :linear_missing_page_info} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
+
+      request_fun = fn _payload, _headers -> bad_page(%{"endCursor" => "c1"}) end
+      assert {:error, :linear_missing_page_info} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)
+    end
+
     test "a next page with no cursor is an error, not a silent cut" do
       request_fun = fn _payload, _headers -> bad_page(%{"hasNextPage" => true, "endCursor" => nil}) end
       assert {:error, :linear_missing_end_cursor} = Client.read_all_issue_comments("issue-uuid-rp", request_fun: request_fun)

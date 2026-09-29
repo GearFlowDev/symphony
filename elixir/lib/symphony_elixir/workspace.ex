@@ -685,7 +685,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp repo_from_pr_url(url) when is_binary(url) do
-    case Regex.run(~r{github\.com/GearFlowDev/([A-Za-z0-9_.-]+)/pull/\d+}i, url) do
+    case Regex.run(~r{\Ahttps://github\.com/GearFlowDev/([A-Za-z0-9_-][A-Za-z0-9_.-]*)/pull/\d+}i, url) do
       [_, repo] -> repo
       _ -> nil
     end

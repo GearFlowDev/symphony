@@ -1005,13 +1005,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
             {["3.0-Parts"], "https://github.com/GearFlowDev/gf_harness_surfaces/pull/366"},
             {["2.0-PartsHub"], nil},
             {["3.0"], "https://github.com/someone-else/gf_platform/pull/1"},
-            {["Harness"], nil}
+            {["Harness"], nil},
+            {["3.0"], "https://notgithub.com/GearFlowDev/gf_platform/pull/19"},
+            {["3.0"], "https://github.com/GearFlowDev/../pull/19"}
           ] do
         assert :ok = Workspace.run_before_run_hook(workspace, issue.(labels, pr_url))
       end
 
       assert File.read!(out) ==
-               Enum.join(["symphony", "gf_harness_surfaces", "gf_platform", "gf_procurement", ""], "\n") <> "\n"
+               Enum.join(["symphony", "gf_harness_surfaces", "gf_platform", "gf_procurement", "", "gf_procurement", "gf_procurement"], "\n") <> "\n"
     end
   end
 

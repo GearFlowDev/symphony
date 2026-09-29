@@ -38,6 +38,10 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
   # input and re-paste a few times before giving up.
   @paste_attempts 8
 
+  # Session id → the process that started the session. A process that dies drops
+  # its entries, so "registered" means "someone alive still drives it".
+  @owners SymphonyElixir.Claude.TmuxCLI.Owners
+
   @type session_handle :: %{
           session_id: String.t(),
           session_name: String.t(),
@@ -66,6 +70,8 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
          :ok <- ensure_tmux() do
       expanded = Path.expand(workspace)
       session_name = session_name(session_id)
+      # Before the tmux session exists, so no reaper pass can see it unowned.
+      claim_owner(session_id)
 
       with :ok <- new_tmux_session(session_name, expanded),
            :ok <- launch_claude(session_name, session_id, opts),
@@ -77,6 +83,7 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
         {:error, reason} ->
           # Tear down a half-started session so we don't leak it.
           kill_session(session_name)
+          release_owner(session_id)
           {:error, reason}
       end
     end
@@ -132,6 +139,35 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
 
     kill_session(session_name)
     cleanup_prompt_files(session_id)
+    release_owner(session_id)
+    :ok
+  end
+
+  @doc """
+  Record the calling process as the owner of `session_id`. `start_session/3` does
+  this for every session, so a caller never needs to. Public for tests.
+
+  The owner is the process that drives the session: an agent run's worker, or the
+  caller of a Planner, Grader or Auditor one-shot. The entry goes away when that
+  process exits, so a worker killed without its `stop_session/1` cleanup leaves an
+  unowned session for the reaper. A no-op when the registry is not running, as at
+  application boot before the supervisor starts it.
+  """
+  @spec claim_owner(String.t()) :: :ok
+  def claim_owner(session_id) when is_binary(session_id) do
+    if Process.whereis(@owners), do: Registry.register(@owners, session_id, nil)
+    :ok
+  end
+
+  @doc "True if a live process still owns `session_id` (see `claim_owner/1`)."
+  @spec owned?(String.t()) :: boolean()
+  def owned?(session_id) when is_binary(session_id) do
+    Process.whereis(@owners) != nil and
+      Enum.any?(Registry.lookup(@owners, session_id), fn {pid, _} -> Process.alive?(pid) end)
+  end
+
+  defp release_owner(session_id) do
+    if Process.whereis(@owners), do: Registry.unregister(@owners, session_id)
     :ok
   end
 
@@ -207,13 +243,22 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
   def reap_orphan_sessions(prefix \\ nil), do: reap_orphan_sessions_except([], prefix: prefix)
 
   @doc """
-  Reap Symphony tmux sessions whose session_id is NOT in `keep_session_ids`.
+  Reap Symphony tmux sessions whose session_id is NOT in `keep_session_ids` and that
+  no live process owns (`owned?/1`).
 
   The orchestrator calls this every poll with the session_ids of its currently
   running workers, so a session leaked mid-run (a worker killed without its
   `stop_session/1` cleanup firing) gets cleaned up within one poll instead of
   surviving until the next BEAM restart. Mirrors `reap_stale_pool_locks` for
   slot locks. `keep_session_ids` may be a list or MapSet.
+
+  WHY OWNERSHIP AND NOT ONLY THE KEEP SET. A worker's session_id reaches the
+  running map only with the first event of its transcript, and that comes after
+  the TUI readiness wait and the transcript wait, each up to
+  `tmux_ready_timeout_ms` (120 s on the box). A Planner, Grader or Auditor
+  one-shot is never in the running map at all, and may take 180 s. The keep set
+  alone let the reaper kill both once they passed the age floor; a killed session
+  writes no transcript, and the run failed with `:not_found` (GEA-10681).
 
   Options:
 
@@ -239,7 +284,10 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
         |> String.split("\n", trim: true)
         |> Enum.map(&parse_session_line/1)
         |> Enum.filter(fn {name, _created} -> String.starts_with?(name, prefix <> "-") end)
-        |> Enum.reject(fn {name, _} -> MapSet.member?(keep, session_id_from_name(name, prefix)) end)
+        |> Enum.reject(fn {name, _} ->
+          session_id = session_id_from_name(name, prefix)
+          MapSet.member?(keep, session_id) or owned?(session_id)
+        end)
         |> Enum.filter(fn {_name, created} -> old_enough?(created, now, min_age) end)
         |> Enum.map(fn {name, _created} ->
           kill_session(name)

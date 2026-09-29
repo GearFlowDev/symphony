@@ -560,8 +560,9 @@ defmodule SymphonyElixir.Orchestrator do
       |> Enum.map(& &1[:session_id])
       |> Enum.reject(&is_nil/1)
 
-    # 120s grace: a just-launched worker's tmux session exists before its
-    # session_id propagates into `running`, so don't reap young sessions.
+    # A session a live process owns is never reaped (`TmuxCLI.owned?/1`), which
+    # covers a worker before its session_id reaches `running` and every one-shot
+    # (GEA-10681). The 120 s floor stays as a second guard.
     case TmuxCLI.reap_orphan_sessions_except(active_session_ids, min_age_seconds: 120) do
       [] -> :ok
       reaped -> Logger.info("Reaped #{length(reaped)} orphaned Claude tmux session(s): #{inspect(reaped)}")

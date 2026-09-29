@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit writes its release notes into the PR description by default, inside
+# <!-- --> markers. `mix pr_body.check` rejects any `<!--`, so every review turned
+# pr-description-lint red (GEA-10503). Keep the summary, but put it in the
+# walkthrough comment, where the lint does not read.
+language: "en-US"
+reviews:
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true

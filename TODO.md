@@ -243,19 +243,6 @@ human. Also: the Resolve Conflicts stage tells the worker to `mix test` then
 push; a worker that can't wait on background tests (harness blocks bare `sleep`)
 should be told to run tests in the foreground.
 
-## No-progress watchdog kills tester runs by design (testers never change files)
-The per-turn progress check counts `files_changed`/`new_commits`, but Test
-tester runs never produce either — they verify and post a verdict. Any tester
-run that needs more than ~6 turns gets "No progress for 3 consecutive turns,
-stopping early" before it can record its SYMPHONY_VERDICT. Seen on
-GEA-5113/GEA-5115 (2026-07-28): re-dispatched testers were killed at turn 6
-with no verdict, so the tester gate never got fresh evidence and the cycle
-breaker escalated to needs_human. (The staleness half of that loop — a no-op
-Fix CI dispatch invalidating an APPROVE at the same head SHA — is fixed:
-`tester_gate` is now SHA-aware via `verdict_at_head?`.) Fix idea: for
-Test-phase dispatches, count a recorded verdict or Linear report as progress,
-or exempt the phase from the files/commits heuristic.
-
 ## Slot claim should prune stale git worktrees left by agents
 An agent working GEA-4629 created a throwaway worktree
 (`git worktree add /private/tmp/main-check main`) from slot1 and never removed

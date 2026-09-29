@@ -203,8 +203,19 @@ defmodule SymphonyElixir.Claude.AgentRunner do
         # Check workspace progress after each turn.
         # Skip no-progress counting on early turns — investigation and planning
         # produce no git changes but are essential work (reading code, posting to Linear).
+        #
+        # A Test run is exempt (GEA-10667). The tester is read-only: it verifies
+        # and posts a verdict, and never changes a file. Counted like a worker, a
+        # tester that needed more than six turns was stopped before its
+        # SYMPHONY_VERDICT line, and with no verdict the orchestrator dispatched
+        # it again at the same state until the no-progress breaker parked the
+        # issue. agent.max_turns still bounds the run.
         progress = check_turn_progress(ctx.workspace)
-        made_progress = progress.files_changed > 0 or progress.new_commits > 0 or turn_number <= 3
+
+        made_progress =
+          progress.files_changed > 0 or progress.new_commits > 0 or turn_number <= 3 or
+            read_only_phase?(ctx.opts)
+
         next_no_progress = if made_progress, do: 0, else: no_progress_count + 1
 
         Logger.info(
@@ -383,6 +394,8 @@ defmodule SymphonyElixir.Claude.AgentRunner do
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
+
+  defp read_only_phase?(opts), do: Keyword.get(opts, :retask_phases) == ["Test"]
 
   defp check_turn_progress(workspace) do
     files_changed = count_git_changes(workspace)

@@ -89,7 +89,21 @@ defmodule SymphonyElixir.NoProgressBreakerTest do
     assert {:blocked, {:no_progress, message}} = decide("SYM-NOVERDICT", "Test")
 
     assert message =~ "next=Test"
-    assert message =~ "the tester was dispatched and recorded no verdict"
+    assert message =~ "the tester was dispatched and recorded no new verdict"
     refute message =~ "the tester has not run yet"
+  end
+
+  # A verdict from an older head makes tester_gate ask for a new Test. It must
+  # not turn the message back into "plan, grader and tester are not converging".
+  test "a stale verdict does not hide a Tester that keeps ending with no new verdict" do
+    all_done_plan("SYM-STALE")
+    {:ok, _} = History.record_tester_verdict("SYM-STALE", "REQUEST_CHANGES", "abc1234", "old head")
+
+    assert {:dispatch, _} = decide("SYM-STALE", "Test")
+    assert {:dispatch, _} = decide("SYM-STALE", "Test")
+    assert {:blocked, {:no_progress, message}} = decide("SYM-STALE", "Test")
+
+    assert message =~ "the tester was dispatched and recorded no new verdict"
+    refute message =~ "not converging"
   end
 end

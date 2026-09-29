@@ -1799,12 +1799,13 @@ defmodule SymphonyElixir.Orchestrator do
   # disagreement that did not exist (first Fly run, GEA-9889, 2026-09-22).
   #
   # A repeated TEST dispatch is its own case: the tester ran and recorded no
-  # verdict, so the fault is the tester's run, not the plan or the grader.
+  # verdict, so the fault is the tester's run, not the plan or the grader. It is
+  # checked first: a stale verdict from an older head must not hide it.
   defp no_progress_message(repeats, limit, fingerprint, identifier, phase) do
     gates =
       case {History.latest_tester_verdict(identifier), phase} do
+        {_, "Test"} -> "the tester was dispatched and recorded no new verdict (no SYMPHONY_VERDICT line)"
         {%{verdict: _verdict}, _} -> "plan, grader and tester are not converging"
-        {_, "Test"} -> "the tester was dispatched and recorded no verdict (no SYMPHONY_VERDICT line)"
         _ -> "the plan and the grader are not converging; the tester has not run yet"
       end
 

@@ -974,8 +974,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
 
     test "slot_lease_for_issue finds a lease on any repo's slot", %{root: root, registry: registry} do
-      put_lease(registry, "gf_engineering-slot2", linear_issue: "GEA-OTHER", branch: "other")
-      put_lease(registry, "symphony-slot3", linear_issue: "GEA-SELF", branch: "gea-self")
+      put_lease(registry, "gf_engineering-slot2", linear_issue: "GEA-OTHER", branch: "other", conversation_id: "symphony-GEA-OTHER")
+      put_lease(registry, "symphony-slot3", linear_issue: "GEA-SELF", branch: "gea-self", conversation_id: "symphony-GEA-SELF")
 
       assert Workspace.slot_lease_for_issue("GEA-SELF") ==
                {Path.join([root, "local-dev", "symphony-slot3"]), "gea-self"}
@@ -983,27 +983,24 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert Workspace.slot_lease_for_issue("GEA-NONE") == nil
     end
 
-    test "slot_lease_for_issue prefers Symphony's own lease, then the first slot name", %{
-      root: root,
-      registry: registry
-    } do
+    test "slot_lease_for_issue takes only Symphony's own lease", %{root: root, registry: registry} do
       put_lease(registry, "gf_platform-slot1", linear_issue: "GEA-BOTH", branch: "a-person", conversation_id: "sess-person")
       put_lease(registry, "symphony-slot4", linear_issue: "GEA-BOTH", branch: "gea-both", conversation_id: "symphony-GEA-BOTH")
 
       assert Workspace.slot_lease_for_issue("GEA-BOTH") ==
                {Path.join([root, "local-dev", "symphony-slot4"]), "gea-both"}
 
-      put_lease(registry, "gf_procurement-slot2", linear_issue: "GEA-TIE", branch: "second")
-      put_lease(registry, "gf_platform-slot3", linear_issue: "GEA-TIE", branch: "first")
+      # A person's lease, or one another run claimed, is never a checkout Symphony pushes from.
+      put_lease(registry, "gf_platform-slot3", linear_issue: "GEA-PERSON", branch: "mine", conversation_id: "sess-person")
+      put_lease(registry, "gf_procurement-slot2", linear_issue: "GEA-PERSON", branch: "theirs", conversation_id: "symphony-GEA-OTHER")
 
-      assert Workspace.slot_lease_for_issue("GEA-TIE") ==
-               {Path.join([root, "local-dev", "gf_platform-slot3"]), "first"}
+      assert Workspace.slot_lease_for_issue("GEA-PERSON") == nil
     end
 
     test "slot_lease_for_issue skips a lease file that is not a JSON object", %{root: root, registry: registry} do
       File.write!(Path.join(registry, "gf_platform-slot1.json"), ~s(["GEA-ODD"]))
       File.write!(Path.join(registry, "gf_platform-slot2.json"), "not json")
-      put_lease(registry, "gf_platform-slot3", linear_issue: "GEA-ODD", branch: "gea-odd")
+      put_lease(registry, "gf_platform-slot3", linear_issue: "GEA-ODD", branch: "gea-odd", conversation_id: "symphony-GEA-ODD")
 
       assert Workspace.slot_lease_for_issue("GEA-ODD") ==
                {Path.join([root, "local-dev", "gf_platform-slot3"]), "gea-odd"}

@@ -258,19 +258,33 @@ defmodule SymphonyElixir.Workspace do
   or nil. Read straight from the registry lease — reliable even when the scratch
   workspace's `.symphony_slot` is gone between dispatches, or the slot tree is
   parked on `main`. Used to act on the issue's PR from a real repo checkout.
+
+  The registry now holds every repo's slots, so a person's own lease can name
+  the same issue. Symphony's lease wins: `before_run` claims it under the
+  session id `symphony-<issue>`. Otherwise the first slot name in sort order
+  wins, so the answer does not depend on directory order.
   """
   @spec slot_lease_for_issue(String.t() | nil) :: {Path.t(), String.t()} | nil
   def slot_lease_for_issue(identifier) when is_binary(identifier) do
-    ld = local_dev_dir()
+    case {local_dev_dir(), leases_for_issue(identifier)} do
+      {ld, [_ | _] = leases} when is_binary(ld) ->
+        {slot_name, lease} =
+          Enum.find(leases, List.first(leases), fn {_slot, lease} ->
+            lease["conversation_id"] == "symphony-" <> identifier
+          end)
 
-    Enum.find_value(registry_leases(), fn {slot_name, lease} ->
-      if is_binary(ld) and to_string(lease["linear_issue"]) == identifier do
         {Path.join(ld, slot_name), to_string(lease["branch"])}
-      end
-    end)
+
+      _ ->
+        nil
+    end
   end
 
   def slot_lease_for_issue(_), do: nil
+
+  defp leases_for_issue(identifier) do
+    Enum.filter(registry_leases(), fn {_slot, lease} -> to_string(lease["linear_issue"]) == identifier end)
+  end
 
   @doc "Scratch workspace path for an issue identifier (resolve the slot via `.symphony_slot`)."
   @spec scratch_path(String.t() | nil) :: Path.t() | nil

@@ -16,6 +16,8 @@ defmodule SymphonyElixir.Planning.Workflow do
 
   require Logger
 
+  alias SymphonyElixir.History
+  alias SymphonyElixir.Linear.Client
   alias SymphonyElixir.Planning
   alias SymphonyElixir.Planning.{Auditor, Dispatch, Grader, Plan, Planner}
 
@@ -28,6 +30,10 @@ defmodule SymphonyElixir.Planning.Workflow do
 
     * If no plan exists for the issue, generate one (single LLM call) and
       return its open-row state.
+    * If a person released the issue from a park after the plan was made,
+      re-plan from the current body and the comments since the park. The
+      person's answer to a parked question lives there, and the old plan
+      would ask the same question again (GEA-10664).
     * If a plan exists with `missing` or `partial` rows, return
       `{:has_open_rows, plan, rows}`.
     * If every row is `done` or `deferred`, return `{:complete, plan}`.
@@ -51,7 +57,10 @@ defmodule SymphonyElixir.Planning.Workflow do
           Planner.plan(issue, Keyword.put(opts, :audit_summary, audit_summary))
 
         %Plan{} = plan ->
-          {:ok, plan}
+          case park_after_plan(plan, identifier, opts) do
+            nil -> {:ok, plan}
+            parked_at -> replan_after_release(issue, plan, parked_at, opts)
+          end
       end
 
     case plan_result do
@@ -59,6 +68,70 @@ defmodule SymphonyElixir.Planning.Workflow do
       err -> err
     end
   end
+
+  # The last park's time when it is newer than the plan, else nil. A re-plan
+  # stamps a newer generated_at, so one release re-plans exactly once.
+  defp park_after_plan(plan, identifier, opts) do
+    last_parked_at = Keyword.get(opts, :last_parked_at_fun, &History.last_parked_at/1)
+
+    case last_parked_at.(identifier) do
+      %DateTime{} = parked_at ->
+        if DateTime.compare(parked_at, plan_generated_at(plan)) == :gt, do: parked_at
+
+      _ ->
+        nil
+    end
+  end
+
+  defp plan_generated_at(%Plan{metadata: %{"generated_at" => at}} = plan) when is_binary(at) do
+    case DateTime.from_iso8601(at) do
+      {:ok, dt, _offset} -> dt
+      _ -> plan.inserted_at
+    end
+  end
+
+  defp plan_generated_at(%Plan{inserted_at: inserted_at}), do: inserted_at
+
+  defp replan_after_release(issue, plan, parked_at, opts) do
+    Logger.info("Re-planning #{plan.issue_identifier}: released after a park at #{DateTime.to_iso8601(parked_at)}")
+    fetch_comments = Keyword.get(opts, :comments_fun, &fetch_comments/1)
+
+    # A failed read defers the re-plan: a plan made without the person's
+    # answer would stamp a newer generated_at and never be re-made.
+    # A plan is stored with the issue's Linear id, so an issue map without one
+    # still reads, and re-saves, the right thread.
+    issue = if issue_id(issue), do: issue, else: Map.put(issue, :id, plan.issue_id)
+
+    case fetch_comments.(issue_id(issue)) do
+      {:ok, comments} ->
+        planner_opts =
+          opts
+          |> Keyword.put(:prior_plan, plan)
+          |> Keyword.put(:comments_since_park, Enum.filter(comments, &posted_after?(&1, parked_at)))
+          |> Keyword.put(:metadata, Map.put(plan.metadata || %{}, "replanned_after_park", DateTime.to_iso8601(parked_at)))
+
+        Planner.plan(issue, planner_opts)
+
+      {:error, reason} ->
+        Logger.warning("Re-plan of #{plan.issue_identifier} deferred: comments unreadable: #{inspect(reason)}")
+        {:error, {:comments_unavailable, reason}}
+    end
+  end
+
+  defp issue_id(issue) do
+    case Map.get(issue, :id) || Map.get(issue, "id") do
+      id when is_binary(id) and id != "" -> id
+      _ -> nil
+    end
+  end
+
+  # With no Linear id there is no thread to read, and an empty list would pass
+  # for a thread with no answer.
+  defp fetch_comments(issue_id) when is_binary(issue_id) and issue_id != "", do: Client.read_all_issue_comments(issue_id)
+  defp fetch_comments(_issue_id), do: {:error, :no_issue_id}
+
+  defp posted_after?(%{created_at: %DateTime{} = at}, parked_at), do: DateTime.compare(at, parked_at) == :gt
+  defp posted_after?(_comment, _parked_at), do: false
 
   defp audit_summary(issue, identifier, opts) do
     case Auditor.audit(issue, pr_url: opts[:pr_url]) do

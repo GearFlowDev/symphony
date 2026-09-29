@@ -113,6 +113,30 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @all_comments_query """
+  query SymphonyLinearAllComments($issueId: String!, $first: Int!, $after: String) {
+    issue(id: $issueId) {
+      comments(first: $first, after: $after, orderBy: createdAt) {
+        nodes {
+          id
+          body
+          createdAt
+          user {
+            name
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+  """
+
+  @comments_page_size 100
+  @comments_max_pages 20
+
   @viewer_query """
   query SymphonyLinearViewer {
     viewer {
@@ -266,21 +290,15 @@ defmodule SymphonyElixir.Linear.Client do
   @doc """
   Fetch ALL comments on an issue (no @agent filter). Used by the evaluator
   to check for evidence and plan comments posted by the agent itself.
+  It reads the first 50 comments, and a Linear failure logs and reads as no
+  comments; use `read_all_issue_comments/2` when the whole thread matters and
+  an empty thread and a failed read differ.
   """
   @spec fetch_all_issue_comments(String.t()) :: {:ok, list(map())}
   def fetch_all_issue_comments(issue_id) when is_binary(issue_id) do
     case graphql(@comments_query, %{issueId: issue_id, first: 50}) do
       {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}}} ->
-        comments =
-          Enum.map(nodes, fn node ->
-            %{
-              body: node["body"] || "",
-              author: get_in(node, ["user", "name"]) || "Unknown",
-              created_at: parse_datetime(node["createdAt"])
-            }
-          end)
-
-        {:ok, comments}
+        {:ok, Enum.map(nodes, &comment_from_node/1)}
 
       {:ok, _body} ->
         {:ok, []}
@@ -289,6 +307,62 @@ defmodule SymphonyElixir.Linear.Client do
         Logger.warning("Failed to fetch all comments for issue #{issue_id}: #{inspect(reason)}")
         {:ok, []}
     end
+  end
+
+  @doc """
+  Fetch every comment on an issue, page by page, and keep a Linear failure as
+  an error. A re-plan after a park needs this: a failed or cut read must not
+  pass for a thread with no answer (GEA-10664). `opts` go to `graphql/3`.
+  """
+  @spec read_all_issue_comments(String.t(), keyword()) :: {:ok, list(map())} | {:error, term()}
+  def read_all_issue_comments(issue_id, opts \\ []) when is_binary(issue_id) do
+    read_comment_pages(issue_id, nil, [], @comments_max_pages, opts)
+  end
+
+  # Page to the end of the thread: a person's answer can be the newest of
+  # many comments. A thread longer than the page cap is an error, never a
+  # silent cut.
+  defp read_comment_pages(_issue_id, _after, _acc, 0, _opts), do: {:error, :too_many_comment_pages}
+
+  defp read_comment_pages(issue_id, after_cursor, acc, pages_left, opts) do
+    variables = %{issueId: issue_id, first: @comments_page_size, after: after_cursor}
+
+    with {:ok, body} <- graphql(@all_comments_query, variables, opts),
+         {:ok, nodes, page_info} <- comment_page(body) do
+      acc = acc ++ Enum.map(nodes, &comment_from_node/1)
+
+      case comment_page_cursor(page_info) do
+        {:ok, ^after_cursor} -> {:error, :linear_repeated_end_cursor}
+        {:ok, cursor} -> read_comment_pages(issue_id, cursor, acc, pages_left - 1, opts)
+        :done -> {:ok, acc}
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  # A 200 response can carry GraphQL errors beside partial data; either one
+  # fails the read.
+  defp comment_page(%{"errors" => errors}) when is_list(errors) and errors != [],
+    do: {:error, {:linear_graphql_errors, errors}}
+
+  defp comment_page(%{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes} = page}}}) when is_list(nodes),
+    do: {:ok, nodes, page["pageInfo"]}
+
+  defp comment_page(body), do: {:error, {:unexpected_comments_response, body}}
+
+  # A 200 response can carry partial data: without a boolean hasNextPage the
+  # read cannot tell a whole thread from a cut one.
+  defp comment_page_cursor(%{"hasNextPage" => has_next_page} = page_info) when is_boolean(has_next_page),
+    do: next_page_cursor(%{has_next_page: has_next_page, end_cursor: page_info["endCursor"]})
+
+  defp comment_page_cursor(_page_info), do: {:error, :linear_missing_page_info}
+
+  defp comment_from_node(node) do
+    %{
+      body: node["body"] || "",
+      author: get_in(node, ["user", "name"]) || "Unknown",
+      created_at: parse_datetime(node["createdAt"])
+    }
   end
 
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}

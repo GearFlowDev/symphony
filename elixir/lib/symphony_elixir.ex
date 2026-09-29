@@ -34,9 +34,6 @@ defmodule SymphonyElixir.Application do
       SymphonyElixir.Repo,
       SymphonyElixir.Repo.Migrator,
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
-      # Before the orchestrator: its reaper asks this which tmux sessions a live
-      # process still owns (GEA-10681).
-      {Registry, keys: :unique, name: SymphonyElixir.Claude.TmuxCLI.Owners},
       SymphonyElixir.WorkflowStore,
       SymphonyElixir.AgentRuntimeSupervisor,
       SymphonyElixir.HttpServer,

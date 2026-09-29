@@ -283,10 +283,13 @@ defmodule SymphonyElixir.Linear.Adapter do
     end
   end
 
+  # Errors first: GraphQL can answer data beside errors, and a `success` next to an
+  # error is not a success.
   defp label_mutation_result(field, response) do
     cond do
-      get_in(response, ["data", field, "success"]) == true -> :ok
       field == "issueRemoveLabel" and label_not_on_issue?(response) -> :ok
+      Map.get(response, "errors") not in [nil, []] -> {:error, :label_update_failed}
+      get_in(response, ["data", field, "success"]) == true -> :ok
       true -> {:error, :label_update_failed}
     end
   end
@@ -296,10 +299,9 @@ defmodule SymphonyElixir.Linear.Adapter do
   # answers HTTP 200 with `errors: [%{"message" => "Label not on issue"}]` and null
   # data (probed 2026-09-29), which logged `:label_update_failed` every two minutes
   # (GEA-10681).
-  defp label_not_on_issue?(%{"errors" => errors}) when is_list(errors) do
-    Enum.any?(errors, &(is_map(&1) and &1["message"] == "Label not on issue"))
-  end
-
+  # Only that one error alone: beside another, the mutation may have failed for a
+  # reason this does not know.
+  defp label_not_on_issue?(%{"errors" => [%{"message" => "Label not on issue"}]}), do: true
   defp label_not_on_issue?(_response), do: false
 
   # The issue's own team's label wins; a workspace-level label (no team) is the

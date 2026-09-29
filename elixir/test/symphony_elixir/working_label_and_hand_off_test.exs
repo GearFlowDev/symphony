@@ -155,6 +155,36 @@ defmodule SymphonyElixir.WorkingLabelAndHandOffTest do
     )
 
     assert {:error, :label_update_failed} = Adapter.remove_label("issue-1", "symphony-working")
+
+    # The absent-label error beside another error is not a clean no-op.
+    Process.put(
+      {FakeLabelClient, :results},
+      [
+        lookup,
+        {:ok,
+         %{
+           "data" => nil,
+           "errors" => [%{"message" => "Label not on issue"}, %{"message" => "Entity not found"}]
+         }}
+      ]
+    )
+
+    assert {:error, :label_update_failed} = Adapter.remove_label("issue-1", "symphony-working")
+
+    # A `success` beside an error is not a success.
+    Process.put(
+      {FakeLabelClient, :results},
+      [
+        lookup,
+        {:ok,
+         %{
+           "data" => %{"issueAddLabel" => %{"success" => true}},
+           "errors" => [%{"message" => "Something else"}]
+         }}
+      ]
+    )
+
+    assert {:error, :label_update_failed} = Adapter.add_label("issue-1", "symphony-working")
   end
 
   test "the memory tracker records both label writes" do

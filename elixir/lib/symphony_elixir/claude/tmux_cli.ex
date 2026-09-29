@@ -212,8 +212,8 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
   The orchestrator calls this every poll with the session_ids of its currently
   running workers, so a session leaked mid-run (a worker killed without its
   `stop_session/1` cleanup firing) gets cleaned up within one poll instead of
-  surviving until the next BEAM restart. Mirrors `reap_stale_pool_locks` for
-  slot locks. `keep_session_ids` may be a list or MapSet.
+  surviving until the next BEAM restart. `keep_session_ids` may be a list or
+  MapSet.
 
   Options:
 

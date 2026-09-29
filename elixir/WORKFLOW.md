@@ -42,13 +42,18 @@ escalation:
 workspace:
   root: ~/code/symphony-workspaces
 
+# Slot hooks belong to the machine's harness, not to this fork (GEA-10251). The
+# gf_engineering box runs agents/WORKFLOW.symphony.md from gf_harness_surfaces:
+# `before_run` calls provision-slot.sh with SYMPHONY_REPO (the raw repo name) and
+# `before_remove` calls `lease release`. Run with that file, or copy its hooks here.
+# Until then a run stops before it touches any slot.
 hooks:
   timeout_ms: 900000
   before_run: |
-    BRANCH="${SYMPHONY_BRANCH_NAME:-$(echo "$(basename "$PWD")" | tr '[:upper:]' '[:lower:]')}"
-    "${SYMPHONY_SCRIPTS}slot-claim.sh" "${SYMPHONY_REPO:-procurement}" "$BRANCH" "$PWD"
+    echo "before_run: this WORKFLOW.md has no slot hooks. Use agents/WORKFLOW.symphony.md from gf_harness_surfaces, or copy its hooks here" >&2
+    exit 1
   before_remove: |
-    "${SYMPHONY_SCRIPTS}slot-release.sh" "$PWD"
+    exit 0
 
 agent:
   backend: claude

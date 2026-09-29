@@ -250,7 +250,7 @@ defmodule SymphonyElixir.Claude.CLI do
         :ok
 
       String.starts_with?(expanded, pool_root) ->
-        # Allow pool slot directories used by symphony-slot-claim
+        # Allow pool slot directories under the configured pool root
         :ok
 
       SymphonyElixir.Workspace.local_dev_slot?(expanded) ->

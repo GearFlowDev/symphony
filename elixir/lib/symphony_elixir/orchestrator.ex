@@ -519,13 +519,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
-    # Free slots whose lock no longer backs a running issue (e.g. a run that
-    # ended without its slot release firing). Runs every poll so abandoned
-    # locks don't silently shrink effective concurrency. Off under :test
-    # (`reap_orphans: false`): a test BEAM's empty running set would otherwise
-    # make every live worker on this host look orphaned.
+    # Kill tmux sessions that no longer back a running worker. Slot leases are
+    # NOT reaped here: the harness owns them, and `slot-status` plus
+    # `lease claim --reclaim` handle a lease nobody released (GEA-10251). Off
+    # under :test (`reap_orphans: false`): a test BEAM's empty running set would
+    # otherwise make every live worker on this host look orphaned.
     if Application.get_env(:symphony_elixir, :reap_orphans, true) do
-      reap_stale_pool_locks(state)
       reap_orphan_tmux_sessions(state)
     end
 
@@ -537,16 +536,6 @@ defmodule SymphonyElixir.Orchestrator do
       Logger.debug("Outside active hours, skipping dispatch")
       state
     end
-  end
-
-  defp reap_stale_pool_locks(%State{running: running}) do
-    running
-    |> Map.values()
-    |> Enum.map(& &1[:identifier])
-    |> Enum.reject(&is_nil/1)
-    |> Workspace.reap_stale_pool_locks()
-
-    :ok
   end
 
   # Kill tmux Claude sessions that no longer back a running worker — the safety
@@ -2795,7 +2784,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp read_base_branch(workspace_path) do
-    # BASE_BRANCH lives in .symphony_slot (written by slot-claim.sh), NOT
+    # BASE_BRANCH lives in .symphony_slot (written by the before_run hook), NOT
     # .env.symphony (which only has port assignments).
     slot_file = Path.join(workspace_path, ".symphony_slot")
 

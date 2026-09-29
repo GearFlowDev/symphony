@@ -143,10 +143,15 @@ claude:
 ### Running on a gf_engineering machine
 
 On machines that use the gf_engineering workspace layout, working copies live at
-`$GEARFLOW_WORKSPACE/local-dev/gf_<repo>-slot<N>` and slot ownership is a single
+`$GEARFLOW_WORKSPACE/local-dev/<repo>-slot<N>` and slot ownership is a single
 atomic lease in `$GEARFLOW_WORKSPACE/local-dev/registry/` shared with interactive
-Claude sessions. To run Symphony there, point the slot hooks at the registry-aware
-scripts and designate which slots Symphony may use:
+Claude sessions. The harness owns those slots, so Symphony's hooks call the
+harness and nothing in this fork claims, resets or releases a slot (GEA-10251).
+Use the hooks in `agents/WORKFLOW.symphony.md` from gf_harness_surfaces:
+
+* `before_run` maps `SYMPHONY_REPO` (the raw repo name, for example
+  `gf_procurement` or `symphony`) to `agents/provision-slot.sh`.
+* `before_remove` calls `local-dev/bin/lease release` once the issue is finished.
 
 ```yaml
 tracker:
@@ -154,26 +159,10 @@ tracker:
   # the automation key, so without this a claim is assigned to the API actor.
   # User id or email; falls back to the LINEAR_CLAIM_ASSIGNEE env var, then the bot.
   claim_assignee: you@example.com
-
-hooks:
-  before_run: |
-    BRANCH="${SYMPHONY_BRANCH_NAME:-$(basename "$PWD" | tr '[:upper:]' '[:lower:]')}"
-    "${SYMPHONY_SCRIPTS}slot-claim-registry.sh" "${SYMPHONY_REPO:-procurement}" "$BRANCH" "$PWD"
-  before_remove: |
-    "${SYMPHONY_SCRIPTS}slot-release-registry.sh" "$PWD"
 ```
 
-The eligible slot set comes from the environment (space-separated slot numbers),
-honored by both the claim script and the orchestrator's orphan-lease reaper:
-
-```bash
-export SYMPHONY_PLATFORM_SLOTS="4 5 6"
-export SYMPHONY_PROCUREMENT_SLOTS="4 5 6"
-```
-
-The reaper only ever touches `owner == "symphony"` leases on these designated
-slots, so an interactive teammate's slot (slots 1–3, any other owner) is never
-reset out from under them.
+A lease that no hook released stays in place. `local-dev/bin/slot-status --stale`
+lists it and `lease claim --reclaim` takes it.
 
 ## Key files
 

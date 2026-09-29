@@ -74,8 +74,9 @@ defmodule SymphonyElixir.Workspace do
       true ->
         case validate_workspace_path(workspace) do
           :ok ->
-            # Release any claimed pool slot before removing the workspace
-            release_pool_slot(workspace)
+            # `before_remove` owns slot release, so this one run releases the
+            # pool slot too. Calling `release_pool_slot/1` first ran the same
+            # hook twice on every removal (GEA-10251).
             maybe_run_before_remove_hook(workspace)
             File.rm_rf(workspace)
 
@@ -112,7 +113,6 @@ defmodule SymphonyElixir.Workspace do
       true ->
         case validate_workspace_path(workspace, Path.dirname(workspace)) do
           :ok ->
-            release_pool_slot(workspace)
             maybe_run_before_remove_hook(workspace)
             File.rm_rf(workspace)
 
@@ -176,125 +176,23 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @doc """
+  Releases the pool slot a workspace's `.symphony_slot` names, through the
+  `before_remove` hook and nothing else.
+
+  The harness owns slots: `lease release` decides whether a lease is ours, and
+  `slot-status` / `lease claim --reclaim` handle a lease nobody released. The
+  fork used to reset slot trees and delete lease files itself, which bypassed
+  that ownership check and could reset a tree holding unmerged work
+  (GEA-10251). With no marker or no hook there is nothing to release here.
+  """
   @spec release_pool_slot(Path.t()) :: :ok
   def release_pool_slot(workspace) do
-    slot_file = Path.join(workspace, ".symphony_slot")
-
-    if File.exists?(slot_file) do
-      case Config.workspace_hooks()[:before_remove] do
-        nil ->
-          release_via_default_script(workspace)
-
-        command ->
-          # A configured before_remove hook owns slot release. Running the
-          # bundled slot-release.sh here instead would bypass the machine's
-          # slot protocol (e.g. registry leases on gf_engineering machines)
-          # and leave its claim records behind.
-          Logger.info("Releasing pool slot via before_remove hook for workspace=#{workspace}")
-
-          run_hook(
-            command,
-            workspace,
-            %{issue_id: nil, issue_identifier: Path.basename(workspace)},
-            "before_remove"
-          )
-          |> ignore_hook_failure()
-      end
-    else
-      # No marker, but a registry lease for this workspace may still be open
-      # (e.g. the marker was cleaned but release didn't finish). Release it
-      # synchronously so a manual redispatch can reclaim the slot now instead of
-      # waiting for the next poll-cycle reaper.
-      release_registry_lease_for_workspace(workspace)
+    if File.exists?(Path.join(workspace, ".symphony_slot")) do
+      maybe_run_before_remove_hook(workspace)
     end
 
     :ok
-  end
-
-  # Synchronously release any Symphony-owned lease whose recorded workspace is
-  # this one. Mirrors the per-poll reaper but targets a single workspace, for
-  # the manual-redispatch path that needs the slot freed immediately.
-  defp release_registry_lease_for_workspace(workspace) do
-    expanded = Path.expand(workspace)
-
-    for {slot_name, lease} <- registry_leases(),
-        symphony_owned?(lease),
-        ws = to_string(lease["workspace"] || ""),
-        ws != "",
-        Path.expand(ws) == expanded do
-      Logger.info("Releasing registry lease #{slot_name} for workspace=#{workspace} (no marker; synchronous release)")
-      release_registry_lease(slot_name)
-    end
-
-    :ok
-  end
-
-  # Grace window so a freshly-claimed lease (written by before_run just before
-  # the run registers) is never reaped out from under a starting agent. The
-  # primary safety is the not-running check below; this is extra margin.
-  @orphan_lease_grace_seconds 120
-
-  defp release_via_default_script(workspace) do
-    release_script = scripts_path("slot-release.sh")
-
-    if File.exists?(release_script) do
-      Logger.info("Releasing pool slot for workspace=#{workspace}")
-
-      case System.cmd("bash", [release_script, workspace], stderr_to_stdout: true) do
-        {output, 0} ->
-          Logger.info("Pool slot released: #{String.trim(output)}")
-
-        {output, status} ->
-          Logger.warning("Pool slot release failed status=#{status}: #{String.trim(output)}")
-      end
-    end
-  end
-
-  @doc """
-  Release registry slot leases that no longer back a running issue — the
-  orchestrator's per-poll safety net for slots whose run ended without its
-  before_remove release firing (e.g. an agent killed on a stall timeout).
-
-  `active_identifiers` is the set of issue identifiers currently running. A lease
-  is reaped only when ALL of these hold:
-
-    * Symphony owns it (`owner == "symphony"`). A lease held by an interactive
-      human session is NEVER touched — `release_registry_lease/1` does a
-      `git reset --hard`, which on a shared machine would wipe a teammate's
-      uncommitted work. This owner guard is the primary safety.
-    * It sits on a Symphony-designated slot (when `SYMPHONY_PLATFORM_SLOTS` /
-      `SYMPHONY_PROCUREMENT_SLOTS` are set — the same designation
-      slot-claim-registry.sh honors). Defense in depth on top of the owner guard.
-    * Its issue is NOT running — so a re-dispatched issue, already back in
-      `running`, is never clobbered — and it was claimed more than the grace
-      window ago.
-
-  The freed slot is reset to origin/main so it is immediately reclaimable.
-  Best-effort; never raises. Returns the reaped slots.
-  """
-  @spec reap_stale_pool_locks([String.t()]) :: [String.t()]
-  def reap_stale_pool_locks(active_identifiers) when is_list(active_identifiers) do
-    active = MapSet.new(active_identifiers)
-    now = DateTime.utc_now()
-
-    for {slot_name, lease} <- registry_leases(), reduce: [] do
-      reaped ->
-        issue = to_string(lease["linear_issue"] || "")
-
-        if symphony_owned?(lease) and eligible_slot?(slot_name) and
-             issue != "" and not MapSet.member?(active, issue) and
-             lease_claimed_older_than?(lease["claimed"], now, @orphan_lease_grace_seconds) do
-          Logger.info("Reaping orphaned slot lease #{slot_name}: issue #{issue} is not running")
-          release_registry_lease(slot_name)
-          [slot_name | reaped]
-        else
-          reaped
-        end
-    end
-  rescue
-    error ->
-      Logger.warning("Orphan lease reap failed: #{Exception.message(error)}")
-      []
   end
 
   # local-dev dir that holds registry/ and the slot working copies.
@@ -312,7 +210,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  # [{slot_name, lease_map}] for each symphony slot lease in the registry.
+  # [{slot_name, lease_map}] for each slot lease in the registry, whatever the
+  # repo: `before_run` provisions a slot of any repo `provision-slot.sh` knows.
   defp registry_leases do
     case local_dev_dir() do
       ld when is_binary(ld) ->
@@ -327,7 +226,8 @@ defmodule SymphonyElixir.Workspace do
     case File.ls(dir) do
       {:ok, files} ->
         files
-        |> Enum.filter(&Regex.match?(~r/^gf_(?:platform|procurement)-slot\d+\.json$/, &1))
+        |> Enum.filter(&Regex.match?(~r/^[A-Za-z0-9_.-]+-slot\d+\.json$/, &1))
+        |> Enum.sort()
         |> Enum.flat_map(&read_registry_lease(dir, &1))
 
       _ ->
@@ -337,108 +237,12 @@ defmodule SymphonyElixir.Workspace do
 
   defp read_registry_lease(dir, file) do
     with {:ok, content} <- File.read(Path.join(dir, file)),
-         {:ok, lease} <- Jason.decode(content) do
+         {:ok, lease} when is_map(lease) <- Jason.decode(content) do
       [{String.replace_suffix(file, ".json", ""), lease}]
     else
       _ -> []
     end
   end
-
-  # The reaper only ever touches leases Symphony itself wrote. An interactive
-  # human session's lease (any other owner) is off limits — the per-poll
-  # `git reset --hard` in release_registry_lease/1 would otherwise wipe a
-  # teammate's uncommitted work on a shared machine.
-  # A lease is Symphony's if it carries the upstream owner marker ("symphony") OR
-  # the orchestrator's conversation_id stamp. The local-dev slot-claim variant sets
-  # owner to the tmux session (e.g. "cc-symphony") for liveness and stamps
-  # conversation_id="symphony-orchestrator"; without the second clause the reaper
-  # never recognises those leases and they leak (the issue completes but the slot
-  # stays held).
-  defp symphony_owned?(lease),
-    do: lease["owner"] == "symphony" or lease["conversation_id"] == "symphony-orchestrator"
-
-  # When the Symphony-eligible slot set is configured (SYMPHONY_PLATFORM_SLOTS /
-  # SYMPHONY_PROCUREMENT_SLOTS — space-separated slot numbers, the same
-  # designation slot-claim-registry.sh honors), confine reaping to those slots.
-  # An unconfigured repo falls back to the owner guard alone.
-  defp eligible_slot?(slot_name) do
-    case Regex.run(~r/^gf_(platform|procurement)-slot(\d+)$/, slot_name) do
-      [_, repo, num] ->
-        case eligible_slot_numbers(repo) do
-          [] -> true
-          nums -> num in nums
-        end
-
-      _ ->
-        false
-    end
-  end
-
-  defp eligible_slot_numbers(repo) do
-    case System.get_env("SYMPHONY_#{String.upcase(repo)}_SLOTS") do
-      v when is_binary(v) and v != "" -> String.split(v, ~r/\s+/, trim: true)
-      _ -> []
-    end
-  end
-
-  # Reset a slot's working copy to origin/main, then free its registry lease —
-  # but ONLY if the reset fully succeeded. Freeing the lease first (the old
-  # behavior) made a slot claimable while it could still hold the previous run's
-  # branch or a dirty worktree, so the next dispatch inherited contaminated
-  # state. slot_name e.g. "gf_procurement-slot5".
-  defp release_registry_lease(slot_name) do
-    case local_dev_dir() do
-      ld when is_binary(ld) ->
-        slot_dir = Path.join(ld, slot_name)
-
-        if reset_slot_to_main?(slot_dir) do
-          File.rm(Path.join([ld, "registry", "#{slot_name}.json"]))
-        else
-          Logger.warning("Leaving lease #{slot_name} in place: reset failed, so the slot is not safe to reclaim yet")
-        end
-
-      _ ->
-        :ok
-    end
-
-    :ok
-  end
-
-  # True only when the slot is clean origin/main afterward. A missing working
-  # copy is vacuously clean (nothing to contaminate); otherwise every git step
-  # must exit 0.
-  defp reset_slot_to_main?(slot_dir) do
-    if File.dir?(slot_dir) do
-      [
-        ["-C", slot_dir, "checkout", "--", "."],
-        ["-C", slot_dir, "checkout", "main"],
-        ["-C", slot_dir, "reset", "--hard", "origin/main"]
-      ]
-      |> Enum.reduce(true, &run_slot_reset_step(slot_dir, &1, &2))
-    else
-      true
-    end
-  end
-
-  defp run_slot_reset_step(slot_dir, args, ok) do
-    case System.cmd("git", args, stderr_to_stdout: true) do
-      {_, 0} ->
-        ok
-
-      {out, code} ->
-        Logger.warning("git #{Enum.join(args, " ")} failed (#{code}) in #{slot_dir}: #{String.trim(out)}")
-        false
-    end
-  end
-
-  defp lease_claimed_older_than?(claimed, now, grace) when is_binary(claimed) do
-    case DateTime.from_iso8601(claimed) do
-      {:ok, dt, _} -> DateTime.diff(now, dt) > grace
-      _ -> true
-    end
-  end
-
-  defp lease_claimed_older_than?(_claimed, _now, _grace), do: true
 
   @spec release_pool_slot_for_issue(String.t()) :: :ok
   def release_pool_slot_for_issue(identifier) when is_binary(identifier) do
@@ -450,17 +254,23 @@ defmodule SymphonyElixir.Workspace do
   def release_pool_slot_for_issue(_identifier), do: :ok
 
   @doc """
-  `{slot_working_copy_dir, branch}` for the slot currently leased to `identifier`,
+  `{slot_working_copy_dir, branch}` for the slot Symphony leased to `identifier`,
   or nil. Read straight from the registry lease — reliable even when the scratch
   workspace's `.symphony_slot` is gone between dispatches, or the slot tree is
   parked on `main`. Used to act on the issue's PR from a real repo checkout.
+
+  Only Symphony's own lease counts: `before_run` claims it under the session id
+  `symphony-<issue>`. The registry holds every repo's slots, so a person's lease
+  or another repo's slot can name the same issue, and pushing or opening a PR
+  from that checkout would act in the wrong tree.
   """
   @spec slot_lease_for_issue(String.t() | nil) :: {Path.t(), String.t()} | nil
   def slot_lease_for_issue(identifier) when is_binary(identifier) do
     ld = local_dev_dir()
 
     Enum.find_value(registry_leases(), fn {slot_name, lease} ->
-      if is_binary(ld) and to_string(lease["linear_issue"]) == identifier do
+      if is_binary(ld) and to_string(lease["linear_issue"]) == identifier and
+           lease["conversation_id"] == "symphony-" <> identifier do
         {Path.join(ld, slot_name), to_string(lease["branch"])}
       end
     end)
@@ -857,11 +667,14 @@ defmodule SymphonyElixir.Workspace do
     # Routing: the issue's resolved PR is authoritative for which repo's slot
     # to lease — labels are a guess and can be wrong (GEA-5247: `3.0` label on
     # gf_platform work leased a procurement slot; the worker could only refuse).
+    # The value is the raw repository name (`gf_platform`, `symphony`, …), and
+    # the `before_run` hook maps it to a slot. Only the hook knows which repos
+    # this machine can provision (GEA-10251).
     repo =
       repo_from_pr_url(issue_context[:pr_url]) ||
         cond do
-          Enum.any?(labels, &label_matches_repo?(&1, "2.0")) -> "platform"
-          Enum.any?(labels, &label_matches_repo?(&1, "3.0")) -> "procurement"
+          Enum.any?(labels, &label_matches_repo?(&1, "2.0")) -> "gf_platform"
+          Enum.any?(labels, &label_matches_repo?(&1, "3.0")) -> "gf_procurement"
           true -> ""
         end
 
@@ -878,9 +691,8 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp repo_from_pr_url(url) when is_binary(url) do
-    case Regex.run(~r{github\.com/[^/]+/(gf_platform|gf_procurement)/pull/}, url) do
-      [_, "gf_platform"] -> "platform"
-      [_, "gf_procurement"] -> "procurement"
+    case Regex.run(~r{\Ahttps://github\.com/GearFlowDev/([A-Za-z0-9_-][A-Za-z0-9_.-]*)/pull/\d+}i, url) do
+      [_, repo] -> repo
       _ -> nil
     end
   end

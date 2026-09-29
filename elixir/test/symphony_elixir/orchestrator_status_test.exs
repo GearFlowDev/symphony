@@ -950,6 +950,81 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert next_poll_in_ms <= 50
   end
 
+  test "a poll leaves a slot with unmerged work, and its lease, alone (GEA-10251)" do
+    root = Path.join(System.tmp_dir!(), "symphony-poll-slot-#{System.unique_integer([:positive])}")
+    registry = Path.join([root, "local-dev", "registry"])
+    origin = Path.join(root, "origin.git")
+    slot = Path.join([root, "local-dev", "gf_procurement-slot9"])
+    File.mkdir_p!(registry)
+
+    git = fn args -> {_, 0} = System.cmd("git", args, stderr_to_stdout: true) end
+    git.(["init", "--bare", "-b", "main", origin])
+    git.(["clone", origin, slot])
+    git.(["-C", slot, "config", "user.name", "Test User"])
+    git.(["-C", slot, "config", "user.email", "test@example.com"])
+    File.write!(Path.join(slot, "README.md"), "main\n")
+    git.(["-C", slot, "add", "README.md"])
+    git.(["-C", slot, "commit", "-m", "main"])
+    git.(["-C", slot, "push", "-q", "origin", "main"])
+    git.(["-C", slot, "checkout", "-q", "-b", "gea-orphan"])
+    File.write!(Path.join(slot, "README.md"), "unmerged work\n")
+    git.(["-C", slot, "commit", "-am", "unmerged"])
+    File.write!(Path.join(slot, "README.md"), "uncommitted work\n")
+    {head, 0} = System.cmd("git", ["-C", slot, "rev-parse", "HEAD"])
+
+    # Every mark the fork's old reaper looked for: its owner string, its conversation stamp,
+    # an issue that is not running and a claim far older than its grace window.
+    lease_file = Path.join(registry, "gf_procurement-slot9.json")
+
+    File.write!(
+      lease_file,
+      Jason.encode!(%{
+        owner: "symphony",
+        conversation_id: "symphony-orchestrator",
+        linear_issue: "GEA-ORPHAN",
+        claimed: "2025-01-01T00:00:00Z"
+      })
+    )
+
+    previous_workspace = System.get_env("GEARFLOW_WORKSPACE")
+    previous_reap = Application.get_env(:symphony_elixir, :reap_orphans)
+    System.put_env("GEARFLOW_WORKSPACE", root)
+    Application.put_env(:symphony_elixir, :reap_orphans, true)
+
+    # A prefix no real session carries, so the tmux reaper that also runs on a poll
+    # can touch nothing on the machine running the test.
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 60_000,
+      claude_tmux_session_prefix: "symphony-test-#{System.unique_integer([:positive])}"
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    orchestrator_name = Module.concat(__MODULE__, :SlotSurvivesPollOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      restore_env("GEARFLOW_WORKSPACE", previous_workspace)
+
+      if is_nil(previous_reap),
+        do: Application.delete_env(:symphony_elixir, :reap_orphans),
+        else: Application.put_env(:symphony_elixir, :reap_orphans, previous_reap)
+
+      File.rm_rf(root)
+    end)
+
+    :sys.replace_state(pid, fn state -> %{state | poll_check_in_progress: true} end)
+    send(pid, :run_poll_cycle)
+    wait_for_snapshot(pid, fn snapshot -> match?(%{polling: %{checking?: false}}, snapshot) end, 5_000)
+
+    assert File.exists?(lease_file), "the fork deleted a lease the harness owns"
+    assert {^head, 0} = System.cmd("git", ["-C", slot, "rev-parse", "HEAD"])
+    assert {"gea-orphan\n", 0} = System.cmd("git", ["-C", slot, "rev-parse", "--abbrev-ref", "HEAD"])
+    assert File.read!(Path.join(slot, "README.md")) == "uncommitted work\n"
+  end
+
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",

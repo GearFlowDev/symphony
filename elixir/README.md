@@ -197,156 +197,31 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 
-## Worker Slot Setup
+## Worker Slots
 
-Symphony uses a pool of pre-built workspace slots so agents start working immediately instead of
-cloning and compiling from scratch each time. Each slot is a full checkout of the target repo with
-compiled dependencies, a seeded database, and running backend/frontend services.
-
-### Architecture
-
-```
-~/code/symphony-workspaces/     ← Symphony scratch workspaces (one per issue)
-  GEA-1234/
-    .symphony_slot              ← points to the claimed pool slot
-
-~/Documents/Gearflow/           ← Pool slot directories (persistent clones)
-  procurement-5/                ← Symphony slot (procurement repo)
-  procurement-6/
-  procurement-7/
-  procurement-8/
-  platform-5/                   ← Symphony slot (platform repo)
-  platform-6/
-  platform-7/
-  platform-8/
-```
+Symphony does not own slots. The machine's harness does: its `before_run` hook provisions or
+reuses a slot and writes `.symphony_slot` into the scratch workspace, and its `before_remove`
+hook releases the lease. On a gf_engineering machine those hooks call
+`local-dev/gf_harness_surfaces/agents/provision-slot.sh` and `local-dev/bin/lease release`;
+see `agents/WORKFLOW.symphony.md` in gf_harness_surfaces.
 
 When Symphony dispatches an agent for an issue:
 
-1. Creates a scratch workspace under `workspace.root` (configured in `WORKFLOW.md`)
-2. Runs the `before_run` hook, which calls `slot-claim.sh`
-3. `slot-claim.sh` finds an unlocked slot (5-8), checks out the issue branch, runs migrations,
-   starts services, and writes `.symphony_slot` with the slot path and ports
-4. The agent runs in the pool slot directory (not the scratch workspace)
-5. When the agent finishes, `slot-release.sh` stops services, cleans git state, and removes the lock
+1. It creates a scratch workspace under `workspace.root`.
+2. It runs `before_run` with `SYMPHONY_REPO` set to the raw repository name: the repo of the
+   issue's GearFlowDev PR, else `gf_platform` for a `2.0` label or `gf_procurement` for a
+   `3.0` label, else empty. The hook maps that name to a slot.
+3. The agent runs in the slot that `.symphony_slot` names.
+4. When a run ends, Symphony runs `before_remove` once. The hook decides whether to release.
 
-### Prerequisites
-
-Each pool slot needs:
-
-- **A clone of the target repo** in `~/Documents/Gearflow/<repo>-<N>/`
-- **PostgreSQL** running on the expected port (25432 for platform, 25433 for procurement)
-- **A seeded database** named `gf_<repo>_<N>_dev`
-- **devenv** configured in the repo (provides Elixir, Node, and other dependencies via Nix)
-
-### Port Assignments
-
-Slots 5-8 are reserved for Symphony. Slots 1-4 are reserved for the separate `cc-*` worker pool
-(manual Claude Code sessions managed by a supervisor agent).
-
-| Slot | Phoenix Port | Frontend Port | Database |
-|------|-------------|---------------|----------|
-| platform-5 | 3009 | 5209 | gf_platform_5_dev |
-| platform-6 | 3010 | 5210 | gf_platform_6_dev |
-| platform-7 | 3011 | 5211 | gf_platform_7_dev |
-| platform-8 | 3012 | 5212 | gf_platform_8_dev |
-| procurement-5 | 3013 | 5213 | gf_procurement_5_dev |
-| procurement-6 | 3014 | 5214 | gf_procurement_6_dev |
-| procurement-7 | 3015 | 5215 | gf_procurement_7_dev |
-| procurement-8 | 3016 | 5216 | gf_procurement_8_dev |
-
-Platform slots use PostgreSQL on port **25432** (with PostGIS + pgvector).
-Procurement slots use PostgreSQL on port **25433**.
-
-### First-Time Slot Setup
-
-For each slot, clone the repo and create the database:
-
-```bash
-# Example: set up procurement-5
-SLOT_DIR=~/Documents/Gearflow/procurement-5
-git clone git@github.com:GearFlowDev/gf_procurement.git "$SLOT_DIR"
-cd "$SLOT_DIR"
-
-# Write the .env with port assignments
-cat > .env <<EOF
-export PHOENIX_PORT=3013
-export FRONTEND_PORT=5213
-export DATABASE_NAME=gf_procurement_5_dev
-export POSTGRES_PORT=25433
-EOF
-
-# Ensure .envrc exists for direnv
-cat > .envrc <<'EOF'
-eval "$(devenv direnvrc)"
-use devenv
-if [ -f .env ]; then set -a; source .env; set +a; fi
-EOF
-direnv allow .
-
-# Create and seed the database
-direnv exec . mix ecto.create
-direnv exec . mix ecto.migrate
-direnv exec . mix run priv/repo/seed.local.exs
-```
-
-Repeat for each slot, adjusting the port numbers and database name per the table above.
-
-### How slot-claim.sh Works
-
-The `before_run` hook in `WORKFLOW.md` calls `slot-claim.sh` with the repo type, branch name,
-and scratch workspace path. The script:
-
-1. Checks if this workspace already has a claimed slot (idempotent)
-2. Releases stale locks (matching workspace/branch, self-referential, or missing workspace dir)
-3. Finds the first unlocked slot (5-8)
-4. Verifies PostgreSQL is running on the expected port
-5. Cleans git state and checks out the issue branch (fetches from origin, rebases on main)
-6. Runs `mix deps.get` and `mix ecto.migrate`
-7. Writes `.env` and `.envrc` with the slot's port assignments
-8. Starts backend and frontend via `devenv-start.sh`
-9. Writes `.symphony_slot` to the scratch workspace with slot info
-
-If the backend is already healthy on the expected port, it skips stopping/starting services.
-
-### How slot-release.sh Works
-
-Called by the `before_remove` hook when Symphony cleans up a workspace. The script:
-
-1. Reads `.symphony_slot` from the workspace to find the slot
-2. Stops backend and frontend services
-3. Cleans git state (checkout main, reset to origin/main)
-4. Removes the `.symphony.lock` file
-5. Removes the `.symphony_slot` marker from the workspace
-
-### Troubleshooting
-
-**"No symphony slots available"** — All 4 slots for that repo are locked. Check for stale locks:
-
-```bash
-ls ~/Documents/Gearflow/procurement-*/.symphony.lock
-cat ~/Documents/Gearflow/procurement-5/.symphony.lock
-# Remove stale locks manually if needed
-rm ~/Documents/Gearflow/procurement-5/.symphony.lock
-```
-
-**"Postgres not running on port X"** — Start PostgreSQL from any slot of that repo type:
-
-```bash
-cd ~/Documents/Gearflow/procurement-1
-direnv exec . devenv up -d postgres
-```
-
-**Backend not starting** — Check that `.envrc` exists in the slot directory. Without it,
-`direnv exec .` is a no-op and the backend starts with wrong config.
-
-**Services on wrong port** — The `.env` file in the slot directory controls port assignments.
-Verify it matches the expected ports for that slot number.
+Symphony never resets a slot tree and never deletes a lease file. A lease that nobody
+released is the harness's job: `local-dev/bin/slot-status --stale` lists it and
+`lease claim --reclaim` takes it (GEA-10251).
 
 ## Project Layout
 
 - `lib/`: application code and Mix tasks
-- `priv/scripts/`: shell scripts bundled into the release (slot-claim, slot-release, devenv-start, linear-upload-image)
+- `priv/scripts/`: shell scripts bundled into the release (linear-upload-image, linear-embed-images, change-census)
 - `test/`: ExUnit coverage for runtime behavior
 - `WORKFLOW.md`: in-repo workflow contract used by local runs
 - `workflow/stages/`: stage-specific prompt templates (e.g., human-review)

@@ -117,6 +117,7 @@ defmodule SymphonyElixir.TestSupport do
           agent_backend: nil,
           claude_command: nil,
           claude_stall_timeout_ms: nil,
+          claude_tmux_session_prefix: nil,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -161,6 +162,7 @@ defmodule SymphonyElixir.TestSupport do
     agent_backend = Keyword.get(config, :agent_backend)
     claude_command = Keyword.get(config, :claude_command)
     claude_stall_timeout_ms = Keyword.get(config, :claude_stall_timeout_ms)
+    claude_tmux_session_prefix = Keyword.get(config, :claude_tmux_session_prefix)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -211,6 +213,7 @@ defmodule SymphonyElixir.TestSupport do
         "claude:",
         "  command: #{yaml_value(claude_command)}",
         "  stall_timeout_ms: #{yaml_value(claude_stall_timeout_ms)}",
+        claude_tmux_session_prefix && "  tmux_session_prefix: #{yaml_value(claude_tmux_session_prefix)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

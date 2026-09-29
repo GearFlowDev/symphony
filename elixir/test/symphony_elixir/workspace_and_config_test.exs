@@ -900,68 +900,143 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  describe "reap_stale_pool_locks/1 registry-lease reaper" do
+  describe "slot handling is the harness's (GEA-10251)" do
     setup do
-      root = Path.join(System.tmp_dir!(), "symphony-reaper-#{System.unique_integer([:positive])}")
+      root = Path.join(System.tmp_dir!(), "symphony-slots-#{System.unique_integer([:positive])}")
       registry = Path.join([root, "local-dev", "registry"])
+      workspace_root = Path.join(root, "workspaces")
       File.mkdir_p!(registry)
+      File.mkdir_p!(workspace_root)
 
       prev = %{
         gearflow_workspace: System.get_env("GEARFLOW_WORKSPACE"),
-        scripts: System.get_env("SYMPHONY_SCRIPTS"),
-        platform_slots: System.get_env("SYMPHONY_PLATFORM_SLOTS"),
-        procurement_slots: System.get_env("SYMPHONY_PROCUREMENT_SLOTS")
+        scripts: System.get_env("SYMPHONY_SCRIPTS")
       }
 
       System.put_env("GEARFLOW_WORKSPACE", root)
       System.delete_env("SYMPHONY_SCRIPTS")
-      System.put_env("SYMPHONY_PLATFORM_SLOTS", "4 5 6")
-      System.put_env("SYMPHONY_PROCUREMENT_SLOTS", "4 5 6")
 
       on_exit(fn ->
         restore_env("GEARFLOW_WORKSPACE", prev.gearflow_workspace)
         restore_env("SYMPHONY_SCRIPTS", prev.scripts)
-        restore_env("SYMPHONY_PLATFORM_SLOTS", prev.platform_slots)
-        restore_env("SYMPHONY_PROCUREMENT_SLOTS", prev.procurement_slots)
         File.rm_rf(root)
       end)
 
-      {:ok, root: root, registry: registry}
+      {:ok, root: root, registry: registry, workspace_root: workspace_root}
     end
 
-    test "reaps only orphaned symphony-owned leases on eligible slots", %{registry: registry} do
-      old = "2025-01-01T00:00:00Z"
-      recent = DateTime.utc_now() |> DateTime.add(-10, :second) |> DateTime.to_iso8601()
+    test "removing a workspace with a slot marker runs before_remove once", %{root: root, workspace_root: workspace_root} do
+      calls = Path.join(root, "before_remove.calls")
 
-      put_lease(registry, "gf_platform-slot4", owner: "symphony", linear_issue: "GEA-ORPHAN", claimed: old)
-      put_lease(registry, "gf_platform-slot5", owner: "symphony", linear_issue: "GEA-ACTIVE", claimed: old)
-      put_lease(registry, "gf_platform-slot6", owner: "sess-human", linear_issue: "GEA-HUMAN", claimed: old)
-      put_lease(registry, "gf_procurement-slot4", owner: "symphony", linear_issue: "GEA-RECENT", claimed: recent)
-      put_lease(registry, "gf_procurement-slot1", owner: "symphony", linear_issue: "GEA-INELIGIBLE", claimed: old)
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_remove: "echo call >> \"#{calls}\""
+      )
 
-      {reaped, _log} = with_log(fn -> Workspace.reap_stale_pool_locks(["GEA-ACTIVE"]) end)
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-ONCE")
+      File.write!(Path.join(workspace, ".symphony_slot"), "SLOT_NAME=symphony-slot1\n")
 
-      assert reaped == ["gf_platform-slot4"]
+      assert :ok = Workspace.remove_issue_workspaces("MT-ONCE")
+      assert File.read!(calls) == "call\n"
+      refute File.exists?(workspace)
 
-      refute lease_exists?(registry, "gf_platform-slot4")
-      assert lease_exists?(registry, "gf_platform-slot5"), "active issue's lease must survive"
-      assert lease_exists?(registry, "gf_platform-slot6"), "non-symphony (human) lease must never be touched"
-      assert lease_exists?(registry, "gf_procurement-slot4"), "within-grace lease must survive"
-      assert lease_exists?(registry, "gf_procurement-slot1"), "ineligible slot must survive"
+      assert {:ok, recorded} = Workspace.create_for_issue("MT-ONCE-RECORDED")
+      File.write!(Path.join(recorded, ".symphony_slot"), "SLOT_NAME=symphony-slot1\n")
+      File.rm!(calls)
+
+      assert {:ok, _removed} = Workspace.remove_recorded(recorded)
+      assert File.read!(calls) == "call\n"
     end
 
-    test "keeps the lease when the slot reset fails", %{root: root, registry: registry} do
-      old = "2025-01-01T00:00:00Z"
+    test "releasing a pool slot runs only before_remove, and nothing without a marker", %{
+      root: root,
+      registry: registry,
+      workspace_root: workspace_root
+    } do
+      calls = Path.join(root, "before_remove.calls")
 
-      # A non-git directory makes the reset commands fail, so the lease must NOT
-      # be freed — otherwise a dirty slot would become reclaimable.
-      File.mkdir_p!(Path.join([root, "local-dev", "gf_platform-slot4"]))
-      put_lease(registry, "gf_platform-slot4", owner: "symphony", linear_issue: "GEA-ORPHAN", claimed: old)
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_remove: "echo call >> \"#{calls}\""
+      )
 
-      with_log(fn -> Workspace.reap_stale_pool_locks([]) end)
+      put_lease(registry, "gf_procurement-slot4", owner: "symphony", linear_issue: "MT-NOMARK", workspace: Path.join(workspace_root, "MT-NOMARK"))
+      assert {:ok, _workspace} = Workspace.create_for_issue("MT-NOMARK")
 
-      assert lease_exists?(registry, "gf_platform-slot4"),
-             "lease must remain when the slot could not be reset to a clean state"
+      assert :ok = Workspace.release_pool_slot_for_issue("MT-NOMARK")
+      refute File.exists?(calls), "no marker means no slot to release"
+      assert lease_exists?(registry, "gf_procurement-slot4"), "the fork never deletes a lease file"
+
+      File.write!(Path.join([workspace_root, "MT-NOMARK", ".symphony_slot"]), "SLOT_NAME=gf_procurement-slot4\n")
+      assert :ok = Workspace.release_pool_slot_for_issue("MT-NOMARK")
+      assert File.read!(calls) == "call\n"
+      assert lease_exists?(registry, "gf_procurement-slot4"), "releasing is the hook's job, not the fork's"
+    end
+
+    test "slot_lease_for_issue finds a lease on any repo's slot", %{root: root, registry: registry} do
+      put_lease(registry, "gf_engineering-slot2", linear_issue: "GEA-OTHER", branch: "other", conversation_id: "symphony-GEA-OTHER")
+      put_lease(registry, "symphony-slot3", linear_issue: "GEA-SELF", branch: "gea-self", conversation_id: "symphony-GEA-SELF")
+
+      assert Workspace.slot_lease_for_issue("GEA-SELF") ==
+               {Path.join([root, "local-dev", "symphony-slot3"]), "gea-self"}
+
+      assert Workspace.slot_lease_for_issue("GEA-NONE") == nil
+    end
+
+    test "slot_lease_for_issue takes only Symphony's own lease", %{root: root, registry: registry} do
+      put_lease(registry, "gf_platform-slot1", linear_issue: "GEA-BOTH", branch: "a-person", conversation_id: "sess-person")
+      put_lease(registry, "symphony-slot4", linear_issue: "GEA-BOTH", branch: "gea-both", conversation_id: "symphony-GEA-BOTH")
+
+      assert Workspace.slot_lease_for_issue("GEA-BOTH") ==
+               {Path.join([root, "local-dev", "symphony-slot4"]), "gea-both"}
+
+      # A person's lease, or one another run claimed, is never a checkout Symphony pushes from.
+      put_lease(registry, "gf_platform-slot3", linear_issue: "GEA-PERSON", branch: "mine", conversation_id: "sess-person")
+      put_lease(registry, "gf_procurement-slot2", linear_issue: "GEA-PERSON", branch: "theirs", conversation_id: "symphony-GEA-OTHER")
+
+      assert Workspace.slot_lease_for_issue("GEA-PERSON") == nil
+    end
+
+    test "slot_lease_for_issue skips a lease file that is not a JSON object", %{root: root, registry: registry} do
+      File.write!(Path.join(registry, "gf_platform-slot1.json"), ~s(["GEA-ODD"]))
+      File.write!(Path.join(registry, "gf_platform-slot2.json"), "not json")
+      put_lease(registry, "gf_platform-slot3", linear_issue: "GEA-ODD", branch: "gea-odd", conversation_id: "symphony-GEA-ODD")
+
+      assert Workspace.slot_lease_for_issue("GEA-ODD") ==
+               {Path.join([root, "local-dev", "gf_platform-slot3"]), "gea-odd"}
+    end
+
+    test "before_run gets the raw repo name from a GearFlowDev PR, else from the Work Area label", %{
+      root: root,
+      workspace_root: workspace_root
+    } do
+      out = Path.join(root, "repo.out")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_run: "printf '%s\\n' \"$SYMPHONY_REPO\" >> \"#{out}\""
+      )
+
+      issue = fn labels, pr_url ->
+        %{id: "id", identifier: "MT-REPO", labels: labels, branch_name: "mt-repo", pr_url: pr_url}
+      end
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-REPO")
+
+      for {labels, pr_url} <- [
+            {["Harness"], "https://github.com/GearFlowDev/symphony/pull/19"},
+            {["3.0-Parts"], "https://github.com/GearFlowDev/gf_harness_surfaces/pull/366"},
+            {["2.0-PartsHub"], nil},
+            {["3.0"], "https://github.com/someone-else/gf_platform/pull/1"},
+            {["Harness"], nil},
+            {["3.0"], "https://notgithub.com/GearFlowDev/gf_platform/pull/19"},
+            {["3.0"], "https://github.com/GearFlowDev/../pull/19"}
+          ] do
+        assert :ok = Workspace.run_before_run_hook(workspace, issue.(labels, pr_url))
+      end
+
+      assert File.read!(out) ==
+               Enum.join(["symphony", "gf_harness_surfaces", "gf_platform", "gf_procurement", "", "gf_procurement", "gf_procurement"], "\n") <> "\n"
     end
   end
 

@@ -110,6 +110,33 @@ defmodule SymphonyElixir.Claude.AgentRunnerTest do
     assert_received :stopped
   end
 
+  # The fake workspace is not a git tree, so every turn reads as no progress:
+  # turns 1-3 are free, and turns 4, 5 and 6 fill the watchdog.
+  test "a worker run with no file changes stops after turn 6" do
+    opts =
+      base_opts(
+        max_turns: 10,
+        issue_state_fetcher: fn _ids -> {:ok, [issue("In Progress")]} end
+      )
+
+    assert :ok = AgentRunner.run(issue("In Progress"), nil, opts)
+    assert sent_turns() == [1, 2, 3, 4, 5, 6]
+  end
+
+  # GEA-10667: the tester is read-only, so no file changes is its normal state.
+  # Stopped at turn 6, it never wrote its SYMPHONY_VERDICT line.
+  test "a Test run is not stopped for making no file changes" do
+    opts =
+      base_opts(
+        max_turns: 10,
+        retask_phases: ["Test"],
+        issue_state_fetcher: fn _ids -> {:ok, [issue("In Progress")]} end
+      )
+
+    assert :ok = AgentRunner.run(issue("In Progress"), nil, opts)
+    assert sent_turns() == Enum.to_list(1..10)
+  end
+
   test "stops once the issue reaches a terminal state" do
     opts =
       base_opts(

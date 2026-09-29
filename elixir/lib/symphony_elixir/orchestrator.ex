@@ -709,16 +709,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
-  @spec plan_cycle_fingerprint_for_test(term(), String.t(), String.t() | nil) :: String.t()
-  def plan_cycle_fingerprint_for_test(plan, identifier, pr_url) do
-    plan_cycle_fingerprint(plan, identifier, pr_url)
+  @spec plan_cycle_fingerprint_for_test(term(), String.t(), String.t() | nil, String.t() | nil) :: String.t()
+  def plan_cycle_fingerprint_for_test(plan, identifier, pr_url, phase \\ nil) do
+    plan_cycle_fingerprint(plan, identifier, pr_url, phase)
   end
 
   @doc false
-  @spec no_progress_message_for_test(pos_integer(), pos_integer(), String.t(), String.t()) :: String.t()
-  def no_progress_message_for_test(repeats, limit, fingerprint, identifier) do
-    no_progress_message(repeats, limit, fingerprint, identifier)
+  @spec no_progress_message_for_test(pos_integer(), pos_integer(), String.t(), String.t(), String.t() | nil) ::
+          String.t()
+  def no_progress_message_for_test(repeats, limit, fingerprint, identifier, phase \\ nil) do
+    no_progress_message(repeats, limit, fingerprint, identifier, phase)
   end
+
+  @doc false
+  @spec no_progress_check_for_test(map(), {:dispatch, map()}) :: {:dispatch, map()} | {:blocked, term()}
+  def no_progress_check_for_test(issue, result), do: no_progress_check(issue, result)
 
   @doc false
   @spec handle_active_retry_for_test(Issue.t(), term(), pos_integer(), map()) :: term()
@@ -1761,8 +1766,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_plan_cycle(plan, meta, finished, identifier, limit, dispatch_metadata, result) do
+    phase = dispatch_phase(dispatch_metadata)
+
     fingerprint =
-      plan_cycle_fingerprint(plan, identifier, dispatch_metadata[:existing_pr_url])
+      plan_cycle_fingerprint(plan, identifier, dispatch_metadata[:existing_pr_url], phase)
 
     history = Enum.take([fingerprint | meta["cycle_history"] || []], 4 * limit)
     repeats = Enum.count(history, &(&1 == fingerprint))
@@ -1780,7 +1787,7 @@ defmodule SymphonyElixir.Orchestrator do
       })
 
     if tripped? do
-      {:blocked, {:no_progress, no_progress_message(repeats, limit, fingerprint, identifier)}}
+      {:blocked, {:no_progress, no_progress_message(repeats, limit, fingerprint, identifier, phase)}}
     else
       result
     end
@@ -1790,10 +1797,15 @@ defmodule SymphonyElixir.Orchestrator do
   # and tester" on every trip, including the pre-PR ones where no tester had
   # ever been dispatched — the person reading it went looking for a tester
   # disagreement that did not exist (first Fly run, GEA-9889, 2026-09-22).
-  defp no_progress_message(repeats, limit, fingerprint, identifier) do
+  #
+  # A repeated TEST dispatch is its own case: the tester ran and recorded no
+  # verdict, so the fault is the tester's run, not the plan or the grader. It is
+  # checked first: a stale verdict from an older head must not hide it.
+  defp no_progress_message(repeats, limit, fingerprint, identifier, phase) do
     gates =
-      case History.latest_tester_verdict(identifier) do
-        %{verdict: _verdict} -> "plan, grader and tester are not converging"
+      case {History.latest_tester_verdict(identifier), phase} do
+        {_, "Test"} -> "the tester was dispatched and recorded no new verdict (no SYMPHONY_VERDICT line)"
+        {%{verdict: _verdict}, _} -> "plan, grader and tester are not converging"
         _ -> "the plan and the grader are not converging; the tester has not run yet"
       end
 
@@ -1803,7 +1815,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   # Human-readable on purpose: it's stored in plan metadata and quoted in the
   # needs_human message, where a hash would say nothing.
-  defp plan_cycle_fingerprint(plan, identifier, pr_url) do
+  #
+  # THE PHASE ABOUT TO BE DISPATCHED IS PART OF THE STATE (GEA-10667). Resolve
+  # Review and the first Test at a head see the same rows, the same `untested`
+  # and the same head. Without the phase, two review passes that pushed nothing
+  # made the Tester's first dispatch the third repeat, and the breaker parked
+  # the issue on the one dispatch that was the next step (GEA-10457,
+  # GEA-10646). The phase keeps a repeated Test counted against itself.
+  defp plan_cycle_fingerprint(plan, identifier, pr_url, phase) do
     rows =
       plan
       |> SymphonyElixir.Planning.Plan.rows()
@@ -1817,7 +1836,14 @@ defmodule SymphonyElixir.Orchestrator do
         nil -> "untested"
       end
 
-    rows <> " | " <> verdict <> " | " <> progress_marker(identifier, pr_url)
+    rows <> " | " <> verdict <> " | " <> progress_marker(identifier, pr_url) <> " | next=" <> (phase || "?")
+  end
+
+  defp dispatch_phase(dispatch_metadata) do
+    case dispatch_metadata[:retask_phases] do
+      [phase | _] when is_binary(phase) -> phase
+      _ -> nil
+    end
   end
 
   # BEFORE a PR exists the verdict and the PR head are both constants

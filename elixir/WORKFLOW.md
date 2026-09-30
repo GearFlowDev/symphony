@@ -178,7 +178,7 @@ The branch `{{ issue.branch_name }}` is already checked out in your working dire
    - Take a screenshot of at least the Equipment page as baseline evidence
    - If the change is user-facing: navigate to affected pages, exercise the flow, take screenshots at key steps
    - If role restrictions are involved, test with the appropriate role accounts (requester, manager, etc.)
-   - Save each screenshot to a file in this scratch workspace directory
+   - Save each screenshot under `/tmp` (for example `/tmp/equipment.png`): `bin/linear` reads a relative `--image` path from the directory it runs in
 
 ### Phase 5: Share Evidence
 
@@ -188,7 +188,7 @@ embeds it at the end of the comment, so you never write an image URL by hand:
 
 ```bash
 {{ tools.linear }} comment {{ issue.identifier }} --body-file /tmp/results-{{ issue.identifier }}.md \
-  --image equipment.png --alt "Equipment page"
+  --image /tmp/equipment.png --alt "Equipment page"   # absolute path, one --image per screenshot
 ```
 
 ### Phase 6: Ship

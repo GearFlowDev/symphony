@@ -735,6 +735,29 @@ defmodule SymphonyElixir.Orchestrator do
     sort_issues_for_dispatch(issues)
   end
 
+  @doc false
+  @spec pin_pr_for_test(Issue.t(), String.t() | nil, String.t() | nil) :: Issue.t()
+  def pin_pr_for_test(%Issue{} = issue, pr_url, pr_branch), do: pin_pr(issue, pr_url, pr_branch)
+
+  # THE PR'S BRANCH, NOT THE TITLE'S (GEA-10800). Linear derives `branchName`
+  # from the issue's CURRENT title, so a retitle mid-run names a branch that
+  # does not exist. The before_run hook then refuses the issue's leased slot
+  # ("sits on '<old>', not '<new>'"), provisions an empty one, and the grader
+  # diffs nothing and grades every row missing. Once the issue has a PR, its
+  # `headRefName` is the branch: the slot hook, the prompts, the ship gate and
+  # the evaluator all read `issue.branch_name`, so pinning it here covers every
+  # stage. Linear's name only names the branch before the first push.
+  #
+  # The running-issue refresh replaces the dispatched issue with a fresh Linear
+  # copy, so it re-pins with the values the dispatch resolved.
+  defp pin_pr(%Issue{} = issue, pr_url, pr_branch) do
+    issue = %{issue | pr_url: pr_url || issue.pr_url}
+
+    if is_binary(pr_branch) and pr_branch != "",
+      do: %{issue | branch_name: pr_branch},
+      else: issue
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -783,7 +806,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
-      %{issue: _} = running_entry ->
+      %{issue: running_issue} = running_entry ->
+        issue = pin_pr(issue, Map.get(running_issue, :pr_url), Map.get(running_issue, :branch_name))
         %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
 
       _ ->
@@ -1249,8 +1273,9 @@ defmodule SymphonyElixir.Orchestrator do
       end
 
     # Carry the resolved PR on the issue so slot routing (workspace hooks)
-    # leases the PR's repo, not the repo the product label guesses.
-    refreshed_issue = %{refreshed_issue | pr_url: pr_url}
+    # leases the PR's repo, not the repo the product label guesses, and every
+    # stage reads the PR's branch, not the one Linear derives from the title.
+    refreshed_issue = pin_pr(refreshed_issue, pr_url, pr_branch)
 
     pr_metadata = %{existing_pr_url: pr_url, existing_pr_branch: pr_branch}
     do_dispatch_issue(state, refreshed_issue, attempt, Map.merge(metadata, pr_metadata))

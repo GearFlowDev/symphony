@@ -410,6 +410,47 @@ defmodule SymphonyElixir.CoreTest do
     assert updated_entry.issue.state == "In Progress"
   end
 
+  test "reconcile keeps the dispatched PR branch when a retitle changes Linear's branchName (GEA-10800)" do
+    issue_id = "issue-retitled"
+    pr = "https://github.com/GearFlowDev/gf_procurement/pull/4108"
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: self(),
+          ref: nil,
+          identifier: "MT-560",
+          issue: %Issue{
+            id: issue_id,
+            identifier: "MT-560",
+            state: "In Progress",
+            branch_name: "mt-560-the-old-title",
+            pr_url: pr
+          },
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    fresh = %Issue{
+      id: issue_id,
+      identifier: "MT-560",
+      state: "In Progress",
+      title: "The new title",
+      branch_name: "mt-560-the-new-title",
+      labels: []
+    }
+
+    updated_entry = Orchestrator.reconcile_issue_states_for_test([fresh], state).running[issue_id]
+
+    assert updated_entry.issue.title == "The new title"
+    assert updated_entry.issue.branch_name == "mt-560-the-old-title"
+    assert updated_entry.issue.pr_url == pr
+  end
+
   test "reconcile stops running issue when it is reassigned away from this worker" do
     issue_id = "issue-reassigned"
 

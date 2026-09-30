@@ -1038,6 +1038,41 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert File.read!(out) ==
                Enum.join(["symphony", "gf_harness_surfaces", "gf_platform", "gf_procurement", "", "gf_procurement", "gf_procurement"], "\n") <> "\n"
     end
+
+    # GEA-10800: a person retitled GEA-10762 mid-run; Linear's branchName moved to a branch
+    # that did not exist, the hook refused the leased slot, and the grader diffed nothing.
+    test "before_run gets the open PR's branch once the issue has a PR, whatever the title says", %{
+      root: root,
+      workspace_root: workspace_root
+    } do
+      out = Path.join(root, "branch.out")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_run: "printf '%s\\n' \"$SYMPHONY_BRANCH_NAME\" >> \"#{out}\""
+      )
+
+      retitled = %Issue{
+        id: "id",
+        identifier: "MT-RETITLE",
+        labels: ["3.0"],
+        branch_name: "mt-retitle-the-new-title"
+      }
+
+      pr = "https://github.com/GearFlowDev/gf_procurement/pull/4108"
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-RETITLE")
+
+      assert :ok =
+               Workspace.run_before_run_hook(
+                 workspace,
+                 Orchestrator.pin_pr_for_test(retitled, pr, "mt-retitle-the-old-title")
+               )
+
+      assert :ok = Workspace.run_before_run_hook(workspace, Orchestrator.pin_pr_for_test(retitled, nil, nil))
+
+      assert File.read!(out) == "mt-retitle-the-old-title\nmt-retitle-the-new-title\n"
+    end
   end
 
   defp put_lease(registry, slot_name, fields) do

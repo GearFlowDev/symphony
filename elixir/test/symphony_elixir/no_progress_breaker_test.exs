@@ -160,6 +160,30 @@ defmodule SymphonyElixir.NoProgressBreakerTest do
       finish_a_run("SYM-CRASH-COUNT")
       assert History.finished_run_count("SYM-CRASH-COUNT") == 2
     end
+
+    # The Claude runner counts only completed turns, so a run that failed during
+    # its first turn has zero turns. Its session proves the agent ran.
+    test "a run that failed during its first turn still counts" do
+      {:ok, run} =
+        History.record_dispatch(%{
+          issue_id: "issue-uuid-SYM-TURN1",
+          issue_identifier: "SYM-TURN1",
+          issue_title: "Fix the thing",
+          started_at: DateTime.utc_now(),
+          agent_backend: "claude",
+          filter_source: "filter"
+        })
+
+      {:ok, _} =
+        History.record_completion(run, %{
+          finished_at: DateTime.utc_now(),
+          outcome: "failed",
+          session_id: "claude-session-1",
+          turns_used: 0
+        })
+
+      assert History.finished_run_count("SYM-TURN1") == 1
+    end
   end
 
   # GEA-10753: GEA-10458's tester approved on the day's twelfth run, and the

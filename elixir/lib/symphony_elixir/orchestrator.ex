@@ -1683,6 +1683,12 @@ defmodule SymphonyElixir.Orchestrator do
   # tester APPROVE on the twelfth run of the day parked a green, clean PR in
   # Shaping with no hand-off, and a person had to hand it off (GEA-10458,
   # 2026-09-29 21:38Z; GEA-10753).
+  #
+  # The cost of this order: with the budget spent, one poll still runs the
+  # decision's side effects before the block (reopened rows, an Implement
+  # Dispatch row that never runs, a push, a CodeRabbit ping). The breaker has
+  # always run after the decision, and the next dispatch re-decides from the
+  # plan; the unused Dispatch row is never graded.
   defp plan_action(issue, metadata) do
     guard_decision(issue, plan_action_decision(issue, metadata))
   end

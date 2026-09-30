@@ -2326,14 +2326,31 @@ defmodule SymphonyElixir.Orchestrator do
   defp run_ci_recovery(issue, plan, pr_url, pr, head, {action, run_ids, reason}) do
     case CiRecovery.act(pr, action, run_ids, &gh_cmd/1) do
       :ok ->
-        # Record before anything else, so the next poll sees the recovery in flight.
-        record_ci_recovery(plan, CiRecovery.record(head, action, run_ids))
+        settle_ci_recovery(issue, plan, pr_url, head, {action, run_ids, reason})
+
+      # Some runs re-run and gh refused a later one. The started runs are in flight, so
+      # they are recorded and waited on; Fix CI now would race them.
+      {:partial, out, started} ->
+        settle_ci_recovery(issue, plan, pr_url, head, {action, started, "#{reason}; gh refused the rest (#{out})"})
+
+      {:error, out} ->
+        {:ci, "CI is red and the #{action} Symphony tried failed (#{out}): #{reason}"}
+    end
+  end
+
+  # THE RECORD IS THE BOUND. The once-per-head rule and the plan's recovery budget both
+  # read it, so a recovery that cannot be recorded would repeat on every poll. When the
+  # write fails, Fix CI runs instead of a wait.
+  defp settle_ci_recovery(issue, plan, pr_url, head, {action, run_ids, reason}) do
+    case record_ci_recovery(plan, CiRecovery.record(head, action, run_ids)) do
+      :ok ->
         Logger.info("Recovered red CI on #{issue_context(issue)} by #{action}: #{reason}")
         post_ci_recovery_note(issue, CiRecovery.note(pr_url, action, reason, head))
         {:ci_wait, "#{action} under way: #{reason}"}
 
-      {:error, out} ->
-        {:ci, "CI is red and the #{action} Symphony tried failed (#{out}): #{reason}"}
+      {:error, err} ->
+        Logger.warning("CI recovery record failed for #{issue_context(issue)}: #{inspect(err)}")
+        {:ci, "CI is red; Symphony ran a #{action} but could not record it (#{inspect(err)}): #{reason}"}
     end
   end
 
@@ -2341,10 +2358,14 @@ defmodule SymphonyElixir.Orchestrator do
     case SymphonyElixir.Repo.get(SymphonyElixir.Planning.Plan, plan.id) do
       %SymphonyElixir.Planning.Plan{} = fresh ->
         meta = fresh.metadata || %{}
-        Planning.update_plan(fresh, %{metadata: Map.put(meta, "ci_recoveries", (meta["ci_recoveries"] || []) ++ [entry])})
+
+        case Planning.update_plan(fresh, %{metadata: Map.put(meta, "ci_recoveries", (meta["ci_recoveries"] || []) ++ [entry])}) do
+          {:ok, _} -> :ok
+          {:error, err} -> {:error, err}
+        end
 
       _ ->
-        :ok
+        {:error, :plan_not_found}
     end
   end
 

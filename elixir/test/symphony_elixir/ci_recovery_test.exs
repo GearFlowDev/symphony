@@ -94,6 +94,12 @@ defmodule SymphonyElixir.CiRecoveryTest do
       assert_received {:gh, {:rerun, "101"}}
     end
 
+    test "a re-run that starts one run and is refused on the next reports the started run" do
+      w = %{{:rerun, "100"} => {"", 0}, {:rerun, "101"} => {"run 101 cannot be rerun\n", 1}}
+
+      assert CiRecovery.act(@pr, :rerun, ["100", "101"], gh(w)) == {:partial, "run 101 cannot be rerun", ["100"]}
+    end
+
     test "a re-run gh refuses is an error with gh's words, so the gate falls back to Fix CI" do
       assert CiRecovery.act(@pr, :rerun, ["100"], gh(%{{:rerun, "100"} => {"run 100 cannot be rerun\n", 1}})) ==
                {:error, "run 100 cannot be rerun"}
@@ -255,6 +261,9 @@ defmodule SymphonyElixir.CiRecoveryTest do
 
     assert src =~ "CiRecovery.decide(pr, head, failing, recoveries, &gh_cmd/1)"
     assert src =~ "{:ci_wait, reason} ->\n"
+    # A recovery that cannot be recorded would repeat on every poll (CodeRabbit on #24).
+    assert src =~ ~r/\{:error, err\} ->\n.*?\n\s+\{:ci, "CI is red; Symphony ran a/s
+    assert src =~ "{:partial, out, started} ->"
     assert src =~ ~r/\{:wait, reason\} ->\n\s+# Something outside the worker is moving.*?complete_issue\(state, issue.id\)/s
   end
 end

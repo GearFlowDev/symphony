@@ -110,8 +110,13 @@ defmodule SymphonyElixir.CiRecovery do
     end
   end
 
-  @doc "Run a recovery `decide/5` chose. Returns `:ok` or `{:error, gh_output}`."
-  @spec act({String.t(), String.t()}, :merge_main | :rerun, [String.t()], gh_fun()) :: :ok | {:error, String.t()}
+  @doc """
+  Run a recovery `decide/5` chose. Returns `:ok`, `{:error, gh_output}`, or
+  `{:partial, gh_output, started_run_ids}` when a re-run started some runs and gh
+  refused a later one: the started runs are in flight and must be waited on.
+  """
+  @spec act({String.t(), String.t()}, :merge_main | :rerun, [String.t()], gh_fun()) ::
+          :ok | {:error, String.t()} | {:partial, String.t(), [String.t()]}
   def act({repo, number}, :merge_main, _run_ids, gh_fun) do
     # `update-branch` merges by default; a rebase would rewrite what a reviewer saw.
     case gh_fun.(["pr", "update-branch", number, "--repo", repo]) do
@@ -121,13 +126,19 @@ defmodule SymphonyElixir.CiRecovery do
   end
 
   def act({repo, _number}, :rerun, run_ids, gh_fun) do
-    Enum.reduce_while(run_ids, :ok, fn run_id, :ok ->
+    run_ids
+    |> Enum.reduce_while([], fn run_id, started ->
       case gh_fun.(["run", "rerun", run_id, "--failed", "--repo", repo]) do
-        {_out, 0} -> {:cont, :ok}
-        {out, _} -> {:halt, {:error, String.trim(out)}}
+        {_out, 0} -> {:cont, [run_id | started]}
+        {out, _} -> {:halt, {String.trim(out), Enum.reverse(started)}}
       end
     end)
+    |> rerun_result()
   end
+
+  defp rerun_result(started) when is_list(started), do: :ok
+  defp rerun_result({out, []}), do: {:error, out}
+  defp rerun_result({out, started}), do: {:partial, out, started}
 
   @doc "The record a recovery leaves in plan metadata."
   @spec record(String.t(), :merge_main | :rerun, [String.t()], DateTime.t()) :: recovery()

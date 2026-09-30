@@ -35,6 +35,40 @@ defmodule SymphonyElixir.CiSettled do
   def pending_states, do: @pending_states
 
   @doc """
+  Read the PR's head and its checks as ONE snapshot, then `check/5` them. The head is read
+  before and after the checks: a push between the two reads would pair the old head's
+  finished rows with the new head, and hand off before the new head's CI has started
+  (CodeRabbit on #26). A head that moved is a wait.
+  """
+  @spec snapshot({String.t(), String.t()}, gh_fun(), DateTime.t()) :: :settled | {:pending, String.t()}
+  def snapshot({repo, number} = pr, gh_fun, now \\ DateTime.utc_now()) do
+    before = head_sha(pr, gh_fun)
+    {output, _status} = gh_fun.(["pr", "checks", number, "--repo", repo, "--json", "name,state,link"])
+    after_read = head_sha(pr, gh_fun)
+
+    if before == after_read do
+      check(pr, before, decode_checks(output), gh_fun, now)
+    else
+      {:pending, "the head moved from #{short(before)} to #{short(after_read)} while its checks were read"}
+    end
+  end
+
+  # `gh pr checks` prints a sentence, not JSON, when the head has no check at all.
+  defp decode_checks(output) do
+    case Jason.decode(output) do
+      {:ok, checks} when is_list(checks) -> checks
+      _ -> []
+    end
+  end
+
+  defp head_sha({repo, number}, gh_fun) do
+    case gh_fun.(["pr", "view", number, "--repo", repo, "--json", "headRefOid", "-q", ".headRefOid"]) do
+      {out, 0} -> String.trim(out)
+      _ -> "?"
+    end
+  end
+
+  @doc """
   `checks` is the decoded output of `gh pr checks --json name,state,link`, and `head` is
   the PR's full head sha.
   """

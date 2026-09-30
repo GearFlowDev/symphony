@@ -2426,17 +2426,8 @@ defmodule SymphonyElixir.Orchestrator do
   # Has every check on the PR's head finished? CiSettled decides (GEA-10755).
   defp ci_settled(pr_url) do
     case pr_ref(pr_url) do
-      {repo, number} = pr ->
-        {output, _status} = gh_cmd(["pr", "checks", number, "--repo", repo, "--json", "name,state,link"])
-
-        case Jason.decode(output) do
-          {:ok, checks} when is_list(checks) -> CiSettled.check(pr, full_head_sha(pr), checks, &gh_cmd/1)
-          # `gh pr checks` prints a sentence, not JSON, when the head has no check at all.
-          _ -> CiSettled.check(pr, full_head_sha(pr), [], &gh_cmd/1)
-        end
-
-      :error ->
-        :settled
+      {_repo, _number} = pr -> CiSettled.snapshot(pr, &gh_cmd/1)
+      :error -> :settled
     end
   rescue
     _ -> :settled

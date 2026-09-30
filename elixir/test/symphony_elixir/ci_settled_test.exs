@@ -78,7 +78,50 @@ defmodule SymphonyElixir.CiSettledTest do
     src = File.read!(Path.expand("../../lib/symphony_elixir/orchestrator.ex", __DIR__))
 
     assert src =~ ~r/:approved ->\n\s+case ci_settled\(pr_url\) do\n\s+:settled -> :done\n\s+\{:pending, reason\} -> \{:wait, /
-    assert src =~ "CiSettled.check(pr, full_head_sha(pr), checks, &gh_cmd/1)"
+    assert src =~ "CiSettled.snapshot(pr, &gh_cmd/1)"
+  end
+
+  describe "snapshot/3 reads the head and its checks together" do
+    # A world whose head answers from a list, one answer per read.
+    defp snapshot_gh(heads, checks_out, overrides \\ %{}) do
+      {:ok, agent} = Agent.start_link(fn -> heads end)
+      base = gh(overrides)
+
+      fn
+        ["pr", "view", "7", "--repo", "o/r", "--json", "headRefOid", "-q", ".headRefOid"] ->
+          {Agent.get_and_update(agent, fn [h | rest] -> {h, if(rest == [], do: [h], else: rest)} end) <> "\n", 0}
+
+        ["pr", "checks", "7", "--repo", "o/r", "--json", "name,state,link"] ->
+          checks_out
+
+        args ->
+          base.(args)
+      end
+    end
+
+    test "a head that holds still is checked on the rows read for it" do
+      rows = {Jason.encode!([row("tests", "SUCCESS")]), 0}
+      assert CiSettled.snapshot(@pr, snapshot_gh([@head], rows), @now) == :settled
+
+      running = {Jason.encode!([row("tests", "IN_PROGRESS")]), 8}
+      assert {:pending, _} = CiSettled.snapshot(@pr, snapshot_gh([@head], running), @now)
+    end
+
+    test "a push between the two head reads is a wait, however green the rows read" do
+      rows = {Jason.encode!([row("tests", "SUCCESS")]), 0}
+      new_head = "9a1f00000000000000000000000000000000beef"
+
+      assert {:pending, reason} = CiSettled.snapshot(@pr, snapshot_gh([@head, new_head], rows), @now)
+      assert reason =~ "the head moved from 0c6cc513c1a5 to 9a1f00000000"
+    end
+
+    test "the sentence gh prints for a head with no checks reads as no rows" do
+      none = {"no checks reported on the 'b' branch\n", 1}
+      young = %{runs: runs([]), committed: {"2026-09-30T14:58:00Z\n", 0}}
+
+      assert {:pending, reason} = CiSettled.snapshot(@pr, snapshot_gh([@head], none, young), @now)
+      assert reason =~ "no check has registered"
+    end
   end
 
   describe "last_code_change_at/1: a Fix CI push does not make the tester's verdict stale" do

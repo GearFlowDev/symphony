@@ -715,6 +715,11 @@ defmodule SymphonyElixir.Orchestrator do
   def no_progress_check_for_test(issue, result), do: no_progress_check(issue, result)
 
   @doc false
+  @spec guard_decision_for_test(map(), {:dispatch, map()} | :done | {:blocked, term()}) ::
+          {:dispatch, map()} | :done | {:blocked, term()}
+  def guard_decision_for_test(issue, decision), do: guard_decision(issue, decision)
+
+  @doc false
   @spec handle_active_retry_for_test(Issue.t(), term(), pos_integer(), map()) :: term()
   def handle_active_retry_for_test(%Issue{} = issue, %State{} = state, attempt, metadata) do
     {:noreply, new_state} = handle_active_retry(state, issue, attempt, metadata)
@@ -1672,18 +1677,30 @@ defmodule SymphonyElixir.Orchestrator do
   #   * No-progress breaker: if the same (row states + tester verdict)
   #     fingerprint keeps coming back across finished runs, the plan/grader/
   #     tester standoff will never converge — stop dispatching.
+  #
+  # Both guards bound DISPATCHES, so both judge only a {:dispatch, _} decision.
+  # A :done result always reaches hand_off. With the budget checked first, a
+  # tester APPROVE on the twelfth run of the day parked a green, clean PR in
+  # Shaping with no hand-off, and a person had to hand it off (GEA-10458,
+  # 2026-09-29 21:38Z; GEA-10753).
+  #
+  # The cost of this order: with the budget spent, one poll still runs the
+  # decision's side effects before the block (reopened rows, an Implement
+  # Dispatch row that never runs, a push, a CodeRabbit ping). The breaker has
+  # always run after the decision, and the next dispatch re-decides from the
+  # plan; the unused Dispatch row is never graded.
   defp plan_action(issue, metadata) do
-    case dispatch_budget_check(issue) do
-      :ok ->
-        case plan_action_decision(issue, metadata) do
-          {:dispatch, _} = result -> no_progress_check(issue, result)
-          other -> other
-        end
+    guard_decision(issue, plan_action_decision(issue, metadata))
+  end
 
-      {:blocked, _} = blocked ->
-        blocked
+  defp guard_decision(issue, {:dispatch, _} = result) do
+    case dispatch_budget_check(issue) do
+      :ok -> no_progress_check(issue, result)
+      {:blocked, _} = blocked -> blocked
     end
   end
+
+  defp guard_decision(_issue, decision), do: decision
 
   defp plan_action_decision(issue, metadata) do
     case PlanningWorkflow.assess(issue, pr_url: metadata[:existing_pr_url]) do

@@ -67,8 +67,8 @@ defmodule SymphonyElixir.ProofEvidenceTest do
           {Jason.encode!(pr()), 0}
 
         ["api", "repos/GearFlowDev/gf_procurement/pulls/4054/reviews" | _] ->
-          # One line per page; the last page has no CodeRabbit review.
-          {~s({"state":"COMMENTED","commit_id":"#{@head}"}\nnull\n), 0}
+          # One line per page that has a CodeRabbit review; a page without one prints nothing.
+          {~s({"state":"CHANGES_REQUESTED","commit_id":"8d9c8cd8aaaa"}\n{"state":"COMMENTED","commit_id":"#{@head}"}\n), 0}
 
         ["api", "graphql" | _] ->
           {"1\n", 0}
@@ -87,7 +87,7 @@ defmodule SymphonyElixir.ProofEvidenceTest do
       more = fn
         ["pr", "view" | _] -> {Jason.encode!(pr()), 0}
         ["api", "graphql" | _] -> {"unknown\n", 0}
-        ["api" | _] -> {"null\n", 0}
+        ["api" | _] -> {"", 0}
       end
 
       assert ProofEvidence.pr_state_section("https://github.com/GearFlowDev/gf_procurement/pull/4054", more) =~

@@ -194,13 +194,14 @@ defmodule SymphonyElixir.Planning.ProofEvidence do
     end
   end
 
-  # `--paginate` runs the jq once per page, so each page prints its own last
-  # CodeRabbit review (or null); the last non-null line is the latest.
+  # `--paginate` runs the jq once per page. A page with no CodeRabbit review
+  # prints nothing (`// empty`), so the last line is the latest review. A
+  # deleted user has a null login, which `// ""` keeps from failing the jq.
   defp latest_coderabbit_review(repo, number, gh_fun) do
-    jq = ~s<[.[] | select(.user.login | startswith("coderabbit"))] | last | {state, commit_id}>
+    jq = ~s<[.[] | select((.user.login // "") | startswith("coderabbit"))] | last // empty | {state, commit_id}>
 
     with {output, 0} <- gh_fun.(["api", "repos/#{repo}/pulls/#{number}/reviews", "--paginate", "--jq", jq]),
-         line when is_binary(line) <- output |> String.split("\n", trim: true) |> Enum.reject(&(String.trim(&1) == "null")) |> List.last(),
+         line when is_binary(line) <- output |> String.split("\n", trim: true) |> List.last(),
          {:ok, %{} = review} <- Jason.decode(line) do
       review
     else

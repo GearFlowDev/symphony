@@ -14,7 +14,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Linear.{Client, Issue}
   alias SymphonyElixir.Planning.ProofEvidence
   alias SymphonyElixir.Planning.Workflow, as: PlanningWorkflow
-  alias SymphonyElixir.{StatusDashboard, Suitability, Tracker, Workspace}
+  alias SymphonyElixir.{ReviewThreads, StatusDashboard, Suitability, Tracker, Workspace}
 
   @continuation_retry_delay_ms 30_000
   # Fixed poll interval while waiting for a shared pool slot to free.
@@ -2086,6 +2086,11 @@ defmodule SymphonyElixir.Orchestrator do
         # main is under way instead of a Fix CI worker (GEA-10757).
         {:wait, reason}
 
+      {:review_wait, reason} ->
+        # Every open thread carries a reply the reviewer has not answered. Another
+        # Resolve Review would find its reply already posted (GEA-10826).
+        {:wait, reason}
+
       {:request_changes, reason} ->
         # A reviewer (CodeRabbit or human) requested changes. Dispatch the
         # dedicated Resolve Review phase WITHOUT reopening the plan's rows:
@@ -2294,7 +2299,7 @@ defmodule SymphonyElixir.Orchestrator do
   # when CI is green and the PR carries no requested-changes review. The tester
   # validates behaviour but is blind to GitHub state, so without this a
   # tester-approved PR with a red build or a CHANGES_REQUESTED review would be
-  # marked done. Returns :ok | {:request_changes, reason}.
+  # marked done. Returns :ok, {:conflicts | :ci | :ci_wait | :request_changes | :review_wait, reason}.
   #
   # Inability to evaluate (no PR yet, gh failure) returns :ok rather than
   # blocking: a transient gh error must never wedge a finished issue, and the
@@ -2492,57 +2497,45 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp review_decision_gate({:ok, %{"reviewDecision" => "CHANGES_REQUESTED"}}, _repo, _number) do
-    {:request_changes, "PR review requested changes"}
-  end
-
-  # CodeRabbit runs in request-changes mode and is a hard merge gate,
-  # but it is not always a "required" reviewer, so reviewDecision can
-  # be nil while CodeRabbit's own review still sits at CHANGES_REQUESTED.
-  # Block on its review directly; the worker clears it by resolving the
-  # comments and posting `@coderabbitai resolve` (auto-approves on green CI).
-  defp review_decision_gate({:ok, decoded}, repo, number) do
-    cond do
-      coderabbit_requested_changes?(decoded) ->
-        {:request_changes, "CodeRabbit requested changes — resolve its comments and post `@coderabbitai resolve`"}
-
-      # A later CodeRabbit round can land as a COMMENTED review with
-      # unresolved threads and an empty reviewDecision — invisible to
-      # both checks above, so the issue completed with open Major
-      # comments (GEA-5242). Unresolved threads block the same way.
-      (n = unresolved_review_threads(repo, number)) > 0 ->
-        {:request_changes, "#{n} unresolved review threads — address them and post `@coderabbitai resolve`"}
-
-      true ->
-        :ok
-    end
+  # A THREAD THE REVIEWER OWES IS A WAIT (GEA-10826). A Resolve Review worker replies and
+  # stops; CodeRabbit resolves the thread minutes later. Counting that thread as work sent
+  # a Resolve Review to the same head on every poll until the breaker parked the issue.
+  # ReviewThreads says whose move each thread is; only a thread a worker owes dispatches.
+  # A wait starts no worker, so the next poll reads CI first and a red check goes to Fix CI.
+  defp review_decision_gate({:ok, decoded}, repo, number) when is_map(decoded) do
+    review_verdict(decoded, ReviewThreads.snapshot({repo, number}, &gh_cmd/1))
   end
 
   defp review_decision_gate(_decoded, _repo, _number), do: :ok
 
-  # Count of unresolved PR review threads. Fail-safe like the other gates: any
-  # gh/parse failure counts as 0 so a transient error never wedges a finished
-  # issue.
-  defp unresolved_review_threads(repo, number) do
-    [owner, name] = String.split(repo, "/", parts: 2)
+  @doc false
+  @spec review_verdict(map(), ReviewThreads.tally()) :: :ok | {:request_changes, String.t()} | {:review_wait, String.t()}
+  def review_verdict(decoded, %{ours: ours, theirs: theirs}) do
+    cond do
+      # A later CodeRabbit round can land as a COMMENTED review with
+      # unresolved threads and an empty reviewDecision — invisible to
+      # both review-state checks below, so the issue completed with open
+      # Major comments (GEA-5242). Unresolved threads block the same way.
+      ours > 0 ->
+        {:request_changes, "#{ours} unresolved review threads — address them and post `@coderabbitai resolve`"}
 
-    query =
-      "query { repository(owner:\"#{owner}\", name:\"#{name}\") { pullRequest(number:#{number}) { reviewThreads(first:100) { nodes { isResolved } } } } }"
+      theirs > 0 ->
+        {:review_wait, "#{theirs} review threads carry a reply the reviewer has not answered yet"}
 
-    jq = "[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved|not)] | length"
+      Map.get(decoded, "reviewDecision") == "CHANGES_REQUESTED" ->
+        {:request_changes, "PR review requested changes"}
 
-    case gh_cmd(["api", "graphql", "-f", "query=#{query}", "--jq", jq]) do
-      {output, 0} ->
-        case Integer.parse(String.trim(output)) do
-          {n, _} -> n
-          :error -> 0
-        end
+      # CodeRabbit runs in request-changes mode and is a hard merge gate,
+      # but it is not always a "required" reviewer, so reviewDecision can
+      # be nil while CodeRabbit's own review still sits at CHANGES_REQUESTED.
+      # Block on its review directly; the worker clears it by resolving the
+      # comments and posting `@coderabbitai resolve` (auto-approves on green CI).
+      coderabbit_requested_changes?(decoded) ->
+        {:request_changes, "CodeRabbit requested changes — resolve its comments and post `@coderabbitai resolve`"}
 
-      _ ->
-        0
+      true ->
+        :ok
     end
-  rescue
-    _ -> 0
   end
 
   defp coderabbit_requested_changes?(%{"latestReviews" => reviews}) when is_list(reviews) do

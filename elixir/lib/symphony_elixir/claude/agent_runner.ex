@@ -146,6 +146,9 @@ defmodule SymphonyElixir.Claude.AgentRunner do
       issue_state_fetcher: issue_state_fetcher,
       comment_fetcher: comment_fetcher,
       max_turns: max_turns,
+      # The slot HEAD at the last progress check; each turn's new commits are
+      # counted from it (GEA-10754).
+      last_head: git_head(Workspace.working_dir(workspace)),
       turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms, Config.claude_turn_timeout_ms()),
       # Collaborators are injectable so the turn loop can be tested without a live
       # tmux session. Production uses the real modules.
@@ -210,7 +213,8 @@ defmodule SymphonyElixir.Claude.AgentRunner do
         # SYMPHONY_VERDICT line, and with no verdict the orchestrator dispatched
         # it again at the same state until the no-progress breaker parked the
         # issue. agent.max_turns still bounds the run.
-        progress = check_turn_progress(ctx.workspace)
+        {progress, head} = check_turn_progress(ctx.workspace, ctx.last_head)
+        ctx = %{ctx | last_head: head}
 
         made_progress =
           progress.files_changed > 0 or progress.new_commits > 0 or turn_number <= 3 or
@@ -397,14 +401,23 @@ defmodule SymphonyElixir.Claude.AgentRunner do
 
   defp read_only_phase?(opts), do: Keyword.get(opts, :retask_phases) == ["Test"]
 
-  defp check_turn_progress(workspace) do
-    files_changed = count_git_changes(workspace)
-    new_commits = count_new_commits(workspace)
-    %{files_changed: files_changed, new_commits: new_commits}
+  # Progress is read in the slot, not in the scratch workspace: the scratch
+  # directory only holds `.symphony_slot` and is no git tree, so every git call
+  # there failed and each turn read as no progress (GEA-10754).
+  #
+  # New commits are HEAD movement since the previous check, not
+  # `@{upstream}..HEAD`: the provisioner creates a new branch with no upstream,
+  # so that range fails until the first `push -u`, and after it the range counts
+  # old unpushed commits again on every turn.
+  defp check_turn_progress(workspace, last_head) do
+    dir = Workspace.working_dir(workspace)
+    head = git_head(dir)
+
+    {%{files_changed: count_git_changes(dir), new_commits: count_new_commits(dir, last_head, head)}, head}
   end
 
-  defp count_git_changes(workspace) do
-    case System.cmd("git", ["diff", "--stat", "HEAD"], cd: workspace, stderr_to_stdout: true) do
+  defp count_git_changes(dir) do
+    case System.cmd("git", ["diff", "--stat", "HEAD"], cd: dir, stderr_to_stdout: true) do
       {output, 0} ->
         output |> String.split("\n", trim: true) |> length()
 
@@ -413,16 +426,28 @@ defmodule SymphonyElixir.Claude.AgentRunner do
     end
   end
 
-  defp count_new_commits(workspace) do
-    case System.cmd("git", ["log", "--oneline", "@{upstream}..HEAD"],
-           cd: workspace,
-           stderr_to_stdout: true
-         ) do
+  defp count_new_commits(_dir, last_head, head) when is_nil(last_head) or is_nil(head) or last_head == head, do: 0
+
+  defp count_new_commits(dir, last_head, head) do
+    case System.cmd("git", ["rev-list", "--count", "#{last_head}..#{head}"], cd: dir, stderr_to_stdout: true) do
       {output, 0} ->
-        output |> String.split("\n", trim: true) |> length()
+        case Integer.parse(String.trim(output)) do
+          {count, _} -> count
+          :error -> 0
+        end
 
       _ ->
         0
     end
+  end
+
+  defp git_head(dir) do
+    case System.cmd("git", ["rev-parse", "--verify", "--quiet", "HEAD"], cd: dir, stderr_to_stdout: true) do
+      {output, 0} -> String.trim(output)
+      _ -> nil
+    end
+  rescue
+    # cd: raises when the directory is gone (a released or missing slot).
+    _ in [ErlangError, File.Error] -> nil
   end
 end

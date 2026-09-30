@@ -131,6 +131,9 @@ defmodule SymphonyElixir.Claude.AgentRunner do
   defp send_phase_update(_recipient, _issue, _phase), do: :ok
 
   defp run_claude_turns(workspace, issue, claude_update_recipient, opts) do
+    # The before_run hook has written `.symphony_slot` by now. Read it once and render it
+    # into every prompt of this run, so no turn is spent reading the file (GEA-10769).
+    opts = Keyword.put_new_lazy(opts, :slot, fn -> Workspace.slot_info(workspace) end)
     max_turns = Keyword.get(opts, :max_turns, Config.agent_max_turns())
 
     issue_state_fetcher =
@@ -317,7 +320,7 @@ defmodule SymphonyElixir.Claude.AgentRunner do
         )
 
       _ ->
-        PromptBuilder.build_continuation_prompt(issue, turn_number, max_turns, comments)
+        PromptBuilder.build_continuation_prompt(issue, turn_number, max_turns, comments, slot: Keyword.get(opts, :slot))
     end
   end
 

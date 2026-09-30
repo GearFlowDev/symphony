@@ -13,11 +13,13 @@ flipped to APPROVED on the current HEAD.
 ### Step 1: Re-orient
 
 ```bash
-cd "$(grep -oE 'DIRECTORY=[^ ]+' .symphony_slot | cut -d= -f2)"
-source .symphony_slot
-PR_NUM=$(gh pr list --head "$(git branch --show-current)" --json number --jq '.[0].number')
-HEAD=$(gh pr view $PR_NUM --json headRefOid --jq .headRefOid)
+cd {{ slot.directory }} && {{ tools.pr }} status
 ```
+
+Its first line names the PR as `<repo>#<number>`, its `coderabbit:` line says whether
+CodeRabbit's newest review is of the head commit, and its `threads:` line counts the
+unresolved threads. Use that number as `$PR_NUM` below, and start each command with
+`cd {{ slot.directory }} && PR_NUM=<number> && `.
 
 ### Step 2: List EVERY open review thread
 
@@ -31,14 +33,9 @@ gh api graphql -f query='
     comments(first:5){ nodes { author{login} path line body } } } } } } }'
 ```
 
-Also confirm CodeRabbit reviewed your latest push (its newest review's `commit_id`
-must equal `$HEAD`; if not, it hasn't seen your changes yet — wait for re-review
-before assuming a thread is stale):
-
-```bash
-gh api repos/{owner}/{repo}/pulls/$PR_NUM/reviews \
-  --jq '[.[] | select(.user.login | startswith("coderabbit"))] | last | {state, commit_id}'
-```
+CodeRabbit must have reviewed your latest push. The `coderabbit:` line of `pr status`
+says so: `(head)` after the commit means it reviewed the head. If it did not, it has
+not seen your changes yet. Wait for its re-review before you assume a thread is stale.
 
 ### Step 3: EVERY comment gets a reply — no exceptions
 
@@ -71,7 +68,7 @@ For **each** one, post a reply to that specific thread — pick exactly one:
   ```
 
 Run `direnv exec . mix check` and `direnv exec . mix test` after code changes,
-then push.
+then push with `cd {{ slot.directory }} && {{ tools.pr }} push --no-verify --base {{ slot.base_branch }}`.
 
 ### Step 4: Verify no comment is unanswered, then resolve
 
@@ -89,8 +86,11 @@ gh api repos/{owner}/{repo}/pulls/$PR_NUM/comments --paginate \
 Empty output = every comment answered. Only then, with CI green, post:
 
 ```bash
-gh pr comment $PR_NUM --body "@coderabbitai resolve"
+cd {{ slot.directory }} && {{ tools.pr }} coderabbit resolve
 ```
+
+`pr coderabbit` posts the command as the PR's own opener, as the harness's CodeRabbit
+rule requires.
 
 CodeRabbit resolves its threads and auto-flips its review `CHANGES_REQUESTED →
 APPROVED` within a minute or two (CI must be green). For human review threads,

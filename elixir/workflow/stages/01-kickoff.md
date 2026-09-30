@@ -20,7 +20,7 @@ Use the **Agent tool with `subagent_type: "Explore"`** for broader searches so y
 
 ### Post your implementation plan to Linear
 
-First, check if a plan has already been posted: read the issue comments (`"$LINEAR" comments {{ issue.identifier }}`, below) and look for "## Requirements". If a plan already exists, skip this step — do NOT post a duplicate.
+First, check if a plan has already been posted: read the issue comments (`{{ tools.linear }} comments {{ issue.identifier }}`, below) and look for "## Requirements". If a plan already exists, skip this step — do NOT post a duplicate.
 
 If no plan exists, post a comment on the Linear issue through `bin/linear`, never `curl`. The plan must be specific enough that a **different agent** (who has not read the codebase) can implement it.
 
@@ -43,11 +43,10 @@ The comment must include:
 Write the plan to a file, then post it:
 
 ```bash
-LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
-if "$LINEAR" comments {{ issue.identifier }} | grep -q '## Requirements'; then
+if {{ tools.linear }} comments {{ issue.identifier }} | grep -q '## Requirements'; then
   echo "plan exists — skip"
 else
-  "$LINEAR" comment {{ issue.identifier }} --body-file /tmp/plan-{{ issue.identifier }}.md
+  {{ tools.linear }} comment {{ issue.identifier }} --body-file /tmp/plan-{{ issue.identifier }}.md
 fi
 ```
 

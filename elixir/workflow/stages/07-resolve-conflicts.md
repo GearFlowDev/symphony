@@ -4,24 +4,15 @@ The plan is code-complete and tester-approved, but the base branch has moved and
 the PR now has **merge conflicts**. Your only job this phase is to make the PR
 mergeable again. Do not add features or refactor unrelated code.
 
-### Step 1: Rebase onto the base branch
-
-In your working directory:
+### Step 1: Merge the base branch in
 
 ```bash
-b="$(git branch --show-current)"
-# origin's tip BEFORE you rewrite anything, fetched with its objects (the slot fetches
-# main only). No branch on origin, or no answer, leaves it empty: the lease then refuses
-# to overwrite anything.
-seen=""
-if git fetch origin "refs/heads/$b" 2>/dev/null; then
-  seen=$(git rev-parse FETCH_HEAD)
-  git merge-base --is-ancestor "$seen" HEAD || git rebase "$seen"   # take in commits you lack
-fi
-BASE="${BASE_BRANCH:-main}"
-git fetch origin "$BASE"
-git rebase "origin/$BASE"
+cd {{ slot.directory }} && {{ tools.pr }} push --no-verify --base {{ slot.base_branch }}
 ```
+
+`pr push` takes in any commits origin has on the branch, then merges
+`origin/{{ slot.base_branch }}`. When the merge conflicts, it stops and names the
+conflicted files. When it merges clean, it pushes, and you go to Step 3.
 
 ### Step 2: Resolve each conflict
 
@@ -32,26 +23,23 @@ For every conflicted file, understand **both** sides before choosing:
 - When both touch the same lines, combine them; deleting either side's logic to
   make the conflict go away is almost always wrong.
 
-After resolving each file: `git add <file>`, then `git rebase --continue` until
-the rebase completes.
+After resolving each file: `git add <file>`. When every file is resolved,
+`git commit --no-edit` to complete the merge.
 
 ### Step 3: Verify, then push
 
 ```bash
-direnv exec . mix test <files touched by the conflicts>
-git push --no-verify --force-with-lease="refs/heads/$b:$seen" origin "$b"
+cd {{ slot.directory }} && direnv exec . mix test <files touched by the conflicts>
+cd {{ slot.directory }} && {{ tools.pr }} push --no-verify --base {{ slot.base_branch }}
+cd {{ slot.directory }} && {{ tools.pr }} status --no-logs
 ```
 
-`$seen` is origin's tip from Step 1, read before the rebase. A rejection means origin moved
-since then: repeat Step 1 and push again. Never re-read the tip just to make the push pass.
+`pr push` never force-pushes. If origin moved since Step 1, it merges the new
+commits in first, and stops again on a conflict.
 
-Confirm the PR is mergeable again:
-
-```bash
-gh pr view --json mergeable --jq .mergeable   # must print MERGEABLE
-```
-
-`UNKNOWN` means GitHub is still recomputing — wait ~30s and re-check.
+The first line of `pr status` must not be `FAILING` with "conflicts with its base".
+`PENDING` means GitHub is still computing mergeability or CI runs: that is fine, and
+you do not poll it.
 
 ### Step 4: Stop
 

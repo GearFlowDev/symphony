@@ -4,24 +4,21 @@ You MUST post test results to the **Linear issue** — NOT to the GitHub PR.
 
 Your job: log in to the app, verify it works in a real browser, take screenshots, and post them to Linear. Do NOT read source code, do NOT investigate the codebase, do NOT fix anything.
 
-### Step 1: Get your workspace info
+### Step 1: Start the app
+
+The app is Phoenix LiveView on `http://127.0.0.1:{{ slot.phoenix_port }}`; there is no frontend server. The backend is NOT started for you. Start it and wait for it in one call:
 
 ```bash
-set -a; source .symphony_slot; set +a   # exports PHOENIX_PORT for the node script
-cd "$DIRECTORY"
+{{ tools.slot_app }} --slot {{ slot.directory }} up && {{ tools.slot_app }} --slot {{ slot.directory }} wait --timeout 300
 ```
 
-The app is Phoenix LiveView on `PHOENIX_PORT`; there is no frontend server. The backend is NOT started for you: start it when it is down, and stop it when you are done.
+If either step fails, post a comment that says so, with the log tail it printed, and stop. Do not post screenshots of an error page.
+
+When you are done with the browser, stop the app and keep Postgres for the next dispatch:
 
 ```bash
-curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null \
-  || { direnv exec . mix phx.server > .phx.log 2>&1 & }
-up=""
-for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && up=1 && break; sleep 2; done
-[ -n "$up" ] && echo "backend up" || { echo "backend DOWN after 120 s — see .phx.log"; tail -n 30 .phx.log; }
+{{ tools.slot_app }} --slot {{ slot.directory }} down && {{ tools.slot_app }} --slot {{ slot.directory }} up --minimal
 ```
-
-If the backend is DOWN, post a comment that says so, with the tail of `.phx.log`, and stop. Do not post screenshots of an error page.
 
 ### Step 2: Browser testing
 
@@ -29,7 +26,7 @@ Test the app in a real browser. The `screenshot` skill in the gf_engineering wor
 
 #### Browser tooling
 
-Playwright with Chromium is installed globally — drive it from a small node script, NOT via a Playwright MCP server (MCP burns enormous context). Write the script to `/tmp/evidence.js` and run with `NODE_PATH=$(npm root -g) node /tmp/evidence.js`:
+Playwright with Chromium is installed globally — drive it from a small node script, NOT via a Playwright MCP server (MCP burns enormous context). Write the script to `/tmp/evidence.js` and run it with `PHOENIX_PORT={{ slot.phoenix_port }} WALK_EMAIL=<email> NODE_PATH=$(npm root -g) node /tmp/evidence.js`:
 
 ```js
 const { chromium } = require('playwright');
@@ -75,26 +72,19 @@ Read the issue description to understand what changed. If the change is user-fac
 
 If the change is backend-only (no UI impact), the smoke test screenshots are sufficient.
 
-### Step 3: Upload screenshots and post to Linear
+### Step 3: Post the screenshots to Linear
 
-Upload the screenshots you captured and collect ready-to-paste markdown. Pass
-the ACTUAL files you saved (any names). The helper uploads each to Linear,
-prints one `![name](assetUrl)` line per file, and NEVER prints an empty `![]()`:
+Write the comment body to a file, then post it through `bin/linear`, never `curl`. Give one `--image` per screenshot you saved, with an `--alt` that says what it shows. `bin/linear` uploads each file to Linear and embeds it at the end of the comment, so you never write an image URL by hand:
 
 ```bash
-URLS=$("${SYMPHONY_SCRIPTS}linear-embed-images.sh" /tmp/evidence-*.png)   # <- use YOUR real screenshot paths
-```
-
-If `$URLS` is empty the upload failed — do NOT post empty `![]()`; fix the paths
-and re-run. Then post a comment with the embedded screenshots through
-`bin/linear`, never `curl`:
-
-```bash
-printf '## Browser Test Results\n\nLogged in and verified core pages load. Screenshots below.\n\n%s\n' "$URLS" \
+printf '## Browser Test Results\n\nLogged in and verified core pages load. Screenshots below.\n' \
   > /tmp/evidence-{{ issue.identifier }}.md
-LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
-"$LINEAR" comment {{ issue.identifier }} --body-file /tmp/evidence-{{ issue.identifier }}.md
+{{ tools.linear }} comment {{ issue.identifier }} --body-file /tmp/evidence-{{ issue.identifier }}.md \
+  --image /tmp/evidence-requisitions.png --alt "Requisitions index, dispatcher" \
+  --image /tmp/evidence-<page>.png --alt "<what it shows>"   # <- YOUR real screenshot paths
 ```
+
+If `bin/linear` fails on a file, it posts no comment. Fix the path and run it again.
 
 ### Done
 

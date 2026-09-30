@@ -43,25 +43,32 @@ If a row is genuinely impossible (missing backend, broken slot, contradictory ro
 
 ## CRITICAL: Working Directory
 
-Your current directory is a Symphony scratch workspace — do NOT work here.
+Your current directory is a Symphony scratch workspace. Do NOT work here.
 
-Read the file `.symphony_slot` in this directory to find your assigned isolated workspace:
+Symphony read your slot from `.symphony_slot` for you. Do not read that file again. If a value below says MISSING, the run has no usable slot marker: emit `SYMPHONY_NEEDS_HELP: the run has no slot marker` and stop.
 
-```
-cat .symphony_slot
-```
+- **Working directory**: `{{ slot.directory | default: "MISSING" }}` (slot `{{ slot.name | default: "MISSING" }}`). It is a pre-built clone with deps compiled and its own Postgres on port `{{ slot.postgres_port | default: "MISSING" }}`.
+- **App**: `http://127.0.0.1:{{ slot.phoenix_port | default: "MISSING" }}` when the backend runs.
+- **Base branch**: `{{ slot.base_branch }}`.
 
-It contains `DIRECTORY=<path>` — that is your working directory. `cd` there immediately and do ALL work from that directory. It is a pre-built clone with deps compiled and its own Postgres on `POSTGRES_PORT`.
+Your shell returns to the scratch workspace after each command. So start every command with `cd {{ slot.directory }} && `, and do ALL work there.
 
-Phoenix serves every page, on the `PHOENIX_PORT` that `.symphony_slot` names. There is no frontend server and no `FRONTEND_PORT`. The Full Platform (gf_procurement) is Phoenix LiveView only: its React SPA, its `frontend/` tree and the `?lv=` flags were deleted on 2026-07-06 (GEA-4136).
+Phoenix serves every page. There is no frontend server and no `FRONTEND_PORT`. The Full Platform (gf_procurement) is Phoenix LiveView only: its React SPA, its `frontend/` tree and the `?lv=` flags were deleted on 2026-07-06 (GEA-4136).
 
-The backend is NOT started for you. When a step needs the app running, check it and start it yourself in the background from the slot directory, and stop it when you are done:
+The backend is NOT started for you. When a step needs the app, start it and wait for it in one call, and stop it when you are done:
 ```bash
-source .symphony_slot
-cd "$DIRECTORY"
-curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && echo "backend up" \
-  || { direnv exec . mix phx.server > .phx.log 2>&1 & }
+{{ tools.slot_app }} --slot {{ slot.directory }} up && {{ tools.slot_app }} --slot {{ slot.directory }} wait --timeout 300
+{{ tools.slot_app }} --slot {{ slot.directory }} down && {{ tools.slot_app }} --slot {{ slot.directory }} up --minimal   # when done: stop the app, keep Postgres for the next dispatch
 ```
+`slot-app up` runs the repo's setup task (deps, migrations, assets) and starts the backend under devenv. `wait` polls it. So do not write a wait loop or a `sleep`. On a failure, both print the cause and the log tail.
+
+## Harness scripts
+
+Three scripts do the routine work. Each one is one call and prints a compact answer, so a routine step costs one turn:
+
+- `{{ tools.pr }}` — the PR. `status` prints the verdict first (GREEN, FAILING, PENDING, CHANGES, MERGED, CLOSED), with the number, head, checks, failed-job log tails, the CodeRabbit state and the open threads. `push --no-verify` takes in origin's commits on the branch, merges `origin/{{ slot.base_branch }}`, and pushes. `ship` does that push, opens the PR ready if none is open, and attaches it to the Linear issue. Run `pr` from the slot directory. It never force-pushes.
+- `{{ tools.slot_app }}` — the slot's app: `up`, `wait`, `status`, `down`.
+- `{{ tools.linear }}` — every Linear read and write (see Environment Notes).
 
 ## Issue Context
 
@@ -138,7 +145,7 @@ The orchestrator notifies the team and moves the issue to a review state when th
 - Do NOT modify files outside the scope of the issue.
 - Do NOT force-push or rewrite shared history.
 - Do NOT merge PRs. Whoever merges is named in your finish line above; it is never you.
-- Start the backend only when a step needs it (see "CRITICAL: Working Directory"), and stop it when you are done. There is no frontend server to start.
+- Start the backend only when a step needs it, with `slot-app` (see "CRITICAL: Working Directory"), and stop it when you are done. There is no frontend server to start.
 - Use `direnv exec .` prefix for ALL mix/npm commands in the working directory.
 - Backend (Elixir) changes should be test-driven — write tests for new features and behavior changes. 100% file-level coverage is not required, but core logic must be tested.
 
@@ -158,9 +165,8 @@ Check out this branch: `git checkout {{ existing_pr_branch }}`
 - The `.env` file in the working directory has all credentials.
 - **Every Linear read and write goes through the harness CLI, `bin/linear`, never through `curl`.** It is the live harness checkout under the workspace:
   ```bash
-  LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
-  "$LINEAR" comments {{ issue.identifier }}                      # read the thread
-  "$LINEAR" comment {{ issue.identifier }} --body-file note.md   # post a comment
+  {{ tools.linear }} comments {{ issue.identifier }}                      # read the thread
+  {{ tools.linear }} comment {{ issue.identifier }} --body-file note.md   # post a comment
+  {{ tools.linear }} comment {{ issue.identifier }} --body-file note.md --image /tmp/a.png --alt "what it shows"
   ```
-  Write the body to a file and pass `--body-file`; never paste markdown into a shell string. `--image shot.png --alt "what it shows"` uploads and embeds a screenshot. `bin/linear` reads `$LINEAR_API_KEY`, the automation account's key.
-
+  Write the body to a file and pass `--body-file`; never paste markdown into a shell string. Each `--image` uploads one file to Linear and embeds it at the end of the comment; the Nth `--alt` captions the Nth image. `bin/linear` reads `$LINEAR_API_KEY`, the automation account's key.

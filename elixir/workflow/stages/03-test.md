@@ -12,37 +12,36 @@ Match the verification to the row's deliverable:
 
 ### Step 1: Load the Contract
 
-1. `cd` to your working directory (from `.symphony_slot`).
+1. Work in `{{ slot.directory }}`: start every command with `cd {{ slot.directory }} && `.
 2. Read the latest `## Contract Audit` comment on Linear and `WORKPAD.md` at the repo root. The Contract row list is your test plan.
 3. Read `docs/<area>/TESTER_PROMPT.md` if it exists in this repo. If a process-specific tester playbook exists, follow it instead of these generic instructions.
-4. Confirm you're on the right branch:
+4. Read the PR's state, and put the slot on the PR's head:
    ```bash
-   gh pr list --search "{{ issue.identifier }}" --json number,url,headRefName,baseRefName --jq '.[0]'
-   git checkout <headRefName>
-   git pull --ff-only origin <headRefName>
+   cd {{ slot.directory }} && {{ tools.pr }} status --no-logs
+   cd {{ slot.directory }} && git checkout {{ issue.branch_name }} && git pull --ff-only origin {{ issue.branch_name }}
    ```
+   The first line of `pr status` names the PR, and its `pr:` line gives the head commit you test.
 
 ### Step 2: Preflight
 
 ```bash
-# Asset bundle must be fresh
-direnv exec . mix assets.build
-ls -la priv/static/assets/app.js
-
-# Backend up. It is NOT started for you: start it when it is down, and stop it after the walk.
-# Phoenix serves every page on PHOENIX_PORT; there is no frontend server.
-source .symphony_slot
-curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null \
-  || { direnv exec . mix phx.server > .phx.log 2>&1 & }
-up=""
-for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PHOENIX_PORT/" >/dev/null && up=1 && break; sleep 2; done
-[ -n "$up" ] && echo "backend up" || { echo "backend DOWN after 120 s — see .phx.log"; tail -n 30 .phx.log; }
+# Backend up, and the asset bundle built: `slot-app up` runs the setup task (deps,
+# migrations, assets.build) and starts the backend; `wait` polls it. Phoenix serves every
+# page on port {{ slot.phoenix_port }}; there is no frontend server.
+{{ tools.slot_app }} --slot {{ slot.directory }} up && {{ tools.slot_app }} --slot {{ slot.directory }} wait --timeout 300
+cd {{ slot.directory }} && ls -la priv/static/assets/app.js
 
 # Playwright is on the system via npx — verify (will install Chromium on first call)
 npx --yes playwright --version
 ```
 
-If `app.js` is < ~250KB, the bundle is a stub — rebuild and retry. If preflight fails — a stub bundle after a rebuild, or `backend DOWN` — post a `## Tester Report` with `Recommendation: BLOCKED` and stop.
+After the walk, stop the app and keep Postgres for the next dispatch:
+
+```bash
+{{ tools.slot_app }} --slot {{ slot.directory }} down && {{ tools.slot_app }} --slot {{ slot.directory }} up --minimal
+```
+
+If `app.js` is < ~250KB, the bundle is a stub: rebuild it with `cd {{ slot.directory }} && direnv exec . mix assets.build` and retry. If preflight fails (a stub bundle after a rebuild, or a `slot-app` failure), post a `## Tester Report` with `Recommendation: BLOCKED` and stop.
 
 ### Step 3: How to drive a real browser (use this — do NOT report "no Playwright tooling")
 
@@ -50,7 +49,7 @@ The `screenshot` skill in the gf_engineering workspace is the full method (`$GEA
 
 You are running inside Symphony's harness with an empty MCP server config — there is no Playwright MCP. **That does not mean Playwright is unavailable.** It is installed on the system. Drive it directly from Bash via `npx playwright`.
 
-The pattern: write a one-shot Node script per page that opens the LiveView route on `PHOENIX_PORT`, takes screenshots at desktop (1280) and tablet (768) widths, and prints any console errors. Then turn the PNGs into embed lines with `${SYMPHONY_SCRIPTS}linear-embed-images.sh` and paste them into your Tester Report.
+The pattern: write a one-shot Node script per page that opens the LiveView route on `PHOENIX_PORT`, takes screenshots at desktop (1280) and tablet (768) widths, and prints any console errors. Then attach the PNGs to your Tester Report with `bin/linear comment --image` (Step 5).
 
 Example you can adapt — save as `/tmp/walk-<page>.cjs`. Playwright is installed globally, so run it with `NODE_PATH="$(npm root -g)"`: a script under `/tmp` cannot resolve the package otherwise, and an ES module ignores `NODE_PATH`, so the script is CommonJS.
 
@@ -87,19 +86,12 @@ console.log(JSON.stringify({ errors }, null, 2));
 Then for each page:
 
 ```bash
-set -a; source .symphony_slot; set +a   # exports PHOENIX_PORT to the script
-WALK_EMAIL="${GF_EMAIL_HANDLE:-$(whoami)}+dispatcher@gearflow.com" NODE_PATH="$(npm root -g)" node /tmp/walk-<page>.cjs <route>
-# Upload the screenshots you just captured and get ready-to-paste markdown.
-# Pass the ACTUAL files you saved — any names, any number. The helper uploads
-# each to Linear and prints one `![name](assetUrl)` line per file. It reports
-# failures on stderr and NEVER prints an empty `![]()`, so its stdout is safe
-# to paste verbatim into the Screenshots section of your report.
-"${SYMPHONY_SCRIPTS}linear-embed-images.sh" /tmp/walk-*.png   # <- use YOUR real screenshot paths/globs
+PHOENIX_PORT={{ slot.phoenix_port }} WALK_EMAIL="${GF_EMAIL_HANDLE:-$(whoami)}+dispatcher@gearflow.com" \
+  NODE_PATH="$(npm root -g)" node /tmp/walk-<page>.cjs <route>
 ```
 
-Do NOT hand-write image tags and do NOT post `![]()`. Only paste lines that
-`linear-embed-images.sh` actually printed. If it embedded zero images, your
-screenshots never uploaded — fix the paths and re-run before posting the report.
+Keep the list of PNG files you saved. Step 5 attaches each one to the report with its
+own `--image`. Never hand-write an image tag, and never post an empty `![]()`.
 
 If `npx playwright` fails to launch Chromium (first-run), do `npx --yes playwright install chromium` once and retry.
 
@@ -136,10 +128,9 @@ A change is only safe if it doesn't break its neighbors. Load the component's ow
 The browser walk proves the paths you walked work; it says nothing about the callers you didn't walk. The dominant defect in this system is a change that lands in one place and leaves its siblings behind — a function whose contract moved while some callers kept the old usage, a schema field or table whose new writer was added but legacy write paths still bypass it, a new module nothing calls. A green suite hides all three. So run a static sweep, code-aware, before you decide:
 
 ```bash
-BASE="${BASE_BRANCH:-main}"
-git fetch origin "$BASE" >/dev/null 2>&1
+cd {{ slot.directory }} && git fetch -q origin {{ slot.base_branch }}
 # What contracts did this branch change?
-git diff "origin/$BASE..HEAD" | grep -E '^[+-].*\b(def |defp |field :|create table|alter table)'
+cd {{ slot.directory }} && git diff origin/{{ slot.base_branch }}..HEAD | grep -E '^[+-].*\b(def |defp |field :|create table|alter table)'
 ```
 
 For each changed function signature / return shape, each added-or-changed schema field or table, and each new module:
@@ -158,9 +149,14 @@ it, so the issue loops forever. Write the report to a file and post it through
 `bin/linear`, never `curl`:
 
 ```bash
-LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
-"$LINEAR" comment {{ issue.identifier }} --body-file /tmp/tester-report-{{ issue.identifier }}.md
+{{ tools.linear }} comment {{ issue.identifier }} --body-file /tmp/tester-report-{{ issue.identifier }}.md \
+  --image /tmp/walk-_issues-desktop.png --alt "/issues, desktop" \
+  --image /tmp/walk-_issues-tablet.png --alt "/issues, tablet"   # <- one --image per PNG you saved
 ```
+
+Each `--image` uploads one file to Linear and embeds it at the end of the report, after
+the Recommendation line; the Nth `--alt` captions the Nth image. If `bin/linear` fails on
+a file, it posts no report: fix the path and run it again.
 
 **NEVER** post the report to GitHub — no `gh pr comment`, no `gh pr review`, no
 `gh api .../issues/comments`. Nothing about the report touches the PR.
@@ -192,12 +188,10 @@ Report format:
 
 - ❌ Row M — <what's missing or how it crashes, with reproduction steps>
 
-### Screenshots
-
-<paste the `![name](url)` lines printed by linear-embed-images.sh — every state
-and dialog you walked, at both widths. Never leave an empty `![]()`.>
-
 **Recommendation: APPROVE** | **REQUEST_CHANGES** | **BLOCKED**
+
+<no Screenshots section: `--image` appends every state and dialog you walked, at
+both widths, below this line>
 ```
 
 The `Recommendation:` line is parsed by the orchestrator by exact match, so

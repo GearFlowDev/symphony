@@ -52,18 +52,28 @@ defmodule SymphonyElixir.StagePromptAskRuleTest do
     end
 
     for name <- ["01-kickoff.md", "03-test.md", "03-human-review.md", "04-simplify.md"] do
-      assert stage(name) =~ ~s("$LINEAR" comment {{ issue.identifier }} --body-file),
+      assert stage(name) =~ ~s({{ tools.linear }} comment {{ issue.identifier }} --body-file),
              "#{name} does not post through bin/linear"
     end
 
-    assert stage("_continuation.md") =~ ~s("$LINEAR" comments {{ issue.identifier }})
+    assert stage("_continuation.md") =~ ~s({{ tools.linear }} comments {{ issue.identifier }})
   end
 
   test "the continuation prompt reaches the agent with the issue's identifier filled in (GEA-10619)" do
     stages = %{"_continuation.md" => stage("_continuation.md")}
-    prompt = StageLoader.assemble_continuation(stages, 2, 20, [], "GEA-7")
 
-    assert prompt =~ ~s("$LINEAR" comments GEA-7 --since)
+    values = %{
+      "slot" => %{"directory" => "/data/workspace/local-dev/gf_procurement-slot3", "base_branch" => "main"},
+      "tools" => %{
+        "pr" => "/data/workspace/local-dev/bin/pr",
+        "linear" => "/data/workspace/local-dev/gf_harness_surfaces/bin/linear"
+      }
+    }
+
+    prompt = StageLoader.assemble_continuation(stages, 2, 20, [], "GEA-7", values)
+
+    assert prompt =~ ~s(/data/workspace/local-dev/gf_harness_surfaces/bin/linear comments GEA-7 --since)
+    assert prompt =~ "cd /data/workspace/local-dev/gf_procurement-slot3 && /data/workspace/local-dev/bin/pr push"
     assert prompt =~ "`GEA-7: <row-id> <summary>`"
     refute prompt =~ "{{"
   end
@@ -73,7 +83,7 @@ defmodule SymphonyElixir.StagePromptAskRuleTest do
 
     for bad <- ["GEA-7; rm -rf /", "GEA-7 $(id)", "gea-7", ""] do
       prompt = StageLoader.assemble_continuation(stages, 2, 20, [], bad)
-      assert prompt =~ ~s("$LINEAR" comments {{ issue.identifier }} --since)
+      assert prompt =~ ~s({{ tools.linear }} comments {{ issue.identifier }} --since)
     end
   end
 

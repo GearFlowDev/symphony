@@ -432,10 +432,9 @@ defmodule SymphonyElixir.Claude.TmuxCLI do
   # launched with (sourced .env) silently vanishes from agent sessions unless
   # passed explicitly. A tester that was promised $LINEAR_API_KEY_AUTOMATION
   # and didn't have it went hunting through the macOS keychain and 1Password
-  # for it — deliver on the promise instead. SYMPHONY_SCRIPTS likewise: the
-  # tester prompt says `${SYMPHONY_SCRIPTS}linear-upload-image.sh`; without
-  # the var, testers hand-roll unverified Linear uploads and post dangling
-  # asset URLs (broken screenshots, observed GEA-4478).
+  # for it — deliver on the promise instead. SYMPHONY_SCRIPTS is passed too, for
+  # the scripts under priv/scripts. The stage prompts no longer name one: the
+  # Linear upload scripts retired for `bin/linear comment --image` (GEA-10774).
   @session_env_passthrough ~w(LINEAR_API_KEY LINEAR_API_KEY_AUTOMATION)
 
   defp session_env_args do

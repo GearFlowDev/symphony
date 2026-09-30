@@ -16,18 +16,7 @@ defmodule SymphonyElixir.PromptBuilder do
       |> parse_template!()
 
     template
-    |> Solid.render!(
-      %{
-        "attempt" => Keyword.get(opts, :attempt),
-        "grant" => grant_map(issue),
-        "issue" => issue |> Map.from_struct() |> to_solid_map(),
-        "existing_pr_url" => Keyword.get(opts, :existing_pr_url),
-        "existing_pr_branch" => Keyword.get(opts, :existing_pr_branch),
-        "assigned_rows_md" => render_rows_md(Keyword.get(opts, :assigned_rows)),
-        "plan_rows_md" => render_rows_md(Keyword.get(opts, :plan_rows))
-      },
-      @render_opts
-    )
+    |> Solid.render!(template_vars(issue, opts), @render_opts)
     |> IO.iodata_to_binary()
   end
 
@@ -40,20 +29,7 @@ defmodule SymphonyElixir.PromptBuilder do
   def build_phase_prompt(issue, phase_name, opts \\ []) do
     stages_dir = Workflow.stages_directory()
     stages = StageLoader.load_stages(stages_dir)
-
-    issue_map = issue |> Map.from_struct() |> to_solid_map()
-    assigned_rows_md = render_rows_md(Keyword.get(opts, :assigned_rows))
-    plan_rows_md = render_rows_md(Keyword.get(opts, :plan_rows))
-
-    template_vars = %{
-      "attempt" => Keyword.get(opts, :attempt),
-      "grant" => grant_map(issue),
-      "issue" => issue_map,
-      "existing_pr_url" => Keyword.get(opts, :existing_pr_url),
-      "existing_pr_branch" => Keyword.get(opts, :existing_pr_branch),
-      "assigned_rows_md" => assigned_rows_md,
-      "plan_rows_md" => plan_rows_md
-    }
+    template_vars = template_vars(issue, opts)
 
     # Render the preamble through Solid for issue context
     preamble =
@@ -71,6 +47,59 @@ defmodule SymphonyElixir.PromptBuilder do
     [preamble, "---", phase_md]
     |> Enum.join("\n\n")
     |> String.trim()
+  end
+
+  defp template_vars(issue, opts) do
+    %{
+      "attempt" => Keyword.get(opts, :attempt),
+      "grant" => grant_map(issue),
+      "issue" => issue |> Map.from_struct() |> to_solid_map(),
+      "existing_pr_url" => Keyword.get(opts, :existing_pr_url),
+      "existing_pr_branch" => Keyword.get(opts, :existing_pr_branch),
+      "assigned_rows_md" => render_rows_md(Keyword.get(opts, :assigned_rows)),
+      "plan_rows_md" => render_rows_md(Keyword.get(opts, :plan_rows)),
+      "slot" => slot_map(opts),
+      "tools" => tools_map()
+    }
+  end
+
+  # THE SLOT, RENDERED INTO THE PROMPT (GEA-10769). The runner reads `.symphony_slot` once,
+  # after the before_run hook wrote it, and passes it as `:slot`. A caller without one (a
+  # test, the Codex runner before its hook) gets every value nil, and the preamble says the
+  # slot is missing rather than rendering an empty path into a `cd`.
+  @empty_slot %{
+    "name" => nil,
+    "directory" => nil,
+    "phoenix_port" => nil,
+    "postgres_port" => nil,
+    "base_branch" => "main"
+  }
+
+  defp slot_map(opts) do
+    case Keyword.get(opts, :slot) do
+      %{} = slot -> Map.merge(@empty_slot, slot)
+      _ -> @empty_slot
+    end
+  end
+
+  @doc """
+  The harness scripts a stage calls, by absolute path under `$GEARFLOW_WORKSPACE`
+  (`/data/workspace` on the Symphony box). The agent's cwd is the scratch workspace and
+  resets there between commands, so a relative `local-dev/bin/pr` never resolves.
+  """
+  @spec tools_map() :: %{String.t() => String.t()}
+  def tools_map do
+    ws =
+      case System.get_env("GEARFLOW_WORKSPACE") do
+        value when is_binary(value) and value != "" -> String.trim_trailing(value, "/")
+        _ -> "/data/workspace"
+      end
+
+    %{
+      "pr" => Path.join(ws, "local-dev/bin/pr"),
+      "slot_app" => Path.join(ws, "local-dev/bin/slot-app"),
+      "linear" => Path.join(ws, "local-dev/gf_harness_surfaces/bin/linear")
+    }
   end
 
   # WHAT THIS RUN IS ALLOWED TO DO, and therefore where it stops, in the stage
@@ -140,14 +169,15 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds a continuation prompt for turn N+.
   Uses staged _continuation.md template if available, otherwise falls back to default.
   """
-  @spec build_continuation_prompt(map(), pos_integer(), pos_integer(), [map()]) :: String.t()
-  def build_continuation_prompt(issue, turn_number, max_turns, comments) do
+  @spec build_continuation_prompt(map(), pos_integer(), pos_integer(), [map()], keyword()) :: String.t()
+  def build_continuation_prompt(issue, turn_number, max_turns, comments, opts \\ []) do
     stages_dir = Workflow.stages_directory()
 
     if File.dir?(stages_dir) do
       stages = StageLoader.load_stages(stages_dir)
+      values = %{"slot" => slot_map(opts), "tools" => tools_map()}
 
-      case StageLoader.assemble_continuation(stages, turn_number, max_turns, comments, Map.get(issue, :identifier)) do
+      case StageLoader.assemble_continuation(stages, turn_number, max_turns, comments, Map.get(issue, :identifier), values) do
         nil -> default_continuation_prompt(issue, turn_number, max_turns, comments)
         prompt -> prompt
       end
@@ -250,9 +280,12 @@ defmodule SymphonyElixir.PromptBuilder do
   already done.
   """
   @spec build_retask_prompt(map(), [String.t()], [String.t()], keyword()) :: String.t()
-  def build_retask_prompt(issue, missing_phases, completed_phases, _opts \\ []) do
+  def build_retask_prompt(issue, missing_phases, completed_phases, opts \\ []) do
     stages_dir = Workflow.stages_directory()
     stages = StageLoader.load_stages(stages_dir)
+    # Phase text and the preamble's sections carry `{{ slot.directory }}` and the like, so
+    # both render like a single-phase prompt does; raw, the agent would read the braces.
+    template_vars = template_vars(issue, opts)
 
     # Build completed phases list
     completed_list = Enum.map_join(completed_phases, "\n", &"- #{&1}")
@@ -263,7 +296,7 @@ defmodule SymphonyElixir.PromptBuilder do
         content = StageLoader.phase_content(stages, phase)
 
         if content do
-          "### #{phase} (INCOMPLETE)\n\n#{content}"
+          "### #{phase} (INCOMPLETE)\n\n#{render_solid(content, template_vars)}"
         else
           "### #{phase} (INCOMPLETE)\n\nComplete the #{phase} phase."
         end
@@ -282,7 +315,7 @@ defmodule SymphonyElixir.PromptBuilder do
       |> String.replace("{{missing_phases_content}}", missing_content)
 
     # Prepend essential context (slot info, env vars) from preamble if available
-    preamble_context = extract_preamble_context(stages)
+    preamble_context = stages |> extract_preamble_context() |> render_solid(template_vars)
 
     if preamble_context != "" do
       preamble_context <> "\n\n---\n\n" <> prompt
@@ -324,7 +357,14 @@ defmodule SymphonyElixir.PromptBuilder do
         # Skip everything else (scope, issue context, continuation) because those contain
         # unrendered Solid template variables and instructions that conflict with retask
         # (e.g. "if PR exists, stop immediately").
-        sections = extract_sections(preamble, ["## CRITICAL: Working Directory", "## Environment Notes", "## Guardrails"])
+        sections =
+          extract_sections(preamble, [
+            "## CRITICAL: Working Directory",
+            "## Harness scripts",
+            "## Environment Notes",
+            "## Guardrails"
+          ])
+
         sections |> Enum.join("\n\n") |> String.trim()
     end
   end

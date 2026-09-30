@@ -98,20 +98,12 @@ Do not look for additional work, do not tackle related issues, do not expand sco
 
 Your current directory is a Symphony scratch workspace — do NOT work here.
 
-Read the file `.symphony_slot` in this directory to find your assigned isolated workspace:
+Symphony read your slot from `.symphony_slot` for you. Do not read that file again.
 
-```
-cat .symphony_slot
-```
+- **Working directory**: `{{ slot.directory | default: "MISSING" }}`. Start every command with `cd {{ slot.directory }} && `.
+- **App**: `http://127.0.0.1:{{ slot.phoenix_port | default: "MISSING" }}` when the backend runs.
 
-It contains `DIRECTORY=<path>` — that is your working directory. `cd` there immediately and do ALL work from that directory. It is a pre-built clone with deps compiled, database seeded, and backend+frontend running.
-
-Source the slot info for port numbers:
-```bash
-source .symphony_slot
-echo "Backend: http://localhost:$PHOENIX_PORT"
-echo "Frontend: http://localhost:$FRONTEND_PORT"
-```
+If a value above says MISSING, emit `SYMPHONY_NEEDS_HELP: the run has no slot marker` and stop.
 
 ## Issue Context
 
@@ -158,12 +150,10 @@ Execute these phases in order. Do not skip phases.
 
 1. Write a concise implementation plan: what files to change, what to add, what to remove.
 2. Identify risks and edge cases.
-3. Post your investigation findings and plan as a comment on the Linear issue:
+3. Write your investigation findings and plan to a file, and post it on the Linear issue
+   through `bin/linear`, never `curl`:
    ```bash
-   curl -s -X POST https://api.linear.app/graphql \
-     -H "Authorization: $LINEAR_API_KEY_AUTOMATION" \
-     -H "Content-Type: application/json" \
-     -d '{"query": "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", "variables": {"id": "{{ issue.id }}", "body": "YOUR_COMMENT"}}'
+   {{ tools.linear }} comment {{ issue.identifier }} --body-file /tmp/plan-{{ issue.identifier }}.md
    ```
 
 ### Phase 3: Implement
@@ -182,58 +172,43 @@ The branch `{{ issue.branch_name }}` is already checked out in your working dire
 2. **Static analysis**: `direnv exec . mix check`
 3. **Unit tests**: `direnv exec . mix test` (full suite). All new and existing tests must pass. If any fail, fix the code or tests before proceeding.
 4. **Browser testing**: Verify the fix works in a real browser:
-   - Backend and frontend are already running on the ports from `.symphony_slot`
+   - Start the backend with `slot-app` (Environment Notes). It serves every page on port `{{ slot.phoenix_port }}`
    - Log in with `$(whoami)+dispatcher@gearflow.com` / `Test1234!`
    - Smoke test: navigate to `/tickets`, `/equipment`, `/mobilizations`, `/maintenance` — confirm they load
    - Take a screenshot of at least the Equipment page as baseline evidence
    - If the change is user-facing: navigate to affected pages, exercise the flow, take screenshots at key steps
    - If role restrictions are involved, test with the appropriate role accounts (requester, manager, etc.)
-   - Save each screenshot to a file in this scratch workspace directory
+   - Save each screenshot under `/tmp` (for example `/tmp/equipment.png`): `bin/linear` reads a relative `--image` path from the directory it runs in
 
 ### Phase 5: Share Evidence
 
-Post test results — including screenshots — to the Linear issue:
+Post test results — including screenshots — to the Linear issue. Write the summary to a
+file, and give one `--image` per screenshot. `bin/linear` uploads each file to Linear and
+embeds it at the end of the comment, so you never write an image URL by hand:
 
-1. **Upload screenshots to Linear** using the helper script:
-   ```bash
-   ASSET_URL=$("${SYMPHONY_SCRIPTS}linear-upload-image.sh" screenshot.png)
-   ```
-   This prints the permanent asset URL. Use it in comments as `![description](ASSET_URL)`.
-   **IMPORTANT**: Only use the URL printed by this script. Do NOT use any signed or temporary URLs.
-
-2. **Post a comment** with test summary and embedded screenshot images:
-   ```bash
-   curl -s -X POST https://api.linear.app/graphql \
-     -H "Authorization: $LINEAR_API_KEY_AUTOMATION" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "query": "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }",
-       "variables": {"id": "{{ issue.id }}", "body": "## Test Results\n\nSummary of what was tested.\n\n![Screenshot description]('"$ASSET_URL"')"}
-     }'
-   ```
+```bash
+{{ tools.linear }} comment {{ issue.identifier }} --body-file /tmp/results-{{ issue.identifier }}.md \
+  --image /tmp/equipment.png --alt "Equipment page"   # absolute path, one --image per screenshot
+```
 
 ### Phase 6: Ship
 
 1. Commit all changes with a clear message: `{{ issue.identifier }}: <summary>`
-2. Fetch and rebase before pushing — ALWAYS:
+2. Push and open the PR in ONE call, ready, never a draft:
    ```bash
-   git fetch origin main
-   git rebase origin/main
+   cd {{ slot.directory }} && {{ tools.pr }} ship {{ issue.identifier }} --no-verify \
+     --title "{{ issue.identifier }}: <title>" --body-file /tmp/pr-{{ issue.identifier }}.md
    ```
-   If there are conflicts, resolve them before continuing.
-3. Push the branch and open the PR in the SAME step, ready, never a draft (only if
-   one doesn't already exist):
-   ```bash
-   git push -u origin {{ issue.branch_name }}
-   gh pr view --json number >/dev/null 2>&1 || \
-     gh pr create --title "{{ issue.identifier }}: <title>" --body "<description>\n\nLinear: {{ issue.identifier }}"
-   ```
+   `pr ship` takes in origin's commits on the branch, merges `origin/main`, pushes without a
+   force-push, opens the PR with `--head` set when none is open, and attaches it to the
+   Linear issue. A bare `gh pr create` in a slot fails with "you must first push the
+   current branch" (GEA-10773).
    A push without a PR is an unfinished step: whoever judges this work judges a pull
    request, never a bare branch. Symphony used to hold every PR a draft because a
    ready PR trips the "PR opened -> In Review" automation and pulls CodeRabbit onto
    half-finished work; that is what the rest of the agent pool already lives with,
    and completeness is decided by the grader and the hand-off instead.
-4. Post the PR link as a comment on the Linear issue.
+3. `pr ship` attaches the PR to the Linear issue, so post no separate link comment.
 
 ### Phase 7: Done
 
@@ -244,9 +219,11 @@ status yourself. Your finish line above says who merges; it is never you.
 ## Environment Notes
 
 - Use `direnv exec .` prefix for ALL mix/npm commands in the working directory.
-- Backend and frontend are already running — do NOT start them yourself.
+- The backend is NOT started for you. Start it with `{{ tools.slot_app }} --slot {{ slot.directory }} up`,
+  wait with `{{ tools.slot_app }} --slot {{ slot.directory }} wait --timeout 300`, and stop it with
+  `{{ tools.slot_app }} --slot {{ slot.directory }} down` when you are done.
 - The `.env` file in the working directory has all credentials.
-- `$LINEAR_API_KEY_AUTOMATION` is available in the environment for Linear API calls.
+- Every Linear read and write goes through `{{ tools.linear }}`, which reads `$LINEAR_API_KEY`.
 
 {% if attempt %}
 ## Continuation
@@ -257,9 +234,9 @@ Do not restart from scratch.
 
 If a PR already exists for this issue, run this checklist:
 
-1. **Merge conflicts**: Run `git fetch origin main && git rebase origin/main`. If there are conflicts, resolve them, then `git push --force-with-lease`.
-2. **CI failures**: Check with `gh pr checks <number>`. If any fail, fix the code and push.
-3. **Code review comments**: Check with `gh pr view <number> --comments` and `gh api repos/{owner}/{repo}/pulls/{number}/reviews`. Triage and address actionable feedback, then push.
+1. **State**: Run `cd {{ slot.directory }} && {{ tools.pr }} status`. Its first line is the verdict, and it lists failed checks with their log tails, the CodeRabbit state and the open threads.
+2. **Merge conflicts or CI failures**: Fix them, commit, and push with `cd {{ slot.directory }} && {{ tools.pr }} push --no-verify`. It merges `origin/main` in and never force-pushes.
+3. **Code review comments**: Triage and address the actionable threads `pr status` lists, then push the same way.
 4. **Incomplete testing**: If issue comments indicate testing gaps, go back to Phase 4 (Test).
 5. **All clear**: If CI is green, no conflicts, and reviews are addressed, push and stop.
    Do NOT decide the issue is "done" and do NOT run `gh pr ready` — the grader decides

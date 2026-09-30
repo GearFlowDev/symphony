@@ -53,6 +53,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts) do
+    opts = Keyword.put_new_lazy(opts, :slot, fn -> Workspace.slot_info(workspace) end)
     max_turns = Keyword.get(opts, :max_turns, Config.agent_max_turns())
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 

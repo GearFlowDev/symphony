@@ -2,18 +2,18 @@
 
 ### Check CI status
 
-First, check if CI passed on the PR:
+First, read the PR's state in one call:
 
 ```bash
-PR_NUM=$(gh pr list --head "$(git branch --show-current)" --json number --jq '.[0].number')
-gh pr checks $PR_NUM
+cd {{ slot.directory }} && {{ tools.pr }} status
 ```
 
-If any checks failed:
-1. Read the failure details: `gh pr checks $PR_NUM --json name,state --jq '.[] | select(.state != "SUCCESS")'`
+The first line is the verdict. `FAILING` lists each failed check with the tail of its
+log. If a check failed:
+1. Read the failure in that output. For more of a log, run `gh run view --job <job-id> --log-failed` with the job id that `pr status --json` gives.
 2. Fix the issue locally
 3. Run `direnv exec . mix check` to verify
-4. Commit and push the fix
+4. Commit, then push: `cd {{ slot.directory }} && {{ tools.pr }} push --no-verify --base {{ slot.base_branch }}`
 
 Do not proceed with simplification until CI is green.
 
@@ -30,7 +30,7 @@ If the PR changed backend business logic without tests, add them before simplify
 ### Review the diff for simplification
 
 ```bash
-git diff origin/main --stat
+cd {{ slot.directory }} && git diff origin/{{ slot.base_branch }} --stat
 ```
 
 Then read specific files that look like they need simplification — do NOT dump the entire diff.
@@ -59,7 +59,8 @@ After any changes: `direnv exec . mix test && direnv exec . mix check`
 
 If you made changes:
 ```bash
-git add -A && git commit -m "{{ issue.identifier }}: simplify and address review feedback" && git push --no-verify
+cd {{ slot.directory }} && git add -A && git commit -m "{{ issue.identifier }}: simplify and address review feedback" && \
+  {{ tools.pr }} push --no-verify --base {{ slot.base_branch }}
 ```
 
 ### Close out the Linear issue
@@ -75,8 +76,7 @@ Post a wrap-up comment on the **Linear issue** (NOT GitHub) with exactly these t
 Write it to a file and post it through `bin/linear`, never `curl`:
 
 ```bash
-LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
-"$LINEAR" comment {{ issue.identifier }} --body-file /tmp/wrapup-{{ issue.identifier }}.md
+{{ tools.linear }} comment {{ issue.identifier }} --body-file /tmp/wrapup-{{ issue.identifier }}.md
 ```
 
 ### Done

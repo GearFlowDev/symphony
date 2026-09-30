@@ -72,10 +72,19 @@ defmodule SymphonyElixir.Workflow.StageLoader do
   THE ISSUE'S IDENTIFIER IS SUBSTITUTED TOO. The template names it in its commit
   message and in its `bin/linear comments` step; left raw, the agent ran
   `bin/linear comments {{` and the step failed (GEA-10619 judge, 2026-09-28).
+
+  So are the slot and the script paths: `values` maps a group (`"slot"`, `"tools"`) to its
+  keys, and `{{ slot.directory }}` takes `values["slot"]["directory"]` (GEA-10769).
   """
-  @spec assemble_continuation(%{String.t() => String.t()}, pos_integer(), pos_integer(), [map()], String.t() | nil) ::
-          String.t() | nil
-  def assemble_continuation(stages, turn_number, max_turns, comments, identifier \\ nil) do
+  @spec assemble_continuation(
+          %{String.t() => String.t()},
+          pos_integer(),
+          pos_integer(),
+          [map()],
+          String.t() | nil,
+          %{String.t() => %{String.t() => String.t() | nil}}
+        ) :: String.t() | nil
+  def assemble_continuation(stages, turn_number, max_turns, comments, identifier \\ nil, values \\ %{}) do
     case Map.get(stages, "_continuation.md") do
       nil ->
         nil
@@ -84,9 +93,29 @@ defmodule SymphonyElixir.Workflow.StageLoader do
         template
         |> String.replace("{{turn_number}}", to_string(turn_number))
         |> String.replace("{{max_turns}}", to_string(max_turns))
-        |> String.replace("{{comments_section}}", format_comments(comments))
+        |> replace_values(values)
         |> replace_identifier(identifier)
+        |> String.replace("{{comments_section}}", format_comments(comments))
     end
+  end
+
+  # THE SLOT AND THE SCRIPT PATHS, BY PLAIN SUBSTITUTION (GEA-10769). This template is not
+  # rendered through Solid, because a person's comment is spliced into it and a `{{` in that
+  # comment must stay text. So each `{{ group.key }}` it names is replaced here, and the
+  # comments go in last, after every substitution, so no comment text is ever substituted.
+  # The values come from `Workspace.slot_info/1` and `PromptBuilder.tools_map/0`, which
+  # already fence them to path, port and ref characters. A nil value leaves its placeholder
+  # raw, so a command that needs it fails loudly instead of running with an empty argument.
+  defp replace_values(text, values) do
+    Enum.reduce(values, text, fn {group, map}, acc ->
+      Enum.reduce(map, acc, fn
+        {key, value}, inner when is_binary(value) ->
+          String.replace(inner, ["{{ #{group}.#{key} }}", "{{#{group}.#{key}}}"], value)
+
+        _, inner ->
+          inner
+      end)
+    end)
   end
 
   # ONLY A LINEAR-SHAPED IDENTIFIER GOES IN. The template puts it into a shell command

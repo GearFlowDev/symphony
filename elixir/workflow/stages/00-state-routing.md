@@ -2,8 +2,8 @@
 
 Before doing anything:
 
-1. `cd` to your working directory (from `.symphony_slot`)
-2. Update and rebase with main:
+1. Work in `{{ slot.directory }}`: start every command with `cd {{ slot.directory }} && `
+2. Update main:
    ```bash
    git fetch origin main
    git checkout main

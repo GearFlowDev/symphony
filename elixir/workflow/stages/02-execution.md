@@ -14,14 +14,14 @@ The orchestrator runs an external Grader after this dispatch completes. Whatever
 
 ### Step 1: Set up
 
-1. `cd` to your working directory (from `.symphony_slot`).
-2. Source the slot: `source .symphony_slot`. Use `$BASE_BRANCH` (defaults to `main` if unset) as the rebase target.
-3. Fetch and check out the issue branch:
+1. Work in `{{ slot.directory }}`. Start every command with `cd {{ slot.directory }} && `.
+2. Check out the issue branch and bring in the base branch:
    ```bash
-   git fetch origin
-   git checkout {{ issue.branch_name }} 2>/dev/null || git checkout -b {{ issue.branch_name }} "origin/${BASE_BRANCH:-main}"
-   git rebase "origin/${BASE_BRANCH:-main}"
+   cd {{ slot.directory }} && git fetch -q origin {{ slot.base_branch }} && \
+     { git checkout {{ issue.branch_name }} 2>/dev/null || git checkout -b {{ issue.branch_name }} origin/{{ slot.base_branch }}; } && \
+     git merge -q --no-edit origin/{{ slot.base_branch }}
    ```
+3. Read `git status` and `git log` there: an earlier dispatch of this issue may have left commits or edits in the slot.
 4. Read `CLAUDE.md` (or `AGENTS.md`) in the working directory for project conventions. If the issue body or any in-repo doc points to a process directory (e.g. `docs/<area>/`), skim every file there — those rules supersede generic guidance.
 
 ### Step 2: Close each assigned row
@@ -48,7 +48,7 @@ If a row's test passes but a sibling row breaks, fix the regression before movin
 For every function whose signature or return you changed, and every schema field or table you added, grep the repo for its other callers/readers:
 
 ```bash
-git diff origin/${BASE_BRANCH:-main}..HEAD | grep -E '^[+-].*\b(def|defp|field :)' # what you changed
+git diff origin/{{ slot.base_branch }}..HEAD | grep -E '^[+-].*\b(def|defp|field :)' # what you changed
 grep -rn '\bthe_changed_name\b' lib/                                              # who else uses it
 ```
 
@@ -60,50 +60,23 @@ Any call site that still uses the old contract is an unfinished row — update i
 work — a person or the harness — judges a pull request, never a bare branch. So the push
 and the PR are one step and you do not end your turn between them.
 
-After all assigned rows have a passing test and a commit:
+After all assigned rows have a passing test and a commit, write the PR body to a file and ship:
 
-1. Record origin's tip of the issue branch, take in any commits it has that the slot lacks,
-   then rebase onto the latest base:
-   ```bash
-   b="$(git branch --show-current)"
-   # origin's tip BEFORE you rewrite anything, fetched with its objects (the slot fetches
-   # main only). No branch on origin, or no answer, leaves it empty: the lease then refuses
-   # to overwrite anything.
-   seen=""
-   if git fetch origin "refs/heads/$b" 2>/dev/null; then
-     seen=$(git rev-parse FETCH_HEAD)
-     git merge-base --is-ancestor "$seen" HEAD || git rebase "$seen"   # take in commits you lack
-   fi
-   git fetch origin "${BASE_BRANCH:-main}"
-   git rebase "origin/${BASE_BRANCH:-main}"
-   ```
-2. Push, with `--no-verify`:
-   ```bash
-   git push --no-verify -u origin {{ issue.branch_name }}
-   ```
-   `--no-verify` is deliberate (GEA-10495). A product slot's pre-push hook runs `mix`
-   outside direnv, so a bare `git push` dies with `mix: not found`, and GEA-10455's run
-   ended with its commit never pushed. You ran `mix check` in Step 2; CI is the gate for
-   the pushed branch.
+```bash
+cd {{ slot.directory }} && {{ tools.pr }} ship {{ issue.identifier }} --no-verify --base {{ slot.base_branch }} \
+  --title "{{ issue.identifier }}: <title>" --body-file /tmp/pr-{{ issue.identifier }}.md
+```
 
-   If the push fails non-fast-forward (the rebase rewrote commits origin already has), force
-   it against the tip you recorded in step 1. The slot fetches `main` only, so a bare
-   `--force-with-lease` has no remote-tracking ref to compare and is rejected as stale; and a
-   tip read now, after the rebase, would accept whatever another worker pushed meanwhile:
-   ```bash
-   git push --no-verify --force-with-lease="refs/heads/$b:$seen" origin "$b"
-   ```
-   A rejection here means origin moved after step 1. Repeat step 1, then push again.
-   **If the push still fails, do not end your turn with the commit unpushed.** Emit
-   `SYMPHONY_NEEDS_HELP` with git's error text. The orchestrator also pushes graded rows
-   itself before the Test phase and parks the issue when that push fails, but your error
-   text is the first thing a person needs.
-3. Open the PR if this issue has none, **ready, never a draft**:
-   ```bash
-   gh pr list --head {{ issue.branch_name }} --state open --json url --jq '.[0].url'   # already open?
-   gh pr create --base "${BASE_BRANCH:-main}" --title "{{ issue.identifier }}: <title>" --body "Linear: {{ issue.identifier }}"
-   ```
-   The PR description doesn't need a Contract or audit block — the orchestrator manages that on Linear.
+`pr ship` does the whole step in one call, and either finishes or says what stopped it:
+
+1. It checks that the branch is the issue's Linear branch.
+2. It pushes: it takes in any commits origin has on the branch that the slot lacks, merges `origin/{{ slot.base_branch }}`, and pushes. It never force-pushes. `--no-verify` is deliberate (GEA-10495): a product slot's pre-push hook runs `mix` outside direnv and dies with `mix: not found`. You ran `mix check` in Step 2, and CI is the gate for the pushed branch.
+3. It opens the PR **ready, never a draft**, when none is open, with `--head` set. A bare `gh pr create` in a slot fails with "you must first push the current branch" (GEA-10773), so never open the PR by hand.
+4. It attaches the PR to the Linear issue, and prints `<repo>#<n> <url>` last.
+
+`--title` and `--body-file` are used only when no PR is open; a re-run reuses the open PR. The body needs no Contract or audit block: the orchestrator manages that on Linear.
+
+If `pr ship` stops on a merge conflict, resolve the files it names, `git commit`, and run it again. **If it still fails, do not end your turn with the commit unpushed.** Emit `SYMPHONY_NEEDS_HELP` with its error text. The orchestrator also pushes graded rows itself before the Test phase and parks the issue when that push fails, but your error text is the first thing a person needs.
 
 Symphony used to hold every PR a draft until the plan graded complete, because a ready PR
 trips the "PR opened -> In Review" automation and pulls CodeRabbit onto half-finished work.

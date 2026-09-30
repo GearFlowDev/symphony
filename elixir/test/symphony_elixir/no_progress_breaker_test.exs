@@ -6,6 +6,7 @@ defmodule SymphonyElixir.NoProgressBreakerTest do
   use SymphonyElixir.TestSupport
   @moduletag :planning
 
+  alias SymphonyElixir.Config
   alias SymphonyElixir.History
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Planning
@@ -105,5 +106,101 @@ defmodule SymphonyElixir.NoProgressBreakerTest do
 
     assert message =~ "the tester was dispatched and recorded no new verdict"
     refute message =~ "not converging"
+  end
+
+  # GEA-10753: GEA-10457's two Resolve Review runs died with `:not_found` before
+  # their first turn, and each one counted as a cycle. The breaker parked a green,
+  # clean PR two minutes later.
+  describe "a run that crashed before its first turn" do
+    defp crash_a_run(identifier) do
+      {:ok, run} =
+        History.record_dispatch(%{
+          issue_id: "issue-uuid-#{identifier}",
+          issue_identifier: identifier,
+          issue_title: "Fix the thing",
+          started_at: DateTime.utc_now(),
+          agent_backend: "claude",
+          filter_source: "filter"
+        })
+
+      {:ok, _} = History.record_completion(run, %{finished_at: DateTime.utc_now(), outcome: "failed", turns_used: 0})
+    end
+
+    defp decide_after_crash(identifier, phase) do
+      crash_a_run(identifier)
+      Orchestrator.no_progress_check_for_test(%{identifier: identifier}, {:dispatch, %{retask_phases: [phase]}})
+    end
+
+    test "does not count toward the breaker" do
+      all_done_plan("SYM-CRASH")
+
+      assert {:dispatch, _} = decide("SYM-CRASH", "Resolve Review")
+      assert {:dispatch, _} = decide_after_crash("SYM-CRASH", "Resolve Review")
+      assert {:dispatch, _} = decide_after_crash("SYM-CRASH", "Resolve Review")
+      assert {:dispatch, _} = decide("SYM-CRASH", "Resolve Review")
+    end
+
+    test "is the only failed run the breaker skips" do
+      crash_a_run("SYM-CRASH-COUNT")
+      assert History.finished_run_count("SYM-CRASH-COUNT") == 0
+
+      {:ok, run} =
+        History.record_dispatch(%{
+          issue_id: "issue-uuid-SYM-CRASH-COUNT",
+          issue_identifier: "SYM-CRASH-COUNT",
+          issue_title: "Fix the thing",
+          started_at: DateTime.utc_now(),
+          agent_backend: "claude",
+          filter_source: "filter"
+        })
+
+      {:ok, _} = History.record_completion(run, %{finished_at: DateTime.utc_now(), outcome: "failed", turns_used: 3})
+      assert History.finished_run_count("SYM-CRASH-COUNT") == 1
+
+      finish_a_run("SYM-CRASH-COUNT")
+      assert History.finished_run_count("SYM-CRASH-COUNT") == 2
+    end
+  end
+
+  # GEA-10753: GEA-10458's tester approved on the day's twelfth run, and the
+  # budget, checked before the decision, parked the finished issue with no hand-off.
+  describe "the daily dispatch budget" do
+    defp spend_the_budget(identifier) do
+      for _ <- 1..Config.max_dispatches_per_issue_per_day() do
+        {:ok, run} =
+          History.record_dispatch(%{
+            issue_id: "issue-uuid-#{identifier}",
+            issue_identifier: identifier,
+            issue_title: "Fix the thing",
+            started_at: DateTime.utc_now(),
+            agent_backend: "claude",
+            filter_source: "filter"
+          })
+
+        {:ok, _} =
+          History.record_completion(run, %{
+            finished_at: DateTime.utc_now(),
+            outcome: "completed",
+            session_id: "thread-#{run.id}",
+            turns_used: 2
+          })
+      end
+    end
+
+    test "never blocks a finished issue" do
+      spend_the_budget("SYM-BUDGET-DONE")
+
+      assert :done = Orchestrator.guard_decision_for_test(%{identifier: "SYM-BUDGET-DONE"}, :done)
+    end
+
+    test "still blocks one more dispatch" do
+      spend_the_budget("SYM-BUDGET-MORE")
+
+      assert {:blocked, {:dispatch_budget_exhausted, _}} =
+               Orchestrator.guard_decision_for_test(
+                 %{identifier: "SYM-BUDGET-MORE"},
+                 {:dispatch, %{retask_phases: ["Implement"]}}
+               )
+    end
   end
 end

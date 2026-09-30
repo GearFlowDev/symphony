@@ -73,6 +73,12 @@ defmodule SymphonyElixir.History do
   have progressed, and counting them let a slot-starved retry loop append the
   same fingerprint three times and self-trip the breaker (GEA-4623,
   2026-07-15 20:14Z).
+
+  Also excludes a run that crashed before its first turn: zero turns and an
+  outcome other than `completed`. No agent turn ran, so nothing could have
+  progressed either. Two Resolve Review runs that died with `:not_found` at
+  19:33Z and 19:36Z tripped the breaker on GEA-10457 at 19:38Z, and a green,
+  clean PR waited for a person to hand it off (2026-09-29, GEA-10753).
   """
   @spec finished_run_count(String.t()) :: non_neg_integer()
   def finished_run_count(issue_identifier) when is_binary(issue_identifier) do
@@ -80,6 +86,7 @@ defmodule SymphonyElixir.History do
     |> where([r], r.issue_identifier == ^issue_identifier)
     |> where([r], not is_nil(r.finished_at))
     |> where([r], is_nil(r.outcome) or r.outcome not in ["no_capacity", "orphaned"])
+    |> where([r], not (coalesce(r.turns_used, 0) == 0 and coalesce(r.outcome, "") != "completed"))
     |> select([r], count(r.id))
     |> Repo.one()
   end

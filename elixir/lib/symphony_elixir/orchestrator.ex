@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
+  alias SymphonyElixir.CiRecovery
   alias SymphonyElixir.Claude.{StreamParser, TmuxCLI}
   alias SymphonyElixir.{Config, Evaluator, Grant, History, Notifier, Planning}
   alias SymphonyElixir.Linear.{Client, Issue}
@@ -1275,6 +1276,12 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:blocked, reason} ->
         block_issue_for_plan_failure(state, issue, reason)
+
+      {:wait, reason} ->
+        # Something outside the worker is moving (a CI re-run, a merge of main). Nothing
+        # to dispatch; the next poll decides again, as after a transient plan failure.
+        Logger.info("Waiting on #{issue_context(issue)}: #{reason}")
+        complete_issue(state, issue.id)
     end
   end
 
@@ -1666,7 +1673,8 @@ defmodule SymphonyElixir.Orchestrator do
   #         dispatch an Implement row-closer to fix CI / address the review.
   #   * Plan generation failed → block the issue and notify a human.
   #
-  # Returns {:dispatch, metadata} | :done | {:blocked, reason}.
+  # Returns {:dispatch, metadata} | :done | {:blocked, reason} | {:wait, reason}.
+  # {:wait, _} is a red CI run Symphony is recovering without a worker (GEA-10757).
   #
   # Two guards wrap the decision (GEA-4625/4621 churn, 2026-07-15: 50 and 42
   # dispatches against already-green PRs). Both escalate to a human via the
@@ -2019,7 +2027,7 @@ defmodule SymphonyElixir.Orchestrator do
     # blocked on dead infra used to park the issue with CI failures and
     # CodeRabbit comments left unaddressed). :done still requires both —
     # the tester gate runs once the PR is externally clean.
-    case external_ship_gate(metadata[:existing_pr_url]) do
+    case external_ship_gate(issue, plan, metadata[:existing_pr_url]) do
       {:conflicts, reason} ->
         # Main moved under the PR. Same shape as Resolve Review:
         # rows stay done, the worker only rebases, resolves, and pushes.
@@ -2033,6 +2041,11 @@ defmodule SymphonyElixir.Orchestrator do
         # failing check names and never learns what broke.
         Logger.info("CI is red for #{issue.identifier}; dispatching Fix CI: #{reason}")
         reopen_and_dispatch(issue, metadata, plan, reason, "Fix CI")
+
+      {:ci_wait, reason} ->
+        # CI is red for a reason the diff did not cause, and a re-run or a merge of
+        # main is under way instead of a Fix CI worker (GEA-10757).
+        {:wait, reason}
 
       {:request_changes, reason} ->
         # A reviewer (CodeRabbit or human) requested changes. Dispatch the
@@ -2241,9 +2254,9 @@ defmodule SymphonyElixir.Orchestrator do
   # continuation cap bounds any retry. PENDING checks are not treated as a
   # failure (only explicit failure states are) — the tester runs far longer than
   # CI, so checks are effectively always resolved by the time the gate runs.
-  defp external_ship_gate(pr_url) do
+  defp external_ship_gate(issue, plan, pr_url) do
     with :ok <- merge_gate(pr_url),
-         :ok <- ci_gate(pr_url) do
+         :ok <- ci_gate(issue, plan, pr_url) do
       review_gate(pr_url)
     end
   end
@@ -2261,14 +2274,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   @gh_timeout_ms 30_000
 
-  defp ci_gate(pr_url) do
+  # A red check goes to Fix CI only when the diff caused it. Anything else — a flaky
+  # test in an untouched file, a runner that died at setup, a check main has since
+  # fixed — is re-run or gets main merged in first, and the issue waits on that
+  # (GEA-10757). CiRecovery decides; this records what it did.
+  defp ci_gate(issue, plan, pr_url) do
     case pr_ref(pr_url) do
       {repo, number} ->
-        {output, _status} = gh_cmd(["pr", "checks", number, "--repo", repo, "--json", "name,state"])
+        {output, _status} = gh_cmd(["pr", "checks", number, "--repo", repo, "--json", "name,state,link"])
 
         case failed_checks(output) do
           [] -> :ok
-          names -> {:ci, "CI checks failing: #{Enum.join(names, ", ")}"}
+          failing -> recover_ci(issue, plan, pr_url, {repo, number}, failing)
         end
 
       :error ->
@@ -2276,6 +2293,98 @@ defmodule SymphonyElixir.Orchestrator do
     end
   rescue
     _ -> :ok
+  end
+
+  defp recover_ci(issue, plan, pr_url, pr, failing) do
+    head = full_head_sha(pr)
+    recoveries = get_in(plan.metadata || %{}, ["ci_recoveries"]) || []
+
+    # An unreadable head cannot key a recovery record, so it gets the old answer.
+    decision =
+      if head == "?",
+        do: {:fix_ci, "CI checks failing: #{Enum.map_join(failing, ", ", &Map.get(&1, "name", "check"))}"},
+        else: CiRecovery.decide(pr, head, failing, recoveries, &gh_cmd/1)
+
+    case decision do
+      {:fix_ci, reason} ->
+        {:ci, reason}
+
+      {:wait, reason} ->
+        {:ci_wait, reason}
+
+      {:recover, action, run_ids, reason} ->
+        run_ci_recovery(issue, plan, pr_url, pr, head, {action, run_ids, reason})
+    end
+  rescue
+    # Recovery must never hide a red build: on any crash, fall back to Fix CI.
+    error ->
+      names = Enum.map_join(failing, ", ", &Map.get(&1, "name", "check"))
+      Logger.warning("CI recovery crashed for #{issue_context(issue)}: #{Exception.message(error)}")
+      {:ci, "CI checks failing: #{names}"}
+  end
+
+  defp run_ci_recovery(issue, plan, pr_url, pr, head, {action, run_ids, reason}) do
+    case CiRecovery.act(pr, action, run_ids, &gh_cmd/1) do
+      :ok ->
+        settle_ci_recovery(issue, plan, pr_url, head, {action, run_ids, reason})
+
+      # Some runs re-run and gh refused a later one. The started runs are in flight, so
+      # they are recorded and waited on; Fix CI now would race them.
+      {:partial, out, started} ->
+        settle_ci_recovery(issue, plan, pr_url, head, {action, started, "#{reason}; gh refused the rest (#{out})"})
+
+      {:error, out} ->
+        {:ci, "CI is red and the #{action} Symphony tried failed (#{out}): #{reason}"}
+    end
+  end
+
+  # THE RECORD IS THE BOUND. The once-per-head rule and the plan's recovery budget both
+  # read it, so a recovery that cannot be recorded would repeat on every poll. When the
+  # write fails, Fix CI runs instead of a wait.
+  defp settle_ci_recovery(issue, plan, pr_url, head, {action, run_ids, reason}) do
+    case record_ci_recovery(plan, CiRecovery.record(head, action, run_ids)) do
+      :ok ->
+        Logger.info("Recovered red CI on #{issue_context(issue)} by #{action}: #{reason}")
+        post_ci_recovery_note(issue, CiRecovery.note(pr_url, action, reason, head))
+        {:ci_wait, "#{action} under way: #{reason}"}
+
+      {:error, err} ->
+        Logger.warning("CI recovery record failed for #{issue_context(issue)}: #{inspect(err)}")
+        {:ci, "CI is red; Symphony ran a #{action} but could not record it (#{inspect(err)}): #{reason}"}
+    end
+  end
+
+  defp record_ci_recovery(plan, entry) do
+    case SymphonyElixir.Repo.get(SymphonyElixir.Planning.Plan, plan.id) do
+      %SymphonyElixir.Planning.Plan{} = fresh ->
+        meta = fresh.metadata || %{}
+
+        case Planning.update_plan(fresh, %{metadata: Map.put(meta, "ci_recoveries", (meta["ci_recoveries"] || []) ++ [entry])}) do
+          {:ok, _} -> :ok
+          {:error, err} -> {:error, err}
+        end
+
+      _ ->
+        {:error, :plan_not_found}
+    end
+  end
+
+  defp post_ci_recovery_note(issue, body) do
+    Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+      case Tracker.create_comment(issue.id, body) do
+        :ok -> :ok
+        {:error, reason} -> Logger.warning("CI recovery note failed for #{issue.identifier}: #{inspect(reason)}")
+      end
+    end)
+  end
+
+  # The whole sha: a recovery record must match the head exactly, and pr_head_sha/1
+  # shortens it for the breaker's fingerprint.
+  defp full_head_sha({repo, number}) do
+    case gh_cmd(["pr", "view", number, "--repo", repo, "--json", "headRefOid", "-q", ".headRefOid"]) do
+      {output, 0} -> String.trim(output)
+      _ -> "?"
+    end
   end
 
   # System.cmd/3 has no timeout; bound the gh call with a Task so a stalled gh
@@ -2295,9 +2404,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp failed_checks(output) do
     case Jason.decode(output) do
       {:ok, checks} when is_list(checks) ->
-        checks
-        |> Enum.filter(fn c -> Map.get(c, "state") in @failing_check_states end)
-        |> Enum.map(fn c -> Map.get(c, "name", "check") end)
+        Enum.filter(checks, fn c -> Map.get(c, "state") in @failing_check_states end)
 
       _ ->
         []

@@ -417,37 +417,40 @@ defmodule SymphonyElixir.Claude.AgentRunner do
   end
 
   defp count_git_changes(dir) do
-    case System.cmd("git", ["diff", "--stat", "HEAD"], cd: dir, stderr_to_stdout: true) do
-      {output, 0} ->
-        output |> String.split("\n", trim: true) |> length()
-
-      _ ->
-        0
+    case git(dir, ["diff", "--stat", "HEAD"]) do
+      {:ok, output} -> output |> String.split("\n", trim: true) |> length()
+      :error -> 0
     end
   end
 
   defp count_new_commits(_dir, last_head, head) when is_nil(last_head) or is_nil(head) or last_head == head, do: 0
 
   defp count_new_commits(dir, last_head, head) do
-    case System.cmd("git", ["rev-list", "--count", "#{last_head}..#{head}"], cd: dir, stderr_to_stdout: true) do
-      {output, 0} ->
-        case Integer.parse(String.trim(output)) do
-          {count, _} -> count
-          :error -> 0
-        end
-
-      _ ->
-        0
+    with {:ok, output} <- git(dir, ["rev-list", "--count", "#{last_head}..#{head}"]),
+         {count, _} <- Integer.parse(String.trim(output)) do
+      count
+    else
+      _ -> 0
     end
   end
 
   defp git_head(dir) do
-    case System.cmd("git", ["rev-parse", "--verify", "--quiet", "HEAD"], cd: dir, stderr_to_stdout: true) do
-      {output, 0} -> String.trim(output)
-      _ -> nil
+    case git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"]) do
+      {:ok, output} -> String.trim(output)
+      :error -> nil
+    end
+  end
+
+  # A git read of the slot, which the harness may remove mid-run. On OTP 28 a
+  # gone `cd:` directory exits non-zero, but `System.cmd/3` may raise on a spawn
+  # failure, so rescue too: a missing slot reads as no progress, never as a
+  # crashed turn loop.
+  defp git(dir, args) do
+    case System.cmd("git", args, cd: dir, stderr_to_stdout: true) do
+      {output, 0} -> {:ok, output}
+      _ -> :error
     end
   rescue
-    # cd: raises when the directory is gone (a released or missing slot).
-    _ in [ErlangError, File.Error] -> nil
+    _ in [ErlangError, File.Error] -> :error
   end
 end

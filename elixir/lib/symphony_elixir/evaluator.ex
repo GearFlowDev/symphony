@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Evaluator do
 
   alias SymphonyElixir.History
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Workspace
 
   # The branch a Symphony PR targets. The rest of this module already reads
   # `origin/main` for its diff and commit checks; a repo whose trunk is not `main`
@@ -50,7 +51,7 @@ defmodule SymphonyElixir.Evaluator do
     branch = run_context[:branch_name] || run_context[:identifier]
 
     # Resolve actual working directory from pool slot if present
-    workspace_path = resolve_workspace_path(workspace_path)
+    workspace_path = Workspace.working_dir(workspace_path)
 
     # Try the actual git branch first, then fall back to Linear branch name and identifier
     pr_result =
@@ -168,7 +169,7 @@ defmodule SymphonyElixir.Evaluator do
           String.t() | nil
   def ensure_pr_open(workspace_path, branch, title, body)
       when is_binary(title) and is_binary(body) do
-    ws = resolve_workspace_path(workspace_path)
+    ws = Workspace.working_dir(workspace_path)
 
     # The issue's branch as given — `gh pr list --head <branch>` matches the PR's
     # head whatever the local checkout is on, so this works even when the slot tree
@@ -219,7 +220,7 @@ defmodule SymphonyElixir.Evaluator do
   """
   @spec ensure_pushed(String.t() | nil, String.t() | nil) :: :ok | {:ok, :pushed} | {:error, String.t()}
   def ensure_pushed(workspace_path, branch) when is_binary(workspace_path) and is_binary(branch) and branch != "" do
-    ws = resolve_workspace_path(workspace_path)
+    ws = Workspace.working_dir(workspace_path)
     ref = safe_arg(branch)
 
     with {:ok, local} <- local_head(ws, ref) do
@@ -239,7 +240,7 @@ defmodule SymphonyElixir.Evaluator do
   """
   @spec branch_pr_state(String.t() | nil, String.t() | nil) :: {:ok, String.t() | nil} | {:error, term()}
   def branch_pr_state(workspace_path, branch) when is_binary(workspace_path) and is_binary(branch) and branch != "" do
-    ws = resolve_workspace_path(workspace_path)
+    ws = Workspace.working_dir(workspace_path)
 
     with {:ok, output} <- run_in_workspace(ws, "gh pr list --head #{safe_arg(branch)} --state all --json state --limit 1"),
          {:ok, prs} when is_list(prs) <- Jason.decode(output) do
@@ -560,32 +561,6 @@ defmodule SymphonyElixir.Evaluator do
 
       _ ->
         {:error, :no_branch}
-    end
-  end
-
-  # Resolve the actual working directory. Pool-based workspaces contain a
-  # `.symphony_slot` file that points to the real git repo directory.
-  defp resolve_workspace_path(nil), do: nil
-
-  defp resolve_workspace_path(path) do
-    slot_file = Path.join(path, ".symphony_slot")
-
-    if File.exists?(slot_file) do
-      resolve_slot_directory(path, slot_file)
-    else
-      path
-    end
-  end
-
-  defp resolve_slot_directory(path, slot_file) do
-    with {:ok, content} <- File.read(slot_file),
-         [_, dir] <- Regex.run(~r/DIRECTORY=(.+)/, content),
-         resolved = String.trim(dir),
-         true <- File.dir?(resolved) do
-      Logger.info("Evaluator: resolved workspace #{path} -> #{resolved}")
-      resolved
-    else
-      _ -> path
     end
   end
 end

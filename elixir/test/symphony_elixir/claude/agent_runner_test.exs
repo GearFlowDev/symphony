@@ -38,6 +38,12 @@ defmodule SymphonyElixir.Claude.AgentRunnerTest do
     def start_link(_opts), do: {:ok, spawn(fn -> :ok end)}
 
     def wait_for_turn(_watcher, _timeout) do
+      # A test can make the "agent" do work in the turn, e.g. commit in the slot.
+      case Application.get_env(:symphony_elixir, :fake_turn_work) do
+        work when is_function(work, 0) -> work.()
+        _ -> :ok
+      end
+
       case Application.get_env(:symphony_elixir, :fake_wait_result, :ok) do
         :timeout ->
           {:error, :timeout}
@@ -75,8 +81,10 @@ defmodule SymphonyElixir.Claude.AgentRunnerTest do
   setup do
     Application.put_env(:symphony_elixir, :agent_runner_test_pid, self())
     Application.delete_env(:symphony_elixir, :fake_wait_result)
+    Application.delete_env(:symphony_elixir, :fake_turn_work)
 
     on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :fake_turn_work)
       Application.delete_env(:symphony_elixir, :agent_runner_test_pid)
       Application.delete_env(:symphony_elixir, :fake_wait_result)
       File.rm_rf(Path.join(SymphonyElixir.Config.workspace_root(), "TST-1"))
@@ -121,6 +129,36 @@ defmodule SymphonyElixir.Claude.AgentRunnerTest do
 
     assert :ok = AgentRunner.run(issue("In Progress"), nil, opts)
     assert sent_turns() == [1, 2, 3, 4, 5, 6]
+  end
+
+  # GEA-10754: the progress check ran git in the scratch workspace, which only
+  # holds `.symphony_slot`, so a worker that committed every turn still read as
+  # no progress and was stopped at turn 6. It must read the slot the marker
+  # names. The slot branch has no upstream, as a freshly provisioned one has not.
+  @tag :tmp_dir
+  test "a commit in the slot each turn counts as progress", %{tmp_dir: tmp_dir} do
+    slot = Path.join(tmp_dir, "slot")
+    File.mkdir_p!(slot)
+    git = fn args -> {_, 0} = System.cmd("git", args, cd: slot, stderr_to_stdout: true) end
+    git.(["init", "-q", "-b", "gea-1-work"])
+    git.(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"])
+
+    workspace = Path.join(SymphonyElixir.Config.workspace_root(), "TST-1")
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, ".symphony_slot"), "SLOT_NAME=slot\nDIRECTORY=#{slot}\n")
+
+    Application.put_env(:symphony_elixir, :fake_turn_work, fn ->
+      git.(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "turn"])
+    end)
+
+    opts =
+      base_opts(
+        max_turns: 10,
+        issue_state_fetcher: fn _ids -> {:ok, [issue("In Progress")]} end
+      )
+
+    assert :ok = AgentRunner.run(issue("In Progress"), nil, opts)
+    assert sent_turns() == Enum.to_list(1..10)
   end
 
   # GEA-10667: the tester is read-only, so no file changes is its normal state.

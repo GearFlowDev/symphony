@@ -278,6 +278,27 @@ defmodule SymphonyElixir.Workspace do
 
   def slot_lease_for_issue(_), do: nil
 
+  @doc """
+  The directory work happens in for a scratch workspace: the slot working copy
+  its `.symphony_slot` names on the `DIRECTORY=` line. Falls back to the
+  workspace itself when there is no marker, no such line, or no such directory.
+  The scratch workspace is never a git tree, so any git read of a run's progress
+  or diff must go through this.
+  """
+  @spec working_dir(Path.t() | nil) :: Path.t() | nil
+  def working_dir(nil), do: nil
+
+  def working_dir(workspace) do
+    with {:ok, content} <- File.read(Path.join(workspace, ".symphony_slot")),
+         [_, dir] <- Regex.run(~r/DIRECTORY=(.+)/, content),
+         resolved = String.trim(dir),
+         true <- File.dir?(resolved) do
+      resolved
+    else
+      _ -> workspace
+    end
+  end
+
   @doc "Scratch workspace path for an issue identifier (resolve the slot via `.symphony_slot`)."
   @spec scratch_path(String.t() | nil) :: Path.t() | nil
   def scratch_path(identifier) when is_binary(identifier),

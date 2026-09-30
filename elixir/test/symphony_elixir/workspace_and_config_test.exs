@@ -1294,4 +1294,29 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         false
     end
   end
+
+  # GEA-10754: the per-turn progress check and the Evaluator read git in the slot
+  # the marker names, never in the scratch workspace.
+  describe "working_dir/1" do
+    @describetag :tmp_dir
+
+    test "names the slot directory from DIRECTORY=, else the workspace itself", %{tmp_dir: tmp_dir} do
+      workspace = Path.join(tmp_dir, "GEA-1")
+      slot = Path.join(tmp_dir, "slot")
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(slot)
+
+      assert Workspace.working_dir(nil) == nil
+      assert Workspace.working_dir(workspace) == workspace
+
+      File.write!(Path.join(workspace, ".symphony_slot"), "SLOT_NAME=slot\n")
+      assert Workspace.working_dir(workspace) == workspace
+
+      File.write!(Path.join(workspace, ".symphony_slot"), "SLOT_NAME=slot\nDIRECTORY=#{Path.join(tmp_dir, "gone")}\n")
+      assert Workspace.working_dir(workspace) == workspace
+
+      File.write!(Path.join(workspace, ".symphony_slot"), "SLOT_NAME=slot\nDIRECTORY=#{slot}\nPHOENIX_PORT=4001\n")
+      assert Workspace.working_dir(workspace) == slot
+    end
+  end
 end

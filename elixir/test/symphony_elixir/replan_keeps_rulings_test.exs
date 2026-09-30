@@ -43,14 +43,14 @@ defmodule SymphonyElixir.ReplanKeepsRulingsTest do
     ]
   end
 
-  defp stored_plan(generated_at) do
+  defp stored_plan(generated_at, plan_json \\ %{"rows" => List.update_at(body_rows(), 0, &Map.put(&1, "state", "done"))}) do
     {:ok, plan} =
       Planning.upsert_plan(%{
         issue_id: "issue-uuid-rk",
         issue_identifier: "SYM-RK",
         status: "dispatching",
         metadata: %{"generated_at" => DateTime.to_iso8601(generated_at)},
-        plan_json: %{"rows" => List.update_at(body_rows(), 0, &Map.put(&1, "state", "done"))}
+        plan_json: plan_json
       })
 
     plan
@@ -70,52 +70,63 @@ defmodule SymphonyElixir.ReplanKeepsRulingsTest do
 
   defp ids(plan), do: Enum.map(Plan.rows(plan), & &1["id"])
 
-  test "a ruling posted before the last park reaches the re-plan" do
+  # GEA-10457's real state: the stored plan is NEWER than both rulings and still carries
+  # R4-R6, because the code that made it read no comments. The person's comments after
+  # that plan cite the ruling by id and do not restate it.
+  test "a ruling older than a stored plan that ignored it still reaches the re-plan" do
     now = DateTime.utc_now()
-    stored_plan(DateTime.add(now, -3 * 3600, :second))
-    ruling = comment(@ruling, DateTime.add(now, -2 * 3600, :second))
+    ruling = comment(@ruling, DateTime.add(now, -3 * 3600, :second))
+    stored_plan(DateTime.add(now, -3600, :second))
     {:ok, _park} = History.record_park("SYM-RK", "a later park on a grader loop")
+    cite = comment("Hand-off: scope per ruling 065493ca.", DateTime.add(now, -1800, :second))
 
-    opts = [request_fun: planner(self()), comments_fun: fn "issue-uuid-rk" -> {:ok, [ruling]} end]
-
-    assert {:ok, {:has_open_rows, plan, _open}} = PlanningWorkflow.assess(issue(), opts)
-    assert ids(plan) == ["R1", "R2", "R3"]
-    assert_received {:planner_prompt, prompt}
-    assert prompt =~ @ruling
-  end
-
-  test "a second release keeps the rows the first re-plan removed, though the body still asks for them" do
-    now = DateTime.utc_now()
-    stored_plan(DateTime.add(now, -3 * 3600, :second))
-    ruling = comment(@ruling, DateTime.add(now, -2 * 3600, :second))
-    {:ok, _first_park} = History.record_park("SYM-RK", "R6 needs a human ruling")
-    first = [ruling]
-
-    opts = [request_fun: planner(self()), comments_fun: fn "issue-uuid-rk" -> {:ok, first} end]
-    assert {:ok, {:has_open_rows, _plan, _open}} = PlanningWorkflow.assess(issue(), opts)
-    assert_received {:planner_prompt, _}
-
-    # The first re-plan's plan is newer than the first park. Park again, later, and
-    # release with only a retask since then: the ruling is older than the prior plan.
-    replanned = Planning.get_plan_by_issue("SYM-RK")
-    assert ids(replanned) == ["R1", "R2", "R3"]
-    assert Enum.map(replanned.plan_json["out_of_scope"], & &1["id"]) == ["R4", "R5", "R6"]
-
-    Repo.query!("UPDATE issue_parks SET inserted_at = $1", [DateTime.add(now, 60, :second)])
-    retask = comment("The judge returned RETASK: add the job dialog.", DateTime.add(now, 120, :second))
-    opts = [request_fun: planner(self()), comments_fun: fn "issue-uuid-rk" -> {:ok, first ++ [retask]} end]
+    opts = [request_fun: planner(self()), comments_fun: fn "issue-uuid-rk" -> {:ok, [ruling, cite]} end]
 
     assert {:ok, {:has_open_rows, plan, open}} = PlanningWorkflow.assess(issue(), opts)
-
-    assert_received {:planner_prompt, prompt}
-    refute prompt =~ @ruling
-    assert prompt =~ "Rows an earlier ruling removed"
-    assert prompt =~ "Contact picker creates"
-
     assert ids(plan) == ["R1", "R2", "R3"]
     assert Enum.map(open, & &1["id"]) == ["R2", "R3"]
     assert Enum.map(plan.plan_json["out_of_scope"], & &1["id"]) == ["R4", "R5", "R6"]
-    assert ids(Planning.get_plan_by_issue("SYM-RK")) == ["R1", "R2", "R3"]
+
+    assert_received {:planner_prompt, prompt}
+    [earlier, since] = String.split(prompt, "### Since the prior plan was made")
+    assert earlier =~ @ruling
+    assert since =~ "ruling 065493ca"
+  end
+
+  # The second guard: a model that plans from the body alone still cannot bring back a
+  # row an earlier re-plan removed, and the Linear plan comment says why.
+  test "a re-plan that ignores the ruling keeps the removed rows out, and says so" do
+    now = DateTime.utc_now()
+
+    stored_plan(DateTime.add(now, -3600, :second), %{
+      "rows" => Enum.take(body_rows(), 3),
+      "out_of_scope" => Enum.map(Enum.drop(body_rows(), 3), &Map.merge(&1, %{"state" => "deferred", "rationale" => "left out"}))
+    })
+
+    {:ok, _park} = History.record_park("SYM-RK", "a later park")
+
+    body_only = fn _system, user_prompt ->
+      send(self(), {:planner_prompt, user_prompt})
+      {:ok, %{"rows" => body_rows(), "out_of_scope" => []}}
+    end
+
+    opts = [request_fun: body_only, comments_fun: fn "issue-uuid-rk" -> {:ok, []} end]
+
+    assert {:ok, {:has_open_rows, plan, _open}} = PlanningWorkflow.assess(issue(), opts)
+    assert ids(plan) == ["R1", "R2", "R3"]
+
+    assert_received {:planner_prompt, prompt}
+    assert prompt =~ "Rows an earlier re-plan left out"
+    assert prompt =~ "Contact picker creates"
+
+    kept_out = plan.plan_json["out_of_scope"]
+    assert Enum.map(kept_out, & &1["id"]) == ["R4", "R5", "R6"]
+    assert Enum.all?(kept_out, &(&1["rationale"] =~ "under its old ID"))
+
+    md = Planning.render_plan_comment(plan)
+    assert md =~ "### Kept out of the plan"
+    assert md =~ "**R6** — Contact picker creates"
+    assert md =~ "under its old ID"
   end
 
   test "a fresh plan reads a ruling posted before it" do
@@ -148,6 +159,13 @@ defmodule SymphonyElixir.ReplanKeepsRulingsTest do
   end
 
   describe "Planner.keep_removed_rows/2" do
+    test "a done row the re-plan leaves out is not filed as removed" do
+      prior = %Plan{issue_identifier: "SYM-RK", plan_json: %{"rows" => [row("R1", "a", "done"), row("R2", "b"), row("R3", "c")]}}
+      json = %{"rows" => [row("R3", "c")]}
+
+      assert [%{"id" => "R2", "state" => "deferred"}] = Planner.keep_removed_rows(json, prior)["out_of_scope"]
+    end
+
     test "without a prior plan the new rows stand as the model wrote them" do
       json = %{"rows" => [row("R1", "d")]}
       assert Planner.keep_removed_rows(json, nil) == json

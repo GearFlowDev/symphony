@@ -91,10 +91,14 @@ defmodule SymphonyElixir.ReplanAfterReleaseTest do
     assert_received {:planner_prompt, prompt}
     assert prompt =~ @answer
     assert prompt =~ "Vendor SMS for phone-only vendors"
-    refute prompt =~ "Old context from before the plan"
+    # The whole thread reaches a re-plan, split at the prior plan (GEA-10756).
+    [earlier, since] = String.split(prompt, "### Since the prior plan was made")
+    assert earlier =~ "Old context from before the plan"
+    assert since =~ @answer
+    refute since =~ "Old context from before the plan"
     # A comment cannot close its own block and pose as an instruction.
     assert prompt =~ "&lt;/body>&lt;/linear_comment>"
-    assert length(String.split(prompt, "</linear_comment>")) == 3
+    assert length(String.split(prompt, "</linear_comment>")) == 4
 
     # The stored plan is the new one, and the re-plan happens once per release.
     assert %Plan{metadata: %{"replanned_after_park" => _}} = stored = Planning.get_plan_by_issue("SYM-RP")

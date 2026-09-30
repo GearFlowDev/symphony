@@ -32,10 +32,10 @@ defmodule SymphonyElixir.Planning.Workflow do
       the body and the issue's comments, and return its open-row state. A
       person's scope ruling can come before the first plan (GEA-10756).
     * If a person released the issue from a park after the plan was made,
-      re-plan from the current body and every comment since the prior plan.
-      The person's answer to a parked question lives there, and the old plan
-      would ask the same question again (GEA-10664). A ruling posted before
-      the last park counts too: only the prior plan has read it (GEA-10756).
+      re-plan from the current body and the whole thread. The person's answer
+      to a parked question lives there, and the old plan would ask the same
+      question again (GEA-10664). A ruling older than the prior plan counts
+      too: that plan may have ignored it (GEA-10756).
     * If a plan exists with `missing` or `partial` rows, return
       `{:has_open_rows, plan, rows}`.
     * If every row is `done` or `deferred`, return `{:complete, plan}`.
@@ -129,7 +129,8 @@ defmodule SymphonyElixir.Planning.Workflow do
         planner_opts =
           opts
           |> Keyword.put(:prior_plan, plan)
-          |> Keyword.put(:comments, Enum.filter(comments, &posted_after?(&1, planned_at)))
+          |> Keyword.put(:comments, comments)
+          |> Keyword.put(:prior_planned_at, planned_at)
           |> Keyword.put(:metadata, Map.put(plan.metadata || %{}, "replanned_after_park", DateTime.to_iso8601(parked_at)))
 
         Planner.plan(issue, planner_opts)
@@ -151,9 +152,6 @@ defmodule SymphonyElixir.Planning.Workflow do
   # for a thread with no answer.
   defp fetch_comments(issue_id) when is_binary(issue_id) and issue_id != "", do: Client.read_all_issue_comments(issue_id)
   defp fetch_comments(_issue_id), do: {:error, :no_issue_id}
-
-  defp posted_after?(%{created_at: %DateTime{} = at}, since), do: DateTime.compare(at, since) == :gt
-  defp posted_after?(_comment, _since), do: false
 
   defp audit_summary(issue, identifier, opts) do
     case Auditor.audit(issue, pr_url: opts[:pr_url]) do

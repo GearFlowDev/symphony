@@ -7,7 +7,10 @@ defmodule SymphonyElixir.CiSettled do
   harness refused it on checks twice (GEA-10755). A hand-off the harness refuses costs
   a retask, and each retask costs about three counted dispatches.
 
-  `check/5` answers `{:pending, reason}` in three cases:
+  `check/5` answers `{:pending, reason}` in four cases:
+
+    * A check row on the head failed. The ship gate read it before it went red, so
+      the next poll's `ci_gate` owns it.
 
     * A check row on the head is not in a finished state.
     * A GitHub Actions run on the head is not `completed`. A queued run has no check
@@ -24,6 +27,8 @@ defmodule SymphonyElixir.CiSettled do
 
   # `gh pr checks --json state` values for a check that has not finished.
   @pending_states ~w(PENDING QUEUED IN_PROGRESS WAITING REQUESTED EXPECTED)
+  # The same list as the orchestrator's `@failing_check_states`.
+  @failing_states ~w(FAILURE ERROR CANCELLED TIMED_OUT ACTION_REQUIRED STARTUP_FAILURE)
   # A push is on the PR within seconds; its workflow runs register within a minute or
   # two. Ten minutes with nothing registered means the repo runs no CI.
   @register_grace_seconds 600
@@ -76,8 +81,15 @@ defmodule SymphonyElixir.CiSettled do
           :settled | {:pending, String.t()}
   def check({repo, _number}, head, checks, gh_fun, now \\ DateTime.utc_now()) do
     running = Enum.filter(checks, &(Map.get(&1, "state") in @pending_states))
+    red = Enum.filter(checks, &(Map.get(&1, "state") in @failing_states))
 
     cond do
+      # A check that went red after the ship gate read it pending (CodeRabbit on #26). It
+      # is a wait, not :done: the next poll's `ci_gate` reads the same red and sends it
+      # through CI recovery, so there is still one path to a fix.
+      red != [] ->
+        {:pending, "#{names(red)} failed on #{short(head)} after the ship gate read it"}
+
       running != [] ->
         {:pending, "#{names(running)} still running on #{short(head)}"}
 

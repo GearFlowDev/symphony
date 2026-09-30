@@ -54,10 +54,19 @@ defmodule SymphonyElixir.CiSettledTest do
   end
 
   describe "a head whose checks have all finished is settled" do
-    test "green and red rows alike: a red check is the ship gate's call, not this one" do
-      checks = [row("test (1)", "SUCCESS"), row("test (2)", "FAILURE"), row("docs", "SKIPPED")]
+    test "green, skipped and neutral rows are settled" do
+      checks = [row("test (1)", "SUCCESS"), row("docs", "SKIPPED"), row("lint", "NEUTRAL")]
 
       assert CiSettled.check(@pr, @head, checks, gh(), @now) == :settled
+    end
+
+    test "a check that went red after the ship gate read it pending is a wait, never :done" do
+      # CodeRabbit on #26: ci_gate read IN_PROGRESS, the check failed, and this later read
+      # would have called the red settled and handed off. The next poll's ci_gate owns it.
+      checks = [row("test (1)", "SUCCESS"), row("test (2)", "FAILURE")]
+
+      assert {:pending, reason} = CiSettled.check(@pr, @head, checks, gh(), @now)
+      assert reason =~ "test (2) failed on 0c6cc513c1a5 after the ship gate read it"
     end
 
     test "a head with no check after the grace is a repo without CI" do

@@ -1382,7 +1382,7 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("#{identifier} finished with no PR to hand off — the run is incomplete")
         :error
 
-      already_handed_off?(issue, pr_url) ->
+      still_in_review?(issue) and already_handed_off?(issue, pr_url) ->
         Logger.info("#{identifier} is already handed off at #{pr_url}'s head commit; nothing to post")
         :ok
 
@@ -1403,6 +1403,19 @@ defmodule SymphonyElixir.Orchestrator do
   #
   # A READ THAT FAILS ANSWERS "no". A hand-off that never posts strands the work with nobody
   # told; a second hand-off supersedes the first (GEA-9955), which is the cheaper mistake.
+  # A HAND-OFF COUNTS ONLY WHILE ITS ISSUE IS STILL IN REVIEW (GEA-10755). The harness sends
+  # a failed gate back by moving the issue to In Progress. When the red check was a flake
+  # that Symphony re-ran, or a review thread closed with no push, the head does not move,
+  # and the old hand-off at that head would keep the issue In Progress with no work and no
+  # hand-off. Out of In Review, the same commit is handed off again, and `bin/linear
+  # handoff` moves it back. In In Review the dedupe still holds on every poll.
+  @doc false
+  @spec still_in_review?(map()) :: boolean()
+  def still_in_review?(issue) do
+    state = Map.get(issue, :state)
+    is_binary(state) and normalize_issue_state(state) == "in review"
+  end
+
   defp already_handed_off?(issue, pr_url) do
     # `pr_head_sha/1` answers with the first 12 characters, or "?" when `gh` cannot say.
     # "?" is not an answer, so it means "post the hand-off".

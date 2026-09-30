@@ -17,8 +17,9 @@ defmodule SymphonyElixir.ReviewThreadsTest do
     }
   end
 
-  defp gh(threads, status \\ 0) do
-    body = Jason.encode!(%{"data" => %{"repository" => %{"pullRequest" => %{"reviewThreads" => %{"nodes" => threads}}}}})
+  defp gh(threads, status \\ 0, more? \\ false) do
+    page = %{"pageInfo" => %{"hasNextPage" => more?}, "nodes" => threads}
+    body = Jason.encode!(%{"data" => %{"repository" => %{"pullRequest" => %{"reviewThreads" => page}}}})
 
     fn
       ["api", "graphql", "-f", "query=" <> _] -> {body, status}
@@ -68,6 +69,15 @@ defmodule SymphonyElixir.ReviewThreadsTest do
     test "reads the threads from the graphql answer" do
       assert %{ours: 0, theirs: 1} =
                ReviewThreads.snapshot(@pr, gh([thread("coderabbitai", "gearflow-bot-2", "2026-09-30T22:12:19Z")]), @now)
+    end
+
+    test "a truncated page counts its unread rest as a worker's, never a silent wait" do
+      waiting = [thread("coderabbitai", "gearflow-bot-2", "2026-09-30T22:12:19Z")]
+
+      tally = ReviewThreads.snapshot(@pr, gh(waiting, 0, true), @now)
+
+      assert %{ours: 1, theirs: 1} = tally
+      assert {:request_changes, _} = Orchestrator.review_verdict(%{}, tally)
     end
 
     test "a gh read that fails counts no thread" do

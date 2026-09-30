@@ -35,21 +35,23 @@ defmodule SymphonyElixir.ReviewThreads do
   @doc """
   Read the PR's review threads and `classify/2` them. A `gh` read that fails counts no
   thread, like every other ship gate read: a transient `gh` error must never wedge a
-  finished issue.
+  finished issue. The read takes the first 100 threads; when GitHub says more exist, the
+  unread rest counts as one thread a worker owes, so a truncated page never makes a wait.
   """
   @spec snapshot({String.t(), String.t()}, gh_fun(), DateTime.t()) :: tally()
   def snapshot({repo, number}, gh_fun, now \\ DateTime.utc_now()) do
     [owner, name] = String.split(repo, "/", parts: 2)
 
     query =
-      ~s|query { repository(owner:"#{owner}", name:"#{name}") { pullRequest(number:#{number}) { reviewThreads(first:100) { nodes { isResolved | <>
+      ~s|query { repository(owner:"#{owner}", name:"#{name}") { pullRequest(number:#{number}) { reviewThreads(first:100) { pageInfo { hasNextPage } nodes { isResolved | <>
         "first: comments(first:1) { nodes { author { login } } } " <>
         "last: comments(last:1) { nodes { author { login } createdAt } } } } } } }"
 
     with {output, 0} <- gh_fun.(["api", "graphql", "-f", "query=#{query}"]),
          {:ok, decoded} <- Jason.decode(output),
-         threads when is_list(threads) <- get_in(decoded, ["data", "repository", "pullRequest", "reviewThreads", "nodes"]) do
-      classify(threads, now)
+         %{"nodes" => threads} = page when is_list(threads) <- get_in(decoded, ["data", "repository", "pullRequest", "reviewThreads"]) do
+      tally = classify(threads, now)
+      if get_in(page, ["pageInfo", "hasNextPage"]) == true, do: Map.update!(tally, :ours, &(&1 + 1)), else: tally
     else
       _ -> %{ours: 0, theirs: 0}
     end

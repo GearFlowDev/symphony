@@ -28,12 +28,14 @@ defmodule SymphonyElixir.Planning.Workflow do
   @doc """
   Read-only assessment of whether the plan has open rows.
 
-    * If no plan exists for the issue, generate one (single LLM call) and
-      return its open-row state.
+    * If no plan exists for the issue, generate one (single LLM call) from
+      the body and the issue's comments, and return its open-row state. A
+      person's scope ruling can come before the first plan (GEA-10756).
     * If a person released the issue from a park after the plan was made,
-      re-plan from the current body and the comments since the park. The
-      person's answer to a parked question lives there, and the old plan
-      would ask the same question again (GEA-10664).
+      re-plan from the current body and the whole thread. The person's answer
+      to a parked question lives there, and the old plan would ask the same
+      question again (GEA-10664). A ruling older than the prior plan counts
+      too: that plan may have ignored it (GEA-10756).
     * If a plan exists with `missing` or `partial` rows, return
       `{:has_open_rows, plan, rows}`.
     * If every row is `done` or `deferred`, return `{:complete, plan}`.
@@ -49,12 +51,7 @@ defmodule SymphonyElixir.Planning.Workflow do
     plan_result =
       case Planning.get_plan_by_issue(identifier) do
         nil ->
-          # Fresh plan — run the Auditor first so the Planner sees what's
-          # already on the WIP branch, and feed the summary in as
-          # :audit_summary. Auditor failures don't block planning; we just
-          # plan from the issue body alone.
-          audit_summary = audit_summary(issue, identifier, opts)
-          Planner.plan(issue, Keyword.put(opts, :audit_summary, audit_summary))
+          fresh_plan(issue, identifier, opts)
 
         %Plan{} = plan ->
           case park_after_plan(plan, identifier, opts) do
@@ -92,9 +89,34 @@ defmodule SymphonyElixir.Planning.Workflow do
 
   defp plan_generated_at(%Plan{inserted_at: inserted_at}), do: inserted_at
 
+  # Fresh plan — read the thread, then run the Auditor so the Planner sees
+  # what's already on the WIP branch, and feed the summary in as
+  # :audit_summary. Auditor failures don't block planning; we just plan from
+  # the issue body alone. A failed comment read defers the plan: a plan made
+  # without a person's ruling would never read that ruling again.
+  defp fresh_plan(issue, identifier, opts) do
+    fetch_comments = Keyword.get(opts, :comments_fun, &fetch_comments/1)
+    read = if issue_id(issue), do: fetch_comments.(issue_id(issue)), else: {:ok, []}
+
+    case read do
+      {:ok, comments} ->
+        audit_summary = Keyword.get(opts, :audit_fun, &audit_summary/3).(issue, identifier, opts)
+
+        Planner.plan(
+          issue,
+          opts |> Keyword.put(:audit_summary, audit_summary) |> Keyword.put(:comments, comments)
+        )
+
+      {:error, reason} ->
+        Logger.warning("Plan of #{identifier} deferred: comments unreadable: #{inspect(reason)}")
+        {:error, {:comments_unavailable, reason}}
+    end
+  end
+
   defp replan_after_release(issue, plan, parked_at, opts) do
     Logger.info("Re-planning #{plan.issue_identifier}: released after a park at #{DateTime.to_iso8601(parked_at)}")
     fetch_comments = Keyword.get(opts, :comments_fun, &fetch_comments/1)
+    planned_at = plan_generated_at(plan)
 
     # A failed read defers the re-plan: a plan made without the person's
     # answer would stamp a newer generated_at and never be re-made.
@@ -107,7 +129,8 @@ defmodule SymphonyElixir.Planning.Workflow do
         planner_opts =
           opts
           |> Keyword.put(:prior_plan, plan)
-          |> Keyword.put(:comments_since_park, Enum.filter(comments, &posted_after?(&1, parked_at)))
+          |> Keyword.put(:comments, comments)
+          |> Keyword.put(:prior_planned_at, planned_at)
           |> Keyword.put(:metadata, Map.put(plan.metadata || %{}, "replanned_after_park", DateTime.to_iso8601(parked_at)))
 
         Planner.plan(issue, planner_opts)
@@ -129,9 +152,6 @@ defmodule SymphonyElixir.Planning.Workflow do
   # for a thread with no answer.
   defp fetch_comments(issue_id) when is_binary(issue_id) and issue_id != "", do: Client.read_all_issue_comments(issue_id)
   defp fetch_comments(_issue_id), do: {:error, :no_issue_id}
-
-  defp posted_after?(%{created_at: %DateTime{} = at}, parked_at), do: DateTime.compare(at, parked_at) == :gt
-  defp posted_after?(_comment, _parked_at), do: false
 
   defp audit_summary(issue, identifier, opts) do
     case Auditor.audit(issue, pr_url: opts[:pr_url]) do

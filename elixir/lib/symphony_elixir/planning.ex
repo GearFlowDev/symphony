@@ -115,8 +115,22 @@ defmodule SymphonyElixir.Planning do
       "## Plan\n\n_Symphony generated this plan and re-grades each row after every dispatch. ✅ done · 🟡 partial · ⬜ missing · ⏭️ deferred._\n"
 
     body = if lines == [], do: "_(no rows)_", else: Enum.join(lines, "\n")
-    header <> "\n" <> body
+    header <> "\n" <> body <> kept_out_section(plan)
   end
+
+  # Rows a re-plan left out, so a person sees what the plan will not build and
+  # why (GEA-10756). The Planner's own bare-string entries are not rows.
+  defp kept_out_section(%Plan{plan_json: %{"out_of_scope" => entries}}) when is_list(entries) do
+    lines =
+      for %{"id" => id} = row <- entries, is_binary(id) do
+        base = "- ⏭️ **#{id}** — #{row["description"] || ""}"
+        if is_binary(row["rationale"]) and row["rationale"] != "", do: base <> "\n    - #{row["rationale"]}", else: base
+      end
+
+    if lines == [], do: "", else: "\n\n### Kept out of the plan\n\n" <> Enum.join(lines, "\n")
+  end
+
+  defp kept_out_section(_plan), do: ""
 
   defp state_marker("done"), do: "✅"
   defp state_marker("partial"), do: "🟡"

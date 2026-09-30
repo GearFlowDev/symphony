@@ -299,6 +299,57 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @doc """
+  The slot a scratch workspace's `.symphony_slot` names, as the values the stage
+  prompts render (GEA-10769).
+
+  WHY THE PROMPT CARRIES THEM. The before_run hook writes the marker, so the values are
+  on disk before the first prompt is built. When the prompt only named the file, 121 of
+  140 runs on the Symphony box spent their first turns reading it, at 7k–10k tokens a
+  read. Symphony reads it once here instead.
+
+  Every value goes into shell commands the agent runs, so each one must match its own
+  pattern: a path of plain path characters, a slot name of one path component, a port of
+  digits, a branch of ref characters. A value that fails is `nil`, and a missing marker
+  gives all `nil`; the preamble then tells the agent that the slot is missing.
+  `base_branch` falls back to `main`, as `read_base_branch/1` in the orchestrator does.
+  """
+  @spec slot_info(Path.t() | nil) :: %{String.t() => String.t() | nil}
+  def slot_info(workspace) do
+    values =
+      with path when is_binary(path) <- workspace && Path.join(workspace, ".symphony_slot"),
+           {:ok, content} <- File.read(path) do
+        parse_slot_marker(content)
+      else
+        _ -> %{}
+      end
+
+    %{
+      "name" => safe_slot_value(values["SLOT_NAME"], ~r/\A[A-Za-z0-9_.-]+\z/),
+      "directory" => safe_slot_value(values["DIRECTORY"], ~r/\A\/[A-Za-z0-9_.\/-]+\z/),
+      "phoenix_port" => safe_slot_value(values["PHOENIX_PORT"], ~r/\A[0-9]{2,5}\z/),
+      "postgres_port" => safe_slot_value(values["POSTGRES_PORT"], ~r/\A[0-9]{2,5}\z/),
+      "base_branch" => safe_slot_value(values["BASE_BRANCH"], ~r/\A[A-Za-z0-9_.\/-]+\z/) || "main"
+    }
+  end
+
+  defp parse_slot_marker(content) do
+    content
+    |> String.split(~r/\R/)
+    |> Enum.reduce(%{}, fn line, acc ->
+      case Regex.run(~r/\A\s*(?:export\s+)?([A-Z_]+)=(.*)\z/, line) do
+        [_, key, value] -> Map.put(acc, key, value |> String.trim() |> String.trim("\""))
+        _ -> acc
+      end
+    end)
+  end
+
+  defp safe_slot_value(value, pattern) when is_binary(value) do
+    if value != "" and not String.contains?(value, "..") and Regex.match?(pattern, value), do: value
+  end
+
+  defp safe_slot_value(_value, _pattern), do: nil
+
   @doc "Scratch workspace path for an issue identifier (resolve the slot via `.symphony_slot`)."
   @spec scratch_path(String.t() | nil) :: Path.t() | nil
   def scratch_path(identifier) when is_binary(identifier),

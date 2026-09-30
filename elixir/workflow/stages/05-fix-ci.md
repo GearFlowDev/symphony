@@ -8,14 +8,15 @@ this phase is to make CI green. Do not add features or refactor unrelated code.
 Do NOT guess from the check name. Get the real failure output.
 
 ```bash
-PR_NUM=$(gh pr list --head "$(git branch --show-current)" --json number --jq '.[0].number')
+cd {{ slot.directory }} && {{ tools.pr }} status
+```
 
-# Failing checks + their run/job links
-gh pr checks $PR_NUM --json name,state,link --jq '.[] | select(.state != "SUCCESS")'
+The first line is the verdict. Under `FAILING`, `pr status` lists each failed check
+with the tail of its failed-step log. For a longer log, take the job id from
+`pr status --json` (`.checks[].job`) and run:
 
-# For each failing check, pull the failing step's log from its run:
-RUN_ID=$(gh pr checks $PR_NUM --json state,link --jq '.[] | select(.state != "SUCCESS") | .link' | grep -oE 'runs/[0-9]+' | grep -oE '[0-9]+' | head -1)
-gh run view $RUN_ID --log-failed
+```bash
+cd {{ slot.directory }} && gh run view --job <job-id> --log-failed
 ```
 
 Read the failed log. Identify the exact failing test, compile error, or lint
@@ -27,8 +28,8 @@ reproduce.
 Run the same thing CI runs, in your working directory:
 
 ```bash
-direnv exec . mix test            # the failing suite (or `mix test <path>` for one)
-direnv exec . mix check           # format, credo, compile-as-error, etc.
+cd {{ slot.directory }} && direnv exec . mix test   # the failing suite (or `mix test <path>` for one)
+cd {{ slot.directory }} && direnv exec . mix check  # format, credo, compile-as-error, etc.
 ```
 
 If it passes locally but fails in CI, the failure is environment- or
@@ -43,8 +44,9 @@ Do not delete or skip a failing test to make it pass.
 ### Step 4: Verify, commit, push
 
 ```bash
-direnv exec . mix test && direnv exec . mix check
-git add -A && git commit -m "{{ issue.identifier }}: fix CI" && git push --no-verify
+cd {{ slot.directory }} && direnv exec . mix test && direnv exec . mix check
+cd {{ slot.directory }} && git add -A && git commit -m "{{ issue.identifier }}: fix CI" && \
+  {{ tools.pr }} push --no-verify --base {{ slot.base_branch }}
 ```
 
 ### Step 5: Stop

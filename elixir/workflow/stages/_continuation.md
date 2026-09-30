@@ -6,11 +6,10 @@ You're still in the same Claude session as turn 1 — the assigned rows from you
 
 ## Step 1: Re-orient
 
+Your slot is `{{ slot.directory }}`. Start every command with `cd {{ slot.directory }} && `.
+
 ```bash
-cd "$(grep -oE 'DIRECTORY=[^ ]+' .symphony_slot | cut -d= -f2)"
-source .symphony_slot
-git status --short
-git log --oneline "origin/${BASE_BRANCH:-main}..HEAD" | head
+cd {{ slot.directory }} && git status --short && git log --oneline origin/{{ slot.base_branch }}..HEAD | head
 ```
 
 If a previous turn left uncommitted changes, decide whether to keep or revert them — the new assignment may have changed what's needed.
@@ -24,32 +23,21 @@ Same loop as the initial dispatch — for each row in the "Your assigned rows" l
 3. Run `direnv exec . mix test <path>`
 4. Commit per row: `{{ issue.identifier }}: <row-id> <summary>`
 
-After all assigned rows have green tests and commits:
+After all assigned rows have green tests and commits, check, then push through `pr`:
 
 ```bash
-direnv exec . mix check
-direnv exec . mix test
-b="$(git branch --show-current)"
-# origin's tip BEFORE you rewrite anything, fetched with its objects (the slot fetches
-# main only). No branch on origin, or no answer, leaves it empty: the lease then refuses
-# to overwrite anything.
-seen=""
-if git fetch origin "refs/heads/$b" 2>/dev/null; then
-  seen=$(git rev-parse FETCH_HEAD)
-  git merge-base --is-ancestor "$seen" HEAD || git rebase "$seen"   # take in commits you lack
-fi
-git fetch origin "${BASE_BRANCH:-main}"
-git rebase "origin/${BASE_BRANCH:-main}"
-git push --no-verify --force-with-lease="refs/heads/$b:$seen" origin "$b"
+cd {{ slot.directory }} && direnv exec . mix check && direnv exec . mix test
+cd {{ slot.directory }} && {{ tools.pr }} push --no-verify --base {{ slot.base_branch }}
 ```
+
+`pr push` takes in any commits origin has on the branch, merges `origin/{{ slot.base_branch }}`, and pushes, without a force-push. On a merge conflict it names the files: resolve them, `git commit`, and run it again. If no PR is open yet, run the Implement phase's `pr ship` line instead.
 
 ## Step 3: @agent feedback
 
 Check Linear for any `@agent` comments newer than your last commit, through `bin/linear` (never `curl`):
 
 ```bash
-LINEAR="${GEARFLOW_WORKSPACE:-/data/workspace}/local-dev/gf_harness_surfaces/bin/linear"
-"$LINEAR" comments {{ issue.identifier }} --since "$(git log -1 --format=%cI)" | grep -i -B2 -A20 '@agent'
+cd {{ slot.directory }} && {{ tools.linear }} comments {{ issue.identifier }} --since "$(git log -1 --format=%cI)" | grep -i -B2 -A20 '@agent'
 ```
 
 `@agent` instructions take priority over the row queue — implement them in this dispatch.

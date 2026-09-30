@@ -221,7 +221,7 @@ released is the harness's job: `local-dev/bin/slot-status --stale` lists it and
 ## Project Layout
 
 - `lib/`: application code and Mix tasks
-- `priv/scripts/`: shell scripts bundled into the release (linear-upload-image, linear-embed-images, change-census)
+- `priv/scripts/`: shell scripts bundled into the release (change-census). Linear writes, screenshots included, go through the harness's `bin/linear` (GEA-10774)
 - `test/`: ExUnit coverage for runtime behavior
 - `WORKFLOW.md`: in-repo workflow contract used by local runs
 - `workflow/stages/`: stage-specific prompt templates (e.g., human-review)

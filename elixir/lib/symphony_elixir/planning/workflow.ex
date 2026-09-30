@@ -177,7 +177,7 @@ defmodule SymphonyElixir.Planning.Workflow do
   Call this only after `assess/2` returned `{:has_open_rows, plan, rows}`
   AND the orchestrator has committed to dispatching a worker. Creates a
   `Dispatch` row with the assigned rows, ready for the Grader to find
-  later.
+  later. `phase:` records the retask phase (for example `"Fix CI"`) on the row.
   """
   @spec start_implement_dispatch(Plan.t(), [map()], keyword()) ::
           {:ok, Dispatch.t()} | {:error, term()}
@@ -186,10 +186,15 @@ defmodule SymphonyElixir.Planning.Workflow do
       plan_id: plan.id,
       role: "implement",
       slot_name: Keyword.get(opts, :slot_name),
-      assigned_rows_json: %{"rows" => rows},
+      assigned_rows_json: assigned_rows_json(rows, Keyword.get(opts, :phase)),
       started_at: DateTime.utc_now()
     })
   end
+
+  # The phase rides beside the rows, so a reader can tell a Fix CI row-closer from an
+  # Implement one. The tester gate needs that (GEA-10755). Rows alone keep the old shape.
+  defp assigned_rows_json(rows, phase) when is_binary(phase), do: %{"rows" => rows, "phase" => phase}
+  defp assigned_rows_json(rows, _phase), do: %{"rows" => rows}
 
   @doc """
   Grade a finished worker dispatch and update the plan with row-level results.

@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.CiRecovery
+  alias SymphonyElixir.CiSettled
   alias SymphonyElixir.Claude.{StreamParser, TmuxCLI}
   alias SymphonyElixir.{Config, Evaluator, Grant, History, Notifier, Planning}
   alias SymphonyElixir.Linear.{Client, Issue}
@@ -1381,7 +1382,7 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("#{identifier} finished with no PR to hand off — the run is incomplete")
         :error
 
-      already_handed_off?(issue, pr_url) ->
+      still_in_review?(issue) and already_handed_off?(issue, pr_url) ->
         Logger.info("#{identifier} is already handed off at #{pr_url}'s head commit; nothing to post")
         :ok
 
@@ -1402,6 +1403,19 @@ defmodule SymphonyElixir.Orchestrator do
   #
   # A READ THAT FAILS ANSWERS "no". A hand-off that never posts strands the work with nobody
   # told; a second hand-off supersedes the first (GEA-9955), which is the cheaper mistake.
+  # A HAND-OFF COUNTS ONLY WHILE ITS ISSUE IS STILL IN REVIEW (GEA-10755). The harness sends
+  # a failed gate back by moving the issue to In Progress. When the red check was a flake
+  # that Symphony re-ran, or a review thread closed with no push, the head does not move,
+  # and the old hand-off at that head would keep the issue In Progress with no work and no
+  # hand-off. Out of In Review, the same commit is handed off again, and `bin/linear
+  # handoff` moves it back. In In Review the dedupe still holds on every poll.
+  @doc false
+  @spec still_in_review?(map()) :: boolean()
+  def still_in_review?(issue) do
+    state = Map.get(issue, :state)
+    is_binary(state) and normalize_issue_state(state) == "in review"
+  end
+
   defp already_handed_off?(issue, pr_url) do
     # `pr_head_sha/1` answers with the first 12 characters, or "?" when `gh` cannot say.
     # "?" is not an answer, so it means "post the hand-off".
@@ -2062,12 +2076,20 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  # The PR is externally clean (no conflicts, CI green, no requested changes) —
+  # The PR is externally clean (no conflicts, no red check, no requested changes) —
   # the tester's verdict is the last gate before :done.
+  #
+  # AN APPROVED ISSUE WAITS FOR ITS CHECKS TO FINISH (GEA-10755). A pending check was a
+  # pass, so GEA-10458 was handed off six minutes after a push and the harness refused it
+  # on checks twice. Only :done waits: a Test still starts while CI runs, because the two
+  # run side by side on purpose. A wait starts no worker and spends no budget.
   defp complete_tester_action(issue, metadata, plan, pr_url) do
     case tester_gate(issue, plan, pr_url) do
       :approved ->
-        :done
+        case ci_settled(pr_url) do
+          :settled -> :done
+          {:pending, reason} -> {:wait, "tester approved; CI is not finished: #{reason}"}
+        end
 
       :needs_test ->
         Logger.info("Plan code rows complete for #{issue.identifier}; dispatching the Test tester sub-agent")
@@ -2209,7 +2231,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   # Record a Dispatch and build the metadata for an Implement row-closer dispatch.
   defp dispatch_implement(issue, metadata, plan, rows, why, phase \\ "Implement") do
-    case PlanningWorkflow.start_implement_dispatch(plan, rows) do
+    case PlanningWorkflow.start_implement_dispatch(plan, rows, phase: phase) do
       {:ok, dispatch} ->
         Logger.info("Dispatching #{phase} row-closer for #{issue.identifier} (#{why}, #{length(rows)} rows)")
 
@@ -2251,9 +2273,9 @@ defmodule SymphonyElixir.Orchestrator do
   #
   # Inability to evaluate (no PR yet, gh failure) returns :ok rather than
   # blocking: a transient gh error must never wedge a finished issue, and the
-  # continuation cap bounds any retry. PENDING checks are not treated as a
-  # failure (only explicit failure states are) — the tester runs far longer than
-  # CI, so checks are effectively always resolved by the time the gate runs.
+  # continuation cap bounds any retry. PENDING checks are not a failure here (only
+  # explicit failure states are), so a Test can start while CI runs. They are not a
+  # pass either: `complete_tester_action/4` waits on them before :done (GEA-10755).
   defp external_ship_gate(issue, plan, pr_url) do
     with :ok <- merge_gate(pr_url),
          :ok <- ci_gate(issue, plan, pr_url) do
@@ -2400,6 +2422,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @failing_check_states ~w(FAILURE ERROR CANCELLED TIMED_OUT ACTION_REQUIRED STARTUP_FAILURE)
+
+  # Has every check on the PR's head finished? CiSettled decides (GEA-10755).
+  defp ci_settled(pr_url) do
+    case pr_ref(pr_url) do
+      {_repo, _number} = pr -> CiSettled.snapshot(pr, &gh_cmd/1)
+      :error -> :settled
+    end
+  rescue
+    _ -> :settled
+  end
 
   defp failed_checks(output) do
     case Jason.decode(output) do
@@ -2701,14 +2733,32 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_implement_dispatch_finish(%SymphonyElixir.Planning.Plan{id: plan_id}) do
-    SymphonyElixir.Planning.dispatches_for_plan(plan_id)
-    |> Enum.filter(fn d -> d.role == "implement" and d.finished_at != nil end)
-    |> Enum.max_by(fn d -> DateTime.to_unix(d.finished_at) end, fn -> nil end)
+    plan_id
+    |> SymphonyElixir.Planning.dispatches_for_plan()
+    |> last_code_change_at()
+  end
+
+  # WHEN THE CODE THE TESTER WALKED LAST CHANGED: the newest finished Implement
+  # row-closer, NOT COUNTING FIX CI (GEA-10755). A Fix CI push made the tester's APPROVE
+  # stale, so every red check cost a full Test run; GEA-10458 had five. A Fix CI worker's
+  # job is to make CI pass, so its scoped check is the CI run on its new head (which
+  # :done waits for) and the Grader's regrade of the rows it reopened. When the Grader
+  # finds a row not done, the next dispatch is a plain Implement, and that one still
+  # makes the verdict stale. Resolve Review and Resolve Conflicts record no Dispatch, so
+  # they never moved this clock.
+  @doc false
+  @spec last_code_change_at([map()]) :: DateTime.t() | nil
+  def last_code_change_at(dispatches) do
+    dispatches
+    |> Enum.filter(fn d -> d.role == "implement" and d.finished_at != nil and not fix_ci_dispatch?(d) end)
+    |> Enum.max_by(fn d -> DateTime.to_unix(d.finished_at, :microsecond) end, fn -> nil end)
     |> then(fn
       nil -> nil
       d -> d.finished_at
     end)
   end
+
+  defp fix_ci_dispatch?(dispatch), do: Map.get(dispatch.assigned_rows_json || %{}, "phase") == "Fix CI"
 
   # When the last feedback-triggered Implement dispatch STARTED (start, not
   # finish: a comment posted mid-run would finish "behind" finished_at and look

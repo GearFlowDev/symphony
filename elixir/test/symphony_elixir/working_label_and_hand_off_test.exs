@@ -184,6 +184,20 @@ defmodule SymphonyElixir.WorkingLabelAndHandOffTest do
       refute Orchestrator.handed_off_for_sha?([%{body: nil}], "e2c34b3f1a9d")
       refute Orchestrator.handed_off_for_sha?(:unreadable, "e2c34b3f1a9d")
     end
+
+    test "the old hand-off counts only while the issue is still In Review (GEA-10755)" do
+      # The harness sends a failed gate back by moving the issue to In Progress. A flake
+      # that Symphony re-ran leaves the head where it was, so without this the old
+      # hand-off would leave the issue In Progress with no work and nothing handed off.
+      assert Orchestrator.still_in_review?(%{state: "In Review"})
+      assert Orchestrator.still_in_review?(%{state: " in review "})
+      refute Orchestrator.still_in_review?(%{state: "In Progress"})
+      refute Orchestrator.still_in_review?(%{state: nil})
+      refute Orchestrator.still_in_review?(%{})
+
+      src = File.read!(Path.expand("../../lib/symphony_elixir/orchestrator.ex", __DIR__))
+      assert src =~ "still_in_review?(issue) and already_handed_off?(issue, pr_url) ->"
+    end
   end
 
   describe "the live mark comes off when the run ends" do

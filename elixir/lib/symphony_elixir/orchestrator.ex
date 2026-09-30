@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.Claude.{StreamParser, TmuxCLI}
   alias SymphonyElixir.{Config, Evaluator, Grant, History, Notifier, Planning}
   alias SymphonyElixir.Linear.{Client, Issue}
+  alias SymphonyElixir.Planning.ProofEvidence
   alias SymphonyElixir.Planning.Workflow, as: PlanningWorkflow
   alias SymphonyElixir.{StatusDashboard, Suitability, Tracker, Workspace}
 
@@ -1793,10 +1794,40 @@ defmodule SymphonyElixir.Orchestrator do
       })
 
     if tripped? do
-      {:blocked, {:no_progress, no_progress_message(repeats, limit, fingerprint, identifier, phase)}}
+      message = no_progress_message(repeats, limit, fingerprint, identifier, phase) <> open_rows_question(plan)
+      {:blocked, {:no_progress, message}}
     else
       result
     end
+  end
+
+  # A LOOP ON OPEN ROWS PARKS AS ONE QUESTION (GEA-10667). When the grader
+  # keeps a row open at an unchanged head, the Implement worker it sends back
+  # has nothing left to change, so only a person can close it. Name each row
+  # and the grader's reason, so the person answers the row, not the state
+  # string (GEA-10457 R10 and GEA-10459 R8, 2026-09-30).
+  @doc false
+  @spec open_rows_question(SymphonyElixir.Planning.Plan.t()) :: String.t()
+  def open_rows_question(plan) do
+    case SymphonyElixir.Planning.Plan.open_rows(plan) do
+      [] ->
+        ""
+
+      rows ->
+        " The grader keeps #{length(rows)} row(s) open: " <>
+          Enum.map_join(rows, "; ", &open_row_line/1) <>
+          ". For each, decide: close it, drop it, or say what proof counts."
+    end
+  end
+
+  defp open_row_line(row) do
+    reason =
+      case row["rationale"] do
+        text when is_binary(text) and text != "" -> ": " <> (text |> String.replace(~r/\s+/, " ") |> String.slice(0, 300))
+        _ -> ""
+      end
+
+    "#{row["id"]} (#{row["state"]})#{reason}"
   end
 
   # Name only the gates that actually ran. The fixed text blamed "plan, grader,
@@ -2652,12 +2683,20 @@ defmodule SymphonyElixir.Orchestrator do
       # can't show. Un-blinds the grader on the #1 defect class.
       census = fetch_dispatch_census(running_entry)
 
+      # Proof evidence: a row that asks for a green run, a review or
+      # screenshots has no trace in the diff. Without these the grader kept
+      # such rows partial on every pass and the issue looped (GEA-10667).
+      pr_state = ProofEvidence.pr_state_section(dispatch_pr_url(running_entry, pr_body))
+      issue_comments = ProofEvidence.issue_comments_for(dispatch_issue_id(running_entry), dispatch.started_at)
+
       case PlanningWorkflow.grade_dispatch(dispatch,
              plan: plan,
              diff: diff,
              test_output: "",
              pr_body: pr_body,
-             census: census
+             census: census,
+             pr_state: pr_state,
+             issue_comments: issue_comments
            ) do
         {:ok, {verdict, _updated_plan}} ->
           Logger.info("Grader verdict for plan dispatch=#{dispatch_id} verdict=#{verdict} issue=#{running_entry[:identifier]}")
@@ -2759,6 +2798,23 @@ defmodule SymphonyElixir.Orchestrator do
   # External-evidence fetcher: pull the current PR description for the issue's
   # open PR, so the Grader can verify rows whose deliverable lives in PR-body
   # markdown rather than in the git tree.
+  # `fetch_pr_body/1` returns the open PR's JSON (number, url, body, title).
+  defp dispatch_pr_url(running_entry, pr_json) do
+    with json when is_binary(json) <- pr_json,
+         {:ok, %{"url" => url}} when is_binary(url) <- Jason.decode(json) do
+      url
+    else
+      _ -> running_entry[:pr_url]
+    end
+  end
+
+  defp dispatch_issue_id(running_entry) do
+    case running_entry[:issue] do
+      %{id: id} when is_binary(id) -> id
+      _ -> running_entry[:issue_id]
+    end
+  end
+
   defp fetch_pr_body(running_entry) do
     workspace_path =
       with identifier when is_binary(identifier) <- running_entry[:identifier],

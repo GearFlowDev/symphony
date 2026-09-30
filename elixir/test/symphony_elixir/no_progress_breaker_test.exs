@@ -227,4 +227,27 @@ defmodule SymphonyElixir.NoProgressBreakerTest do
                )
     end
   end
+
+  test "a row the grader keeps open parks with that row named as the question" do
+    {:ok, _} =
+      Planning.upsert_plan(%{
+        issue_id: "issue-uuid-SYM-STUCKROW",
+        issue_identifier: "SYM-STUCKROW",
+        status: "dispatching",
+        metadata: %{},
+        plan_json: %{
+          "rows" => [
+            %{"id" => "R1", "description" => "Prompt", "state" => "done"},
+            %{"id" => "R8", "description" => "Run it green", "state" => "partial", "rationale" => "no green-run evidence"}
+          ]
+        }
+      })
+
+    assert {:dispatch, _} = decide("SYM-STUCKROW", "Implement")
+    assert {:dispatch, _} = decide("SYM-STUCKROW", "Implement")
+    assert {:blocked, {:no_progress, message}} = decide("SYM-STUCKROW", "Implement")
+
+    assert message =~ "next=Implement"
+    assert message =~ "The grader keeps 1 row(s) open: R8 (partial): no green-run evidence."
+  end
 end

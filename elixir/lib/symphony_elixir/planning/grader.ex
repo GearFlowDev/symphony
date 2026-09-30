@@ -133,6 +133,26 @@ defmodule SymphonyElixir.Planning.Grader do
       The census is heuristic and greps by call syntax, so it over-reports
       common names — a bare mention is not proof of a defect; only downgrade a
       row when the changed contract genuinely leaves a listed caller stale.
+  12. **Proof rows are graded from the proof channels, never from the diff
+      alone.** Some rows ask for proof rather than code: a green test run, a
+      CodeRabbit review and resolved threads, screenshots or a report on the
+      issue. Sending such a row back to an Implement worker changes nothing,
+      so grade it from the channel that holds its proof:
+       - A green run: "## PR state on the head". The row's test is on the
+         branch and every CI check on the head passed → the run is green.
+         An empty "## Test output" is not, by itself, grounds for `partial`.
+       - A review: CodeRabbit's latest review is on the head and no review
+         thread is unresolved → the review row is `done`.
+       - Proof posted to the issue: "## Issue comments during this dispatch".
+       - **Screenshots, a browser walk or any visual proof of UI on the
+         branch fall to the Test phase.** Once every row is done, the tester
+         walks the app, posts screenshots in its report, and its verdict
+         gates the hand-off. Grade such a row on its code alone, and when that
+         is done, mark it `done` with the note "screenshots fall to the Test
+         phase". Never keep a row `partial` only for screenshots.
+       - A proof channel that is absent from the evidence is unknown, not
+         failed: grade the row's code, and say in the note which proof you
+         could not see.
   """
 
   @doc """
@@ -147,6 +167,9 @@ defmodule SymphonyElixir.Planning.Grader do
         * `:plan` — the parent `Plan.t()` (passed in to avoid a refetch)
         * `:notes` — optional extra context (e.g. "browser walkthrough
           screenshots attached on Linear")
+        * `:pr_state` / `:issue_comments` — the rendered sections from
+          `ProofEvidence`: CI and review state on the PR head, and the issue
+          comments posted during the dispatch (GEA-10667)
 
   Returns the updated `Dispatch.t()` with `grade_json` populated.
   """
@@ -168,12 +191,20 @@ defmodule SymphonyElixir.Planning.Grader do
     end
   end
 
-  defp build_user_prompt(dispatch, plan, evidence) do
+  @doc false
+  @spec system_prompt() :: String.t()
+  def system_prompt, do: @grade_system_prompt
+
+  @doc false
+  @spec build_user_prompt(Dispatch.t(), SymphonyElixir.Planning.Plan.t(), keyword()) :: String.t()
+  def build_user_prompt(dispatch, plan, evidence) do
     diff = Keyword.get(evidence, :diff, "")
     test_output = Keyword.get(evidence, :test_output, "")
     notes = Keyword.get(evidence, :notes, "")
     pr_body = Keyword.get(evidence, :pr_body)
     census = Keyword.get(evidence, :census, "")
+    pr_state = Keyword.get(evidence, :pr_state)
+    issue_comments = Keyword.get(evidence, :issue_comments)
 
     assigned = Map.get(dispatch.assigned_rows_json || %{}, "rows", [])
     plan_rows = Map.get(plan.plan_json || %{}, "rows", [])
@@ -184,6 +215,8 @@ defmodule SymphonyElixir.Planning.Grader do
       "## Branch state vs base\n\nThis is a structured summary (file list + commit subjects + diff stats), NOT a full diff dump. `assigned_rows[*].touches` are Planner GUESSES — treat them as hints only. Grade each row on its description against the actual files and content plus the commit subjects; if a row's `touches` paths don't appear (e.g. the plan used a different namespace), match on intent + commits rather than marking it missing.\n\n```\n#{truncate(diff, 200_000)}\n```",
       census_section(census),
       pr_body_section(pr_body),
+      pr_state,
+      issue_comments,
       "## Test output\n\n```\n#{truncate(test_output, 20_000)}\n```",
       if(notes != "", do: "## Additional context\n\n#{notes}", else: nil)
     ]

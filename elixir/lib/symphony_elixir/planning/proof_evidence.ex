@@ -34,7 +34,7 @@ defmodule SymphonyElixir.Planning.ProofEvidence do
     with url when is_binary(url) <- pr_url,
          {repo, number} <- pr_ref(url),
          {:ok, pr} <- pr_view(repo, number, gh_fun) do
-      format_pr_state(pr, unresolved_threads(repo, number, gh_fun))
+      format_pr_state(pr, unresolved_threads(repo, number, gh_fun), latest_coderabbit_review(repo, number, gh_fun))
     else
       _ -> nil
     end
@@ -45,12 +45,13 @@ defmodule SymphonyElixir.Planning.ProofEvidence do
   end
 
   @doc """
-  Render a decoded `gh pr view --json headRefOid,statusCheckRollup,latestReviews,comments`
+  Render a decoded `gh pr view --json headRefOid,statusCheckRollup,comments`
   result. `unresolved` is the unresolved review-thread count, or nil when it
-  could not be read.
+  could not be read. `review` is CodeRabbit's latest review as the REST API
+  gives it (`state`, `commit_id`), or nil.
   """
-  @spec format_pr_state(map(), non_neg_integer() | nil) :: String.t()
-  def format_pr_state(pr, unresolved) do
+  @spec format_pr_state(map(), non_neg_integer() | nil, map() | nil) :: String.t()
+  def format_pr_state(pr, unresolved, review) do
     head = pr["headRefOid"] || ""
     short = String.slice(head, 0, 12)
 
@@ -58,7 +59,7 @@ defmodule SymphonyElixir.Planning.ProofEvidence do
       [
         "Head: `#{short}`",
         checks_line(pr["statusCheckRollup"] || []),
-        coderabbit_line(pr["latestReviews"] || [], head),
+        coderabbit_line(review, head),
         threads_line(unresolved)
       ] ++ review_request_lines(pr["comments"] || [])
 
@@ -103,17 +104,14 @@ defmodule SymphonyElixir.Planning.ProofEvidence do
     end
   end
 
-  defp coderabbit_line(reviews, head) do
-    case Enum.filter(reviews, &coderabbit?(get_in(&1, ["author", "login"]))) do
-      [] ->
-        "CodeRabbit: no review on this PR."
-
-      [review | _] ->
-        oid = get_in(review, ["commit", "oid"]) || ""
-        where = if oid != "" and oid == head, do: "the head", else: "`#{String.slice(oid, 0, 12)}`, not the head"
-        "CodeRabbit: latest review is #{review["state"]} on #{where}."
-    end
+  # The commit comes from the REST reviews API: `gh pr view`'s `latestReviews`
+  # returns an empty commit oid, which would read every review as stale.
+  defp coderabbit_line(%{"state" => state, "commit_id" => oid}, head) when is_binary(oid) and oid != "" do
+    where = if oid == head, do: "the head", else: "`#{String.slice(oid, 0, 12)}`, not the head"
+    "CodeRabbit: latest review is #{state} on #{where}."
   end
+
+  defp coderabbit_line(_review, _head), do: "CodeRabbit: no review on this PR, or it could not be read."
 
   defp threads_line(nil), do: "Unresolved review threads: unknown (could not be read)."
   defp threads_line(n), do: "Unresolved review threads: #{n}."
@@ -121,9 +119,10 @@ defmodule SymphonyElixir.Planning.ProofEvidence do
   defp review_request_lines(comments) do
     comments
     |> Enum.filter(&String.contains?(&1["body"] || "", "@coderabbitai"))
+    |> Enum.reject(&coderabbit?(get_in(&1, ["author", "login"])))
     |> Enum.take(-5)
     |> Enum.map(fn c ->
-      body = c["body"] |> String.trim() |> String.slice(0, 80)
+      body = c["body"] |> String.replace(~r/\s+/, " ") |> String.trim() |> String.slice(0, 80)
       "PR comment by #{get_in(c, ["author", "login"]) || "?"} at #{c["createdAt"]}: `#{body}`"
     end)
   end
@@ -185,7 +184,7 @@ defmodule SymphonyElixir.Planning.ProofEvidence do
   end
 
   defp pr_view(repo, number, gh_fun) do
-    args = ["pr", "view", number, "--repo", repo, "--json", "headRefOid,statusCheckRollup,latestReviews,comments"]
+    args = ["pr", "view", number, "--repo", repo, "--json", "headRefOid,statusCheckRollup,comments"]
 
     with {output, 0} <- gh_fun.(args),
          {:ok, %{} = pr} <- Jason.decode(output) do
@@ -195,14 +194,32 @@ defmodule SymphonyElixir.Planning.ProofEvidence do
     end
   end
 
+  # `--paginate` runs the jq once per page, so each page prints its own last
+  # CodeRabbit review (or null); the last non-null line is the latest.
+  defp latest_coderabbit_review(repo, number, gh_fun) do
+    jq = ~s<[.[] | select(.user.login | startswith("coderabbit"))] | last | {state, commit_id}>
+
+    with {output, 0} <- gh_fun.(["api", "repos/#{repo}/pulls/#{number}/reviews", "--paginate", "--jq", jq]),
+         line when is_binary(line) <- output |> String.split("\n", trim: true) |> Enum.reject(&(String.trim(&1) == "null")) |> List.last(),
+         {:ok, %{} = review} <- Jason.decode(line) do
+      review
+    else
+      _ -> nil
+    end
+  end
+
   defp unresolved_threads(repo, number, gh_fun) do
     [owner, name] = String.split(repo, "/", parts: 2)
 
     query =
       ~s|query { repository(owner:"#{owner}", name:"#{name}") { pullRequest(number:#{number}) | <>
-        "{ reviewThreads(first:100) { nodes { isResolved } } } } }"
+        "{ reviewThreads(first:100) { pageInfo { hasNextPage } nodes { isResolved } } } } }"
 
-    jq = "[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved|not)] | length"
+    # A count over a partial page is not proof of zero: past 100 threads the
+    # count is unknown, and the grader is told so.
+    jq =
+      "if .data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage then \"unknown\" " <>
+        "else [.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved|not)] | length end"
 
     with {output, 0} <- gh_fun.(["api", "graphql", "-f", "query=#{query}", "--jq", jq]),
          {n, _} <- Integer.parse(String.trim(output)) do

@@ -19,12 +19,10 @@ defmodule SymphonyElixir.ProofEvidenceTest do
           %{"name" => "checks", "status" => "COMPLETED", "conclusion" => "SUCCESS"},
           %{"context" => "CodeRabbit", "state" => "SUCCESS"}
         ],
-        "latestReviews" => [
-          %{"author" => %{"login" => "coderabbitai"}, "state" => "APPROVED", "commit" => %{"oid" => @head}}
-        ],
         "comments" => [
           %{"author" => %{"login" => "gearflow-bot-2"}, "createdAt" => "2026-09-30T12:40:00Z", "body" => "@coderabbitai review"},
-          %{"author" => %{"login" => "someone"}, "createdAt" => "2026-09-30T12:41:00Z", "body" => "unrelated"}
+          %{"author" => %{"login" => "someone"}, "createdAt" => "2026-09-30T12:41:00Z", "body" => "unrelated"},
+          %{"author" => %{"login" => "coderabbitai"}, "createdAt" => "2026-09-30T12:42:00Z", "body" => "<!-- reply -->\n@coderabbitai help"}
         ]
       },
       overrides
@@ -33,7 +31,7 @@ defmodule SymphonyElixir.ProofEvidenceTest do
 
   describe "the PR state section" do
     test "a green head with CodeRabbit on the head and no open threads reads as proof" do
-      section = ProofEvidence.format_pr_state(pr(), 0)
+      section = ProofEvidence.format_pr_state(pr(), 0, %{"state" => "APPROVED", "commit_id" => @head})
 
       assert section =~ "Head: `a59430d343b8`"
       assert section =~ "CI checks on the head: 3 passed, 0 failed, 0 pending."
@@ -41,6 +39,7 @@ defmodule SymphonyElixir.ProofEvidenceTest do
       assert section =~ "Unresolved review threads: 0."
       assert section =~ "PR comment by gearflow-bot-2 at 2026-09-30T12:40:00Z: `@coderabbitai review`"
       refute section =~ "unrelated"
+      refute section =~ "reply"
     end
 
     test "failed and pending checks are named, and a review on an older commit says so" do
@@ -51,12 +50,10 @@ defmodule SymphonyElixir.ProofEvidenceTest do
               %{"name" => "test (2)", "status" => "COMPLETED", "conclusion" => "FAILURE"},
               %{"name" => "verify", "status" => "IN_PROGRESS", "conclusion" => nil},
               %{"context" => "ci/legacy", "state" => "PENDING"}
-            ],
-            "latestReviews" => [
-              %{"author" => %{"login" => "coderabbitai"}, "state" => "CHANGES_REQUESTED", "commit" => %{"oid" => "8d9c8cd8aaaa0000"}}
             ]
           }),
-          2
+          2,
+          %{"state" => "CHANGES_REQUESTED", "commit_id" => "8d9c8cd8aaaa0000"}
         )
 
       assert section =~ "0 passed, 1 failed (test (2)), 2 pending (verify, ci/legacy)."
@@ -66,17 +63,35 @@ defmodule SymphonyElixir.ProofEvidenceTest do
 
     test "reads the PR through gh, and a gh failure gives no section" do
       gh = fn
-        ["pr", "view", "4054", "--repo", "GearFlowDev/gf_procurement" | _] -> {Jason.encode!(pr()), 0}
-        ["api", "graphql" | _] -> {"1\n", 0}
+        ["pr", "view", "4054", "--repo", "GearFlowDev/gf_procurement" | _] ->
+          {Jason.encode!(pr()), 0}
+
+        ["api", "repos/GearFlowDev/gf_procurement/pulls/4054/reviews" | _] ->
+          # One line per page; the last page has no CodeRabbit review.
+          {~s({"state":"COMMENTED","commit_id":"#{@head}"}\nnull\n), 0}
+
+        ["api", "graphql" | _] ->
+          {"1\n", 0}
       end
 
       section = ProofEvidence.pr_state_section("https://github.com/GearFlowDev/gf_procurement/pull/4054", gh)
       assert section =~ "Unresolved review threads: 1."
+      assert section =~ "CodeRabbit: latest review is COMMENTED on the head."
 
       assert ProofEvidence.pr_state_section("https://github.com/GearFlowDev/gf_procurement/pull/4054", fn _ -> {"boom", 1} end) ==
                nil
 
       assert ProofEvidence.pr_state_section(nil) == nil
+
+      # More than one page of threads: the jq prints "unknown", never a count.
+      more = fn
+        ["pr", "view" | _] -> {Jason.encode!(pr()), 0}
+        ["api", "graphql" | _] -> {"unknown\n", 0}
+        ["api" | _] -> {"null\n", 0}
+      end
+
+      assert ProofEvidence.pr_state_section("https://github.com/GearFlowDev/gf_procurement/pull/4054", more) =~
+               "Unresolved review threads: unknown (could not be read)."
     end
   end
 
@@ -116,7 +131,7 @@ defmodule SymphonyElixir.ProofEvidenceTest do
       prompt =
         Grader.build_user_prompt(dispatch, plan,
           diff: "stat",
-          pr_state: ProofEvidence.format_pr_state(pr(), 0),
+          pr_state: ProofEvidence.format_pr_state(pr(), 0, nil),
           issue_comments: "## Issue comments during this dispatch (live from Linear)\n\nx"
         )
 

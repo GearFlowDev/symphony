@@ -266,7 +266,9 @@ defmodule SymphonyElixir.Linear.Adapter do
   end
 
   @doc """
-  Take `label_name` off the issue. Idempotent in the same way.
+  Take `label_name` off the issue. Idempotent, but not by Linear's doing: `issueRemoveLabel`
+  on a label the issue does not carry answers "Label not on issue" as a GraphQL error.
+  The absent label is the state this call asks for, so that answer is `:ok`.
   """
   @spec remove_label(String.t(), String.t()) :: :ok | {:error, term()}
   def remove_label(issue_id, label_name) when is_binary(issue_id) and is_binary(label_name) do
@@ -276,15 +278,31 @@ defmodule SymphonyElixir.Linear.Adapter do
   defp mutate_label(mutation, field, issue_id, label_name) do
     with {:ok, label_id} <- resolve_label_id(issue_id, label_name),
          {:ok, response} <-
-           client_module().graphql(mutation, %{issueId: issue_id, labelId: label_id}),
-         true <- get_in(response, ["data", field, "success"]) == true do
-      :ok
-    else
-      false -> {:error, :label_update_failed}
-      {:error, reason} -> {:error, reason}
-      _ -> {:error, :label_update_failed}
+           client_module().graphql(mutation, %{issueId: issue_id, labelId: label_id}) do
+      label_mutation_result(field, response)
     end
   end
+
+  # Errors first: GraphQL can answer data beside errors, and a `success` next to an
+  # error is not a success.
+  defp label_mutation_result(field, response) do
+    cond do
+      field == "issueRemoveLabel" and label_not_on_issue?(response) -> :ok
+      Map.get(response, "errors") not in [nil, []] -> {:error, :label_update_failed}
+      get_in(response, ["data", field, "success"]) == true -> :ok
+      true -> {:error, :label_update_failed}
+    end
+  end
+
+  # WHY THIS IS A NO-OP AND NOT A FAILURE. Every poll re-assesses a completed issue in
+  # In Review, and each pass clears the live-run mark it already cleared. Linear
+  # answers HTTP 200 with `errors: [%{"message" => "Label not on issue"}]` and null
+  # data (probed 2026-09-29), which logged `:label_update_failed` every two minutes
+  # (GEA-10681).
+  # Only that one error alone: beside another, the mutation may have failed for a
+  # reason this does not know.
+  defp label_not_on_issue?(%{"errors" => [%{"message" => "Label not on issue"}]}), do: true
+  defp label_not_on_issue?(_response), do: false
 
   # The issue's own team's label wins; a workspace-level label (no team) is the
   # fallback. Another team's same-named label is never adopted — see

@@ -1951,7 +1951,8 @@ defmodule SymphonyElixir.CoreTest do
       SymphonyElixir.AgentRuntimeSupervisor.start_link(
         name: runtime_name,
         orchestrator_name: orchestrator_name,
-        task_supervisor_name: task_supervisor_name
+        task_supervisor_name: task_supervisor_name,
+        owners_registry_name: Module.concat(__MODULE__, :RuntimeOwners)
       )
 
     # No on_exit stop: start_link links the runtime to this test process, so it
@@ -1974,6 +1975,36 @@ defmodule SymphonyElixir.CoreTest do
     end)
 
     assert is_pid(Process.whereis(task_supervisor_name))
+  end
+
+  test "a crashed session owner registry takes the agents that owned its entries down with it" do
+    # GEA-10681: the reaper spares a tmux session only while its owner is registered.
+    # A registry that came back empty beside live agents would let the reaper kill them.
+    # A killed Registry's partition holds its name for a moment, so the fast restarts
+    # can exhaust the group's budget and escalate; either way the agents go down.
+    Process.flag(:trap_exit, true)
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    owners_name = Module.concat(__MODULE__, :OwnersRestartOwners)
+    task_supervisor_name = Module.concat(__MODULE__, :OwnersRestartTaskSupervisor)
+
+    {:ok, _runtime} =
+      SymphonyElixir.AgentRuntimeSupervisor.start_link(
+        name: Module.concat(__MODULE__, :OwnersRestartRuntime),
+        orchestrator_name: Module.concat(__MODULE__, :OwnersRestartOrchestrator),
+        task_supervisor_name: task_supervisor_name,
+        owners_registry_name: owners_name
+      )
+
+    {:ok, agent_pid} =
+      Task.Supervisor.start_child(task_supervisor_name, fn -> Process.sleep(:infinity) end)
+
+    agent_ref = Process.monitor(agent_pid)
+    registry_pid = Process.whereis(owners_name)
+    Process.exit(registry_pid, :kill)
+
+    assert_receive {:DOWN, ^agent_ref, :process, ^agent_pid, _reason}, 2_000
   end
 
   test "a row-closer's continuation guidance keys on its rows, not on a push" do

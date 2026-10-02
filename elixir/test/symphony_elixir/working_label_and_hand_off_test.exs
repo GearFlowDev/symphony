@@ -122,6 +122,71 @@ defmodule SymphonyElixir.WorkingLabelAndHandOffTest do
     assert {:error, :label_update_failed} = Adapter.remove_label("issue-1", "symphony-working")
   end
 
+  test "removing a label the issue does not carry succeeds, and adding one Linear refuses still fails" do
+    # Linear's real answer to `issueRemoveLabel` on an absent label (GEA-10681): HTTP 200,
+    # null data, one "Label not on issue" error. Every poll clears the mark on a completed
+    # issue again, so this answer must read as done, not as a failure to log.
+    not_on_issue =
+      {:ok,
+       %{
+         "data" => nil,
+         "errors" => [
+           %{
+             "message" => "Label not on issue",
+             "path" => ["issueRemoveLabel"],
+             "extensions" => %{"code" => "INPUT_ERROR", "userError" => true}
+           }
+         ]
+       }}
+
+    lookup = lookup_response([%{"id" => "label-1", "team" => %{"id" => "team-gea"}}])
+
+    Process.put({FakeLabelClient, :results}, [lookup, not_on_issue])
+    assert :ok = Adapter.remove_label("issue-1", "symphony-working")
+
+    # The same error on an ADD is not the state the caller asked for.
+    Process.put({FakeLabelClient, :results}, [lookup, not_on_issue])
+    assert {:error, :label_update_failed} = Adapter.add_label("issue-1", "symphony-working")
+
+    # Any other error on a remove still fails.
+    Process.put(
+      {FakeLabelClient, :results},
+      [lookup, {:ok, %{"data" => nil, "errors" => [%{"message" => "Entity not found"}]}}]
+    )
+
+    assert {:error, :label_update_failed} = Adapter.remove_label("issue-1", "symphony-working")
+
+    # The absent-label error beside another error is not a clean no-op.
+    Process.put(
+      {FakeLabelClient, :results},
+      [
+        lookup,
+        {:ok,
+         %{
+           "data" => nil,
+           "errors" => [%{"message" => "Label not on issue"}, %{"message" => "Entity not found"}]
+         }}
+      ]
+    )
+
+    assert {:error, :label_update_failed} = Adapter.remove_label("issue-1", "symphony-working")
+
+    # A `success` beside an error is not a success.
+    Process.put(
+      {FakeLabelClient, :results},
+      [
+        lookup,
+        {:ok,
+         %{
+           "data" => %{"issueAddLabel" => %{"success" => true}},
+           "errors" => [%{"message" => "Something else"}]
+         }}
+      ]
+    )
+
+    assert {:error, :label_update_failed} = Adapter.add_label("issue-1", "symphony-working")
+  end
+
   test "the memory tracker records both label writes" do
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
 

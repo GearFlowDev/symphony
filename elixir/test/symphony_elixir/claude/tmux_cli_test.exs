@@ -149,6 +149,37 @@ defmodule SymphonyElixir.Claude.TmuxCLITest do
       assert TmuxCLI.reap_orphan_sessions_except([], prefix: prefix) == [name]
     end
 
+    test "spares a session a live process owns, and reaps it once that process dies", %{prefix: prefix} do
+      # GEA-10681: a worker's session_id reaches the running map only with its first
+      # transcript event, and a Planner, Grader or Auditor one-shot never does. Past the
+      # age floor the reaper killed them mid-start, and the run failed with :not_found.
+      session_id = "#{System.unique_integer([:positive])}"
+      name = new_session("#{prefix}-#{session_id}")
+      test_pid = self()
+
+      owner =
+        spawn(fn ->
+          :ok = TmuxCLI.claim_owner(session_id)
+          send(test_pid, :claimed)
+          receive do: (:stop -> :ok)
+        end)
+
+      assert_receive :claimed
+      assert TmuxCLI.owned?(session_id)
+
+      # Empty keep set and no age floor: only ownership spares it.
+      assert TmuxCLI.reap_orphan_sessions_except([], prefix: prefix) == []
+      assert {_, 0} = System.cmd("tmux", ["has-session", "-t", name], stderr_to_stdout: true)
+
+      # An owner that exits without stop_session/1 leaves an orphan the reaper takes.
+      ref = Process.monitor(owner)
+      send(owner, :stop)
+      assert_receive {:DOWN, ^ref, :process, ^owner, _}
+
+      refute TmuxCLI.owned?(session_id)
+      assert TmuxCLI.reap_orphan_sessions_except([], prefix: prefix) == [name]
+    end
+
     test "kill_by_session_id kills the matching session and is idempotent" do
       # kill_by_session_id derives the name from the configured prefix, so build
       # the session under that same prefix (unique id avoids any real session).

@@ -181,6 +181,20 @@ defmodule SymphonyElixir.PlanGroundingTest do
       assert [%{"asked_before" => true}] = Plan.questions(plan)
     end
 
+    test "a new one-way question that reuses an old id still holds the issue" do
+      assert {:ok, {:needs_answer, _plan, _}} = PlanningWorkflow.assess(issue(), assess_opts(question_reply("one-way", nil)))
+      {:ok, _} = History.record_park("SYM-PG", "Q1")
+
+      other =
+        {:ok,
+         %{
+           "rows" => [row("R1", ["lib/gf/requests.ex"])],
+           "questions" => [%{"id" => "Q1", "question" => "Delete the archived requests?", "door" => "one-way"}]
+         }}
+
+      assert {:ok, {:needs_answer, _plan, [%{"asked_before" => false}]}} = PlanningWorkflow.assess(issue(), assess_opts(other))
+    end
+
     test "the park is one card that lists every question and its recommendation" do
       questions = [
         %{"id" => "Q1", "question" => "Delete the old rows?", "recommendation" => "Keep them."},

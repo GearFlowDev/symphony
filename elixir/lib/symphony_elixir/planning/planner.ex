@@ -251,7 +251,8 @@ defmodule SymphonyElixir.Planning.Planner do
 
   # A question carries an id, a door and a default; the Planner's own text may
   # leave any of them out. With no default there is nothing to build, so the
-  # question is one-way. A one-way question a prior plan already asked was
+  # question is one-way. A one-way question a prior plan already asked (the same
+  # text, ignoring case and punctuation; ids repeat across plans, so never by id) was
   # answered, or waived, by the person who released the issue: it is never
   # asked twice (GEA-11074; GEA-10457 asked one scope question six times).
   defp normalize_questions(plan_json, prior_plan) do
@@ -265,13 +266,13 @@ defmodule SymphonyElixir.Planning.Planner do
       |> Enum.with_index(1)
       |> Enum.map(fn {q, i} ->
         default = blank_to_nil(q["default"])
-        door = if q["door"] == "two-way" and default, do: "two-way", else: "one-way"
+        door = if q["door"] == "two-way" and default != nil, do: "two-way", else: "one-way"
 
         q
         |> Map.put("id", blank_to_nil(q["id"]) || "Q#{i}")
         |> Map.put("door", door)
         |> Map.put("default", default)
-        |> Map.put("asked_before", MapSet.member?(asked, normalize_text(q["question"])) or MapSet.member?(asked, q["id"]))
+        |> Map.put("asked_before", normalize_text(q["question"]) in asked)
       end)
 
     Map.put(plan_json, "questions", questions)
@@ -280,12 +281,11 @@ defmodule SymphonyElixir.Planning.Planner do
   defp asked_question_texts(%Plan{plan_json: %{"questions" => qs}}) when is_list(qs) do
     qs
     |> Enum.filter(&(is_map(&1) and &1["door"] == "one-way"))
-    |> Enum.flat_map(&[normalize_text(&1["question"]), &1["id"]])
+    |> Enum.map(&normalize_text(&1["question"]))
     |> Enum.reject(&is_nil/1)
-    |> MapSet.new()
   end
 
-  defp asked_question_texts(_prior_plan), do: MapSet.new()
+  defp asked_question_texts(_prior_plan), do: []
 
   defp normalize_text(text) when is_binary(text), do: text |> String.downcase() |> String.replace(~r/\W+/u, " ") |> String.trim()
   defp normalize_text(_), do: nil

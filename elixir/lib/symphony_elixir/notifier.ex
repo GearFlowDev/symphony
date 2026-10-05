@@ -288,6 +288,13 @@ defmodule SymphonyElixir.Notifier do
           recommendation: recommend || "(Symphony's, the agent gave none.) Clear the blocker the agent names, then resume. Cancel the issue if the blocker means the work is no longer needed."
         }
 
+      :planner ->
+        %{
+          question: ask || "Answer the plan's questions and resume #{who}?",
+          problem: present(blocker),
+          recommendation: recommend || "(Symphony's, the planner gave none.) Answer each question on #{who}, then resume."
+        }
+
       _orchestrator ->
         %{
           question: "Fix the cause below and resume #{who}, or cancel it?",

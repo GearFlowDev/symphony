@@ -16,14 +16,16 @@ defmodule SymphonyElixir.Planning.Workflow do
 
   require Logger
 
+  alias SymphonyElixir.Config
   alias SymphonyElixir.History
   alias SymphonyElixir.Linear.Client
   alias SymphonyElixir.Planning
-  alias SymphonyElixir.Planning.{Auditor, Dispatch, Grader, Plan, Planner}
+  alias SymphonyElixir.Planning.{Auditor, Dispatch, Grader, Plan, Planner, RepoFiles}
 
   @type assess_result ::
           {:has_open_rows, Plan.t(), [map()]}
           | {:complete, Plan.t()}
+          | {:needs_answer, Plan.t(), [map()]}
 
   @doc """
   Read-only assessment of whether the plan has open rows.
@@ -39,6 +41,9 @@ defmodule SymphonyElixir.Planning.Workflow do
     * If a plan exists with `missing` or `partial` rows, return
       `{:has_open_rows, plan, rows}`.
     * If every row is `done` or `deferred`, return `{:complete, plan}`.
+    * If the plan carries a one-way question no earlier plan asked, return
+      `{:needs_answer, plan, questions}` before any of that: the issue waits
+      for a person before the build, not in the middle of it (GEA-11074).
 
   This does NOT create a `Dispatch` row — call `start_implement_dispatch/3`
   separately when the orchestrator commits to dispatching a worker against
@@ -104,7 +109,10 @@ defmodule SymphonyElixir.Planning.Workflow do
 
         Planner.plan(
           issue,
-          opts |> Keyword.put(:audit_summary, audit_summary) |> Keyword.put(:comments, comments)
+          opts
+          |> Keyword.put(:audit_summary, audit_summary)
+          |> Keyword.put(:comments, comments)
+          |> put_grounding(issue, identifier)
         )
 
       {:error, reason} ->
@@ -132,6 +140,7 @@ defmodule SymphonyElixir.Planning.Workflow do
           |> Keyword.put(:comments, comments)
           |> Keyword.put(:prior_planned_at, planned_at)
           |> Keyword.put(:metadata, Map.put(plan.metadata || %{}, "replanned_after_park", DateTime.to_iso8601(parked_at)))
+          |> put_grounding(issue, plan.issue_identifier)
 
         Planner.plan(issue, planner_opts)
 
@@ -140,6 +149,38 @@ defmodule SymphonyElixir.Planning.Workflow do
         {:error, {:comments_unavailable, reason}}
     end
   end
+
+  # What grounds a plan in the world (GEA-11074): the project's rulings, so a
+  # question the project answered is never asked, and the repository's real
+  # tree, so `touches` names files that exist. Neither read blocks a plan: a
+  # plan made without them is the plan Symphony made before.
+  defp put_grounding(opts, issue, identifier) do
+    project =
+      case Keyword.get(opts, :project_fun, &fetch_project/1).(issue_id(issue)) do
+        {:ok, project} ->
+          project
+
+        {:error, reason} ->
+          Logger.warning("Plan of #{identifier}: project unreadable, planning without it: #{inspect(reason)}")
+          nil
+      end
+
+    repo_tree =
+      case Keyword.get(opts, :repo_tree_fun, &RepoFiles.load/2).(issue, opts) do
+        {:ok, tree} -> tree
+        _ -> nil
+      end
+
+    opts |> Keyword.put(:project, project) |> Keyword.put(:repo_tree, repo_tree)
+  end
+
+  # Only a Linear tracker has projects; the memory tracker the tests run on must
+  # never reach the real API through an ambient LINEAR_API_KEY.
+  defp fetch_project(issue_id) when is_binary(issue_id) do
+    if Config.tracker_kind() == "linear", do: Client.fetch_issue_project(issue_id), else: {:ok, nil}
+  end
+
+  defp fetch_project(_issue_id), do: {:ok, nil}
 
   defp issue_id(issue) do
     case Map.get(issue, :id) || Map.get(issue, "id") do
@@ -165,9 +206,10 @@ defmodule SymphonyElixir.Planning.Workflow do
   end
 
   defp open_rows_result(plan) do
-    case Plan.open_rows(plan) do
-      [] -> {:complete, plan}
-      rows -> {:has_open_rows, plan, rows}
+    case {Plan.open_questions(plan), Plan.open_rows(plan)} do
+      {[_ | _] = questions, _rows} -> {:needs_answer, plan, questions}
+      {[], []} -> {:complete, plan}
+      {[], rows} -> {:has_open_rows, plan, rows}
     end
   end
 

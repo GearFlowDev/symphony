@@ -742,19 +742,26 @@ defmodule SymphonyElixir.Workspace do
     # The value is the raw repository name (`gf_platform`, `symphony`, …), and
     # the `before_run` hook maps it to a slot. Only the hook knows which repos
     # this machine can provision (GEA-10251).
-    repo =
-      repo_from_pr_url(issue_context[:pr_url]) ||
-        cond do
-          Enum.any?(labels, &label_matches_repo?(&1, "2.0")) -> "gf_platform"
-          Enum.any?(labels, &label_matches_repo?(&1, "3.0")) -> "gf_procurement"
-          true -> ""
-        end
-
     env
-    |> Map.put("SYMPHONY_REPO", repo)
+    |> Map.put("SYMPHONY_REPO", repo_name(labels, issue_context[:pr_url]))
     |> Map.put("SYMPHONY_ROOT", Application.app_dir(:symphony_elixir))
     |> Map.put("SYMPHONY_SCRIPTS", scripts_path("") <> "/")
     |> Map.to_list()
+  end
+
+  @doc """
+  The repository an issue routes to: its PR's repository, else its `2.0` / `3.0`
+  label, else `""`. The `before_run` hook leases a slot for it, and the Planner
+  reads its file tree (GEA-11074).
+  """
+  @spec repo_name([String.t()], String.t() | nil) :: String.t()
+  def repo_name(labels, pr_url) do
+    repo_from_pr_url(pr_url) ||
+      cond do
+        Enum.any?(labels, &label_matches_repo?(&1, "2.0")) -> "gf_platform"
+        Enum.any?(labels, &label_matches_repo?(&1, "3.0")) -> "gf_procurement"
+        true -> ""
+      end
   end
 
   defp label_matches_repo?(label, prefix) do

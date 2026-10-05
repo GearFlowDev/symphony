@@ -77,6 +77,27 @@ defmodule SymphonyElixir.Planning.Plan do
     plan |> rows() |> Enum.filter(&(&1["state"] in ["missing", "partial"]))
   end
 
+  @doc "Returns the Planner's questions, or `[]` (GEA-11074)."
+  @spec questions(t()) :: [map()]
+  def questions(%__MODULE__{plan_json: %{"questions" => qs}}) when is_list(qs), do: Enum.filter(qs, &is_map/1)
+  def questions(_), do: []
+
+  @doc """
+  The one-way questions that hold the issue before any build: those no earlier
+  plan asked. A person released the issue after the first ask, so a repeat is
+  answered or waived.
+  """
+  @spec open_questions(t()) :: [map()]
+  def open_questions(plan) do
+    plan |> questions() |> Enum.filter(&(&1["door"] == "one-way" and &1["asked_before"] != true))
+  end
+
+  @doc "The two-way questions the plan settles on their default."
+  @spec default_decisions(t()) :: [map()]
+  def default_decisions(plan) do
+    plan |> questions() |> Enum.filter(&(&1["door"] == "two-way"))
+  end
+
   @spec statuses() :: [String.t()]
   def statuses, do: @statuses
 end

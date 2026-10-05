@@ -115,8 +115,30 @@ defmodule SymphonyElixir.Planning do
       "## Plan\n\n_Symphony generated this plan and re-grades each row after every dispatch. ✅ done · 🟡 partial · ⬜ missing · ⏭️ deferred._\n"
 
     body = if lines == [], do: "_(no rows)_", else: Enum.join(lines, "\n")
-    header <> "\n" <> body <> kept_out_section(plan)
+    header <> "\n" <> body <> kept_out_section(plan) <> decisions_section(plan)
   end
+
+  # A two-way question goes ahead on its default, and the plan comment says so,
+  # so a person who disagrees answers before the PR rather than after it
+  # (GEA-11074). A one-way question holds the issue; it is listed here too.
+  defp decisions_section(plan) do
+    defaults =
+      for q <- Plan.default_decisions(plan) do
+        "- **#{q["id"]}** #{q["question"]} I build: #{q["default"]}, unless a person says otherwise on this issue."
+      end
+
+    held =
+      for q <- Plan.questions(plan), q["door"] == "one-way" do
+        rec = if is_binary(q["recommendation"]) and q["recommendation"] != "", do: " Recommendation: #{q["recommendation"]}", else: ""
+        note = if q["asked_before"] == true, do: " (asked before the last release; the build goes ahead)", else: ""
+        "- **#{q["id"]}** #{q["question"]}#{rec}#{note}"
+      end
+
+    section("Decisions on their defaults", defaults) <> section("Questions that hold the build", held)
+  end
+
+  defp section(_title, []), do: ""
+  defp section(title, lines), do: "\n\n### #{title}\n\n" <> Enum.join(lines, "\n")
 
   # Rows a re-plan left out, so a person sees what the plan will not build and
   # why (GEA-10756). The Planner's own bare-string entries are not rows.

@@ -157,6 +157,85 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @project_query """
+  query SymphonyLinearIssueProject($issueId: String!) {
+    issue(id: $issueId) {
+      project {
+        id
+        name
+        description
+      }
+    }
+  }
+  """
+
+  # The ROOT `comments` connection filtered by project, never `project { comments }`:
+  # that field answers an empty list for a project that has comments (gf_harness_surfaces
+  # core/linear.py `project_comments_since`, verified 2026-08-14). The connection is
+  # newest-first, so `first:` is the newest page.
+  @project_comments_query """
+  query SymphonyLinearProjectComments($projectId: ID!, $first: Int!) {
+    comments(first: $first, filter: {project: {id: {eq: $projectId}}}) {
+      nodes {
+        body
+        createdAt
+        user {
+          name
+        }
+      }
+    }
+  }
+  """
+
+  @project_comments_page_size 50
+
+  @doc """
+  The issue's project, with its description and its newest comments oldest-first,
+  or `nil` when the issue sits in no project. A project's description and thread
+  carry rulings that cover every issue in it, and the Planner reads them before it
+  plans (GEA-11074).
+  """
+  @spec fetch_issue_project(String.t(), keyword()) :: {:ok, map() | nil} | {:error, term()}
+  def fetch_issue_project(issue_id, opts \\ []) when is_binary(issue_id) do
+    case graphql(@project_query, %{issueId: issue_id}, opts) do
+      {:ok, %{"data" => %{"issue" => %{"project" => nil}}}} ->
+        {:ok, nil}
+
+      {:ok, %{"data" => %{"issue" => %{"project" => %{"id" => id} = project}}}} ->
+        with {:ok, comments} <- fetch_project_comments(id, opts) do
+          {:ok, %{name: project["name"] || "", description: project["description"] || "", comments: comments}}
+        end
+
+      {:ok, %{"errors" => errors}} ->
+        {:error, {:linear_graphql_errors, errors}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :linear_unknown_payload}
+    end
+  end
+
+  defp fetch_project_comments(project_id, opts) do
+    case graphql(@project_comments_query, %{projectId: project_id, first: @project_comments_page_size}, opts) do
+      {:ok, %{"data" => %{"comments" => %{"nodes" => nodes}}}} when is_list(nodes) ->
+        {:ok, nodes |> Enum.map(&comment_from_node/1) |> Enum.sort_by(&sort_key(&1.created_at))}
+
+      {:ok, %{"errors" => errors}} ->
+        {:error, {:linear_graphql_errors, errors}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :linear_unknown_payload}
+    end
+  end
+
+  defp sort_key(%DateTime{} = at), do: DateTime.to_unix(at, :microsecond)
+  defp sort_key(_), do: 0
+
   @doc """
   GitHub PR URLs attached to an issue by the Linear-GitHub integration,
   oldest-first. Repo-agnostic — this finds the PR even when label-based repo

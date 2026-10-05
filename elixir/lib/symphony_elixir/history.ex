@@ -53,14 +53,27 @@ defmodule SymphonyElixir.History do
   on issue churn, and blocked GEA-9699 at `12 dispatches since 00:00 UTC` with a
   message offering re-activation as the only way out (2026-09-22). The
   failure-retry cap, not this budget, is what bounds a hook that keeps failing.
+
+  The count starts at the later of UTC midnight and the issue's last park. A
+  person who releases a parked issue has read why it stopped, and the budget
+  park's own card tells them to re-activate it. Counted from midnight alone, the
+  released issue still had a spent budget and parked again within minutes:
+  GEA-10702 was resumed at 16:37Z and re-parked at 16:40Z, and GEA-10458 parked
+  2 minutes after its release (2026-09-29/30, GEA-11074).
   """
   @spec dispatches_today(String.t()) :: non_neg_integer()
   def dispatches_today(issue_identifier) when is_binary(issue_identifier) do
     midnight = DateTime.new!(Date.utc_today(), ~T[00:00:00], "Etc/UTC")
 
+    since =
+      case last_parked_at(issue_identifier) do
+        %DateTime{} = parked_at -> Enum.max([midnight, parked_at], DateTime)
+        _ -> midnight
+      end
+
     Run
     |> where([r], r.issue_identifier == ^issue_identifier)
-    |> where([r], r.started_at >= ^midnight)
+    |> where([r], r.started_at >= ^since)
     |> where([r], is_nil(r.outcome) or r.outcome not in ["no_capacity", "orphaned"])
     |> where([r], not (is_nil(r.session_id) and coalesce(r.turns_used, 0) == 0 and not is_nil(r.finished_at)))
     |> select([r], count(r.id))

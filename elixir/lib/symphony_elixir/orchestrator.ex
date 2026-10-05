@@ -1777,10 +1777,11 @@ defmodule SymphonyElixir.Orchestrator do
     if used >= limit do
       {:blocked,
        {:dispatch_budget_exhausted,
-        "#{used} dispatches since 00:00 UTC (limit #{limit}) — a converging issue " <>
-          "finishes in far fewer; something is looping. Review the plan and recent " <>
-          "run outcomes. The count resets at 00:00 UTC; re-activate the issue to " <>
-          "resume before then."}}
+        "#{used} dispatches since 00:00 UTC or the issue's last park, whichever is " <>
+          "later (limit #{limit}) — a converging issue finishes in far fewer; " <>
+          "something is looping. Review the plan and recent run outcomes. The count " <>
+          "resets at 00:00 UTC; re-activate the issue to resume before then, and the " <>
+          "count starts again from that park."}}
     else
       :ok
     end

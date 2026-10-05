@@ -1759,6 +1759,9 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, {:complete, plan}} ->
         complete_plan_action(issue, metadata, plan)
 
+      {:ok, {:needs_answer, _plan, questions}} ->
+        {:blocked, {:open_questions, questions}}
+
       {:error, reason} ->
         {:blocked, {:plan_assess_failed, reason}}
     end
@@ -2653,7 +2656,7 @@ defmodule SymphonyElixir.Orchestrator do
     else
       Logger.error("Plan workflow blocked for #{issue_context(issue)}: #{inspect(reason)}; notifying human")
 
-      message = "Symphony could not produce or advance a plan: #{inspect(reason)}"
+      {message, source} = plan_failure_message(reason)
 
       # Move FIRST, so the card says "parked" only when the move landed.
       move_result = move_blocked_issue_to_needs_human_state(issue, Config.escalation_needs_human_state())
@@ -2663,7 +2666,7 @@ defmodule SymphonyElixir.Orchestrator do
         identifier: issue.identifier,
         title: issue_title(issue),
         help_message: message,
-        source: :orchestrator,
+        source: source,
         parked_state: parked_state(move_result)
       })
 
@@ -2681,6 +2684,28 @@ defmodule SymphonyElixir.Orchestrator do
       |> complete_issue(issue.id)
     end
   end
+
+  # THE PLANNER'S QUESTIONS PARK AS ONE CARD, BEFORE ANY BUILD (GEA-11074). The
+  # card's Ask lists every one-way question, so a person answers them in one
+  # pass; the agent's `Ask:` / `Recommend:` shape lets the notifier render it.
+  @doc false
+  @spec plan_failure_message(term()) :: {String.t(), atom()}
+  def plan_failure_message({:open_questions, questions}) do
+    asks = Enum.map_join(questions, " ", &"#{&1["id"]}: #{&1["question"]}")
+
+    recs =
+      questions
+      |> Enum.filter(&(is_binary(&1["recommendation"]) and &1["recommendation"] != ""))
+      |> Enum.map_join(" ", &"#{&1["id"]}: #{&1["recommendation"]}")
+
+    message =
+      "The plan has #{length(questions)} product question(s) that cannot be undone cheaply, so Symphony asks before it builds anything. " <>
+        "Ask: #{asks}" <> if(recs == "", do: "", else: " Recommend: #{recs}")
+
+    {message, :planner}
+  end
+
+  def plan_failure_message(reason), do: {"Symphony could not produce or advance a plan: #{inspect(reason)}", :orchestrator}
 
   defp move_blocked_issue_to_needs_human_state(issue, needs_human_state) when is_binary(needs_human_state) do
     case Tracker.update_issue_state(issue.id, needs_human_state) do
